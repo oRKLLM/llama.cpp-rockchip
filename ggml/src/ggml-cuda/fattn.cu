@@ -453,12 +453,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // TurboQuant3: only VEC kernel implemented for now (no MMA/TILE/WMMA support)
-    if (K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0) {
-        const bool can_use_vec = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
-        return can_use_vec ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
-    }
-
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
