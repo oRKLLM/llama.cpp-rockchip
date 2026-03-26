@@ -1080,6 +1080,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "TURBO_WHT",
 
     "UNARY",
 
@@ -1191,6 +1192,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "turbo_wht(a)",
 
     "unary(x)",
 
@@ -6283,6 +6285,28 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_turbo_wht
+
+struct ggml_tensor * ggml_turbo_wht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   direction) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] % 128 == 0);  // ne[0] must be divisible by rotation group size
+    GGML_ASSERT(direction == 0 || direction == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
+
+    result->op = GGML_OP_TURBO_WHT;
+    result->src[0] = a;
+
+    // Store direction in op_params: 0 = forward, 1 = inverse
+    memcpy(result->op_params, &direction, sizeof(int));
 
     return result;
 }
