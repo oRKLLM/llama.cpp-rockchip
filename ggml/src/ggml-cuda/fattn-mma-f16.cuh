@@ -193,6 +193,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(640, 512, 64, 256, 1,  32, 160, 128, 128, 1, false);
 
     // TODO tune specifically for RDNA
+    // Fall back to ampere config rather than upstream's zero-sentinel —
+    // template instances (e.g. fattn-mma-f16-instance-ncols1_1-ncols2_16.cu)
+    // do constexpr arithmetic on the returned config (np = nwarps * cols_per_warp /
+    // ncols, etc); a sentinel with nwarps=0 triggers compile-time div/mod-by-zero
+    // under -Werror,-Wdivision-by-zero on the HIP quality build.
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
 
