@@ -693,6 +693,16 @@ void process_shaders() {
             string_to_spv("flash_attn_f32_f16", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"MMQ", "1"}, {"FA_MMQ_MIXED", "1"}}), fp16, false, false, f16acc, "_int8");
 #endif
+            // TurboQuant3 FA: separate SPIR-V variants with DATA_A_TURBO3_0 so the
+            // shader gets turbo3-only K/V bindings (no f16 alias) and the dequant
+            // path runs the per-element centroid lookup (graph applies WHT to Q
+            // pre-attention and inverse WHT to output post-attention).
+            string_to_spv("flash_attn_f32_f16_turbo3_0", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_TURBO3_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            string_to_spv("flash_attn_f32_f16_turbo3_0", "flash_attn_cm1.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_TURBO3_0", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+#endif
         }
     }
 
@@ -816,7 +826,7 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
-    // TurboQuant WHT operation
+    // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
 
     auto get_type_str = [](bool f16) {
