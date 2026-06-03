@@ -7,6 +7,7 @@
 
 void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     if (dense_first) {
+    if (dense_first) {
         for (uint32_t il = 0; il < n_layer(); ++il) {
             is_swa_impl[il] = n_pattern == 0 || (il % n_pattern != 0);
         }
@@ -36,6 +37,8 @@ void llama_hparams::set_recr_pattern(uint32_t n_pattern, bool dense_first) {
         is_recr_impl[il] = false;
     }
 }
+
+
 
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer_all; ++il) {
@@ -222,7 +225,11 @@ uint32_t llama_hparams::n_embd_s() const {
 }
 
 bool llama_hparams::is_recr(uint32_t il) const {
+<<<<<<< HEAD
     if (il < n_layer_all) {
+=======
+    if (il < n_layer) {
+>>>>>>> 75606176f (tests : add support for qwen3 SSM archs (#24031))
         return is_recr_impl[il];
     }
 
