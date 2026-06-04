@@ -922,7 +922,6 @@ float * llama_context::get_embeddings_nextn() {
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
-
     try {
         if (embd_nextn.data == nullptr) {
             throw std::runtime_error("no nextn embeddings");
@@ -1422,6 +1421,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     n_outputs = n_tokens;
+    n_outputs_pre_norm = cparams.embeddings_pre_norm ? n_tokens : 0;
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -1807,7 +1807,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, cparams.embeddings_pre_norm ? n_tokens_all : n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -1997,6 +1997,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+    n_outputs_pre_norm = n_outputs_pre_norm_prev;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2055,11 +2056,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_outputs_pre_norm_req) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    const int64_t n_outputs_pre_norm_max = cparams.embeddings_pre_norm
+        ? std::max<int64_t>(n_outputs_pre_norm_req < 0 ? n_outputs : n_outputs_pre_norm_req, n_seq_max())
+        : 0;
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2211,6 +2215,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
+    this->n_outputs_pre_norm = 0;
 
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
 
@@ -2280,7 +2285,6 @@ void llama_context::output_reorder() {
                 }
             }
         }
-
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
