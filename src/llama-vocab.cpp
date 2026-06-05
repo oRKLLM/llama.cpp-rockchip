@@ -2550,7 +2550,6 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_LOWERCASE,     normalizer_opts.lowercase,     false);
         normalizer_opts.strip_accents = normalizer_opts.lowercase;
         ml.get_key(LLM_KV_TOKENIZER_NORMALIZER_STRIP_ACCENTS, normalizer_opts.strip_accents, false);
-
         // suppress tokens
         {
             const int suppress_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_SUPPRESS_TOKENS).c_str());
@@ -3988,7 +3987,6 @@ bool llama_vocab::get_treat_whitespace_as_suffix() const {
 const llama_vocab::normalizer_options & llama_vocab::get_normalizer_opts() const {
     return pimpl->normalizer_opts;
 }
-
 const std::vector<llama_token> & llama_vocab::get_suppress_tokens() const {
     return pimpl->suppress_tokens;
 }
