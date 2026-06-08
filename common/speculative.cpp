@@ -1037,6 +1037,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
+<<<<<<< HEAD
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
@@ -1060,6 +1061,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
                 return false;
             }
+=======
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        if (rc != 0) {
+            LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
+            return false;
+>>>>>>> 47106bd3a (fork: drop pre-norm Qwen MTP (#149) ahead of upstream MTP lineage)
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

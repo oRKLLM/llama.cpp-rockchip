@@ -222,7 +222,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs, int32_t n_outputs_pre_norm = -1);
+    uint32_t output_reserve(int32_t n_outputs);
 
     void output_reorder();
 
