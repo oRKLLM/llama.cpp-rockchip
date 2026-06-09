@@ -239,7 +239,7 @@ void main() {
                             uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
                             uint ib = coord / BLOCK_SIZE_K;
                             uint iqs = (coord % BLOCK_SIZE_K);
-                            K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+                            K_Tf = f16vec4(dequantize4(ib, iqs, k_offset, BINDING_IDX_K));
                         } else
 #endif
                         {
@@ -284,7 +284,7 @@ void main() {
                                 uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
                                 uint ib = coord / BLOCK_SIZE_K;
                                 uint iqs = (coord % BLOCK_SIZE_K);
-                                K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+                                K_Tf = f16vec4(dequantize4(ib, iqs, k_offset, BINDING_IDX_K));
                             } else
 #endif
                             {
@@ -416,7 +416,8 @@ void main() {
                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
                             uint ib = coord / BLOCK_SIZE_V;
                             uint iqs = (coord % BLOCK_SIZE_V);
-                            V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+
+                            V_Tf = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
                         } else
 #endif
                         {
@@ -469,7 +470,8 @@ void main() {
                     if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
-                            kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+
+                            kvsh[row * vsh_stride + col] = f16vec4(dequantize4(ib, iqs, v_offset, BINDING_IDX_V));
                         } else
 #endif
                         {
