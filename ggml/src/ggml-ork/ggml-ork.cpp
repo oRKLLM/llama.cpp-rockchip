@@ -12,6 +12,7 @@
 
 #include <vector>
 #include <cstring>
+#include <unordered_map>
 
 extern "C" {
 #include "ork_npu.h"
@@ -19,9 +20,12 @@ extern "C" {
 
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
-    std::vector<float>   f32;   // dequantized src0 plane [N*K]
-    std::vector<ork_f16> bf;    // weights as fp16 B[K*N]
+    std::vector<float>   f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
+    std::vector<ork_f16> bf;    // weights as fp16 B[K*N]      (cache-miss scratch)
     std::vector<ork_f16> af;    // activations as fp16 A[M*K]
+    // model weights are constant during inference, so pack each once (NPU-resident) and reuse,
+    // keyed by the weight plane's host pointer. This is the transformer pattern ork-driver is for.
+    std::unordered_map<const void *, ork_w *> wcache;
 };
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
@@ -55,22 +59,29 @@ static bool ggml_backend_ork_mul_mat(ggml_backend_ork_context * ctx, struct ggml
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13); // [M][K] f32
                   float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);   // [M][N] f32
 
-            // src0 -> fp32 [N][K]
-            if (type == GGML_TYPE_F32) {
-                for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
+            // pack the weight plane once (NPU-resident), reuse on later tokens
+            ork_w * w;
+            auto it = ctx->wcache.find(x);
+            if (it != ctx->wcache.end()) {
+                w = it->second;
             } else {
-                for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
+                // src0 -> fp32 [N][K]
+                if (type == GGML_TYPE_F32) {
+                    for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
+                } else {
+                    for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
+                }
+                // -> fp16 B[K][N]   (B[k][n] = src0[n][k])
+                for (int n = 0; n < N; n++)
+                    for (int k = 0; k < K; k++) bf[(size_t) k*N + n] = (ork_f16) f32[(size_t) n*K + k];
+                w = ork_mm_pack(ctx->npu, K, N, bf);
+                if (!w) return false;
+                ctx->wcache[x] = w;
             }
-            // -> fp16 B[K][N]   (B[k][n] = src0[n][k])
-            for (int n = 0; n < N; n++)
-                for (int k = 0; k < K; k++) bf[(size_t) k*N + n] = (ork_f16) f32[(size_t) n*K + k];
             // src1 -> fp16 A[M][K]
             for (int64_t i = 0; i < (int64_t) M*K; i++) af[i] = (ork_f16) y[i];
 
-            ork_w * w = ork_mm_pack(ctx->npu, K, N, bf);
-            if (!w) return false;
             int rc = ork_mm_run(ctx->npu, w, M, af, d);
-            ork_w_free(w);
             if (rc) return false;
         }
     }
@@ -83,6 +94,7 @@ static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "
 
 static void ggml_backend_ork_free(ggml_backend_t backend) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    for (auto & kv : ctx->wcache) ork_w_free(kv.second);
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     delete backend;
