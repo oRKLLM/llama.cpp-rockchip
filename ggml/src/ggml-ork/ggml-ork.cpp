@@ -222,6 +222,74 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
     return true;
 }
 
+// Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V
+// projections off the normed hidden state; FFN gate/up off the same x). Concatenates their weights
+// along N into one packed weight, quantizes the shared activation ONCE, runs ONE NPU matmul, then
+// scatters the wide int32 result into each dst — turning n submits into 1, amortizing the per-matmul
+// submit floor. All g[i] are 2D (ne2==ne3==1), same K and M. Weight cached by g[0]->src0->data.
+static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
+    const struct ggml_tensor * src1 = g[0]->src[1];
+    const int K = (int) g[0]->src[0]->ne[0];
+    const int M = (int) src1->ne[1];
+    int Ntot = 0, off[16];
+    for (int i = 0; i < ng; i++) { off[i] = Ntot; Ntot += (int) g[i]->src[0]->ne[1]; }
+
+    const void * key = g[0]->src[0]->data;
+    auto it = ctx->wcache.find(key);
+    if (it == ctx->wcache.end()) {                       // build + pack the fused weight once
+        ork_weight ow; ow.bscale.resize(Ntot);
+        ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
+        for (int i = 0; i < ng; i++) {
+            const struct ggml_tensor * w = g[i]->src[0];
+            const int Ni = (int) w->ne[1];
+            const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
+            ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
+            const char * x = (const char *) w->data;
+            if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
+            else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
+            for (int n = 0; n < Ni; n++) {
+                float mx = 1e-9f;
+                for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+                float s = mx / 127.0f; ow.bscale[off[i]+n] = s;
+                for (int k = 0; k < K; k++) {            // fused B[k][off+n] = src0_i[n][k]
+                    int q = (int) lrintf(f32[(size_t) n*K + k] / s);
+                    bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                }
+            }
+        }
+        ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+        if (!ow.w) return false;
+        it = ctx->wcache.emplace(key, std::move(ow)).first;
+    }
+    const ork_weight & ow = it->second;
+
+    ctx->ai.resize((size_t) M*K); ctx->as.resize(M); ctx->ci.resize((size_t) M*Ntot);
+    int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
+    const float * y = (const float *) src1->data;
+    for (int m = 0; m < M; m++) {                        // quantize the shared activation once
+        const float * yr = y + (size_t) m*K; int8_t * ar = ai + (size_t) m*K;
+        float mx = 1e-9f;
+        for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+        as[m] = mx / 127.0f; const float inv = 127.0f / mx;
+        for (int k = 0; k < K; k++) { float q = yr[k]*inv; int qi = (int)(q + copysignf(0.5f, q));
+            ar[k] = (int8_t)(qi > 127 ? 127 : qi < -127 ? -127 : qi); }
+    }
+    const double t1 = ctx->profile ? ork_now_us() : 0;
+    if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;     // ONE submit for all ng matmuls
+    const double t2 = ctx->profile ? ork_now_us() : 0;
+
+    const float * bs = ow.bscale.data();                 // scatter+dequant into each dst
+    for (int i = 0; i < ng; i++) {
+        const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
+        float * dbase = (float *) g[i]->data;
+        for (int m = 0; m < M; m++) { const float rs = as[m]; const int32_t * cr = ci + (size_t) m*Ntot + o;
+            float * dr = dbase + (size_t) m*Ni; for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n]; }
+    }
+    if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
+        if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
+    return true;
+}
+
 // backend interface
 
 static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "ORK"; GGML_UNUSED(backend); }
@@ -245,13 +313,35 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    // QKV/gate-up fusion: implemented + correct, but measured SLOWER on RK3588 (decode 9.4->6.4
+    // tok/s) — one wide multi-core matmul + strided scatter costs more than the 2 saved submits, i.e.
+    // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
+    // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
+    const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
-            case GGML_OP_MUL_MAT:
-                if (ctx->qbits == 4 ? !ggml_backend_ork_mul_mat_i4(ctx, node)
-                                    : !ggml_backend_ork_mul_mat_i8(ctx, node)) return GGML_STATUS_FAILED;
+            case GGML_OP_MUL_MAT: {
+                // fuse adjacent MUL_MATs sharing the same src1 input (QKV / gate+up), 2D, same K
+                struct ggml_tensor * grp[16]; int ng = 1; grp[0] = node;
+                if (fuse && node->ne[2] == 1 && node->ne[3] == 1) {
+                    while (i + ng < cgraph->n_nodes && ng < 16) {
+                        struct ggml_tensor * nj = cgraph->nodes[i + ng];
+                        if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
+                            nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1)
+                            grp[ng++] = nj;
+                        else break;
+                    }
+                }
+                if (ng >= 2) {
+                    if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
+                    i += ng - 1;
+                } else if (ctx->qbits == 4 ? !ggml_backend_ork_mul_mat_i4(ctx, node)
+                                           : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
+                    return GGML_STATUS_FAILED;
+                }
                 break;
+            }
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
