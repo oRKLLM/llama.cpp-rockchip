@@ -21,14 +21,18 @@ extern "C" {
 #include "ork_npu.h"
 }
 
-// a packed int8 weight + its per-output-channel scales (W8A8): kept NPU-resident and reused.
+// a packed quantized weight + its scales, kept NPU-resident and reused.
+//   int8 (W8A8):  gsize==0, bscale [N]            (per output channel)
+//   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
 struct ork_weight {
     ork_w * w = nullptr;
-    std::vector<float> bscale;   // [N] per-channel weight scale
+    std::vector<float> bscale;
+    int gsize = 0;
 };
 
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
+    int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
@@ -40,7 +44,7 @@ struct ggml_backend_ork_context {
 };
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
-static bool ggml_backend_ork_mul_mat(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -120,6 +124,82 @@ static bool ggml_backend_ork_mul_mat(ggml_backend_ork_context * ctx, struct ggml
     return true;
 }
 
+// int4 (W4A4) with per-group scales. The NPU MAC is same-precision, so int4 weights require int4
+// activations too — weights AND activations are per-group int4-quantized (group_size G along K),
+// the NPU dequantizes each group's int partial in fp32. ~9.5% matmul error (W4A4 floor; weights at
+// 0.5 B/elem). Submit-heavy (K/G submits/core), so coarser/larger G is cheaper but less accurate.
+static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const enum ggml_type type = src0->type;
+    const int K = (int) ne00, N = (int) ne01, M = (int) ne11;
+    const int G = (K % 128 == 0) ? 128 : (K % 64 == 0) ? 64 : 32;   // largest std group dividing K
+    const int NG = K / G;
+
+    const int64_t r2 = ne12/ne02, r3 = ne13/ne03;
+    const auto * tt = ggml_get_type_traits(type);
+    ggml_to_float_t const to_float = tt->to_float;
+
+    ctx->f32.resize((size_t) N * K);
+    ctx->bi .resize((size_t) K * N);
+    ctx->ai .resize((size_t) M * K);
+    ctx->as .resize((size_t) M * NG);                 // per-row, per-group activation scale
+    float  * f32 = ctx->f32.data();
+    int8_t * bi  = ctx->bi.data();
+    int8_t * ai  = ctx->ai.data();
+    float  * as  = ctx->as.data();
+
+    for (int64_t i13 = 0; i13 < ne13; i13++) {
+        for (int64_t i12 = 0; i12 < ne12; i12++) {
+            const char  * x = (const char *) src0->data + (i13/r3)*nb03 + (i12/r2)*nb02;
+            const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
+                  float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);
+
+            auto it = ctx->wcache.find(x);
+            if (it == ctx->wcache.end()) {
+                if (type == GGML_TYPE_F32) {
+                    for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
+                } else {
+                    for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
+                }
+                ork_weight ow; ow.gsize = G; ow.bscale.resize((size_t) NG * N);
+                for (int g = 0; g < NG; g++)
+                    for (int n = 0; n < N; n++) {
+                        float mx = 1e-9f;
+                        for (int j = 0; j < G; j++) { float v = fabsf(f32[(size_t) n*K + g*G + j]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; ow.bscale[(size_t) g*N + n] = s;
+                        for (int j = 0; j < G; j++) {
+                            int q = (int) lrintf(f32[(size_t) n*K + g*G + j] / s);
+                            bi[(size_t)(g*G + j)*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
+                    }
+                ow.w = ork_mm_pack_i4_grouped(ctx->npu, K, N, bi, G);
+                if (!ow.w) return false;
+                it = ctx->wcache.emplace(x, std::move(ow)).first;
+            }
+            const ork_weight & ow = it->second;
+
+            // activations: per-row, per-group int4 quant
+            for (int m = 0; m < M; m++)
+                for (int g = 0; g < NG; g++) {
+                    float mx = 1e-9f;
+                    for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
+                    float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
+                    for (int j = 0; j < G; j++) {
+                        int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
+                        ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                    }
+                }
+
+            // grouped run dequantizes per group into the fp32 dst directly
+            if (ork_mm_run_i4_grouped(ctx->npu, ow.w, M, ai, as, ow.bscale.data(), d)) return false;
+        }
+    }
+    return true;
+}
+
 // backend interface
 
 static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "ORK"; GGML_UNUSED(backend); }
@@ -138,7 +218,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         struct ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
             case GGML_OP_MUL_MAT:
-                if (!ggml_backend_ork_mul_mat(ctx, node)) return GGML_STATUS_FAILED;
+                if (ctx->qbits == 4 ? !ggml_backend_ork_mul_mat_i4(ctx, node)
+                                    : !ggml_backend_ork_mul_mat_i8(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
@@ -180,6 +261,9 @@ ggml_backend_t ggml_backend_ork_init(void) {
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
+    const char * q = getenv("ORK_QUANT");
+    ctx->qbits = (q && q[0] == '4') ? 4 : 8;
+    GGML_LOG_INFO("%s: ork backend ready (W%dA%d)\n", __func__, ctx->qbits, ctx->qbits);
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_ork_guid(),
         /* .interface = */ ork_backend_i,
@@ -230,7 +314,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const int64_t min_batch = 32;                 // NPU only pays off on large matmuls
             return ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
-                   K % 32 == 0 && N % 32 == 0 &&           // ork int8 (W8A8) path: K%32, N%32
+                   K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
                    (M >= min_batch || N >= min_batch) && K >= min_batch &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
