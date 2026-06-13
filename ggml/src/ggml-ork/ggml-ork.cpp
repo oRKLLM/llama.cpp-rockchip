@@ -42,6 +42,10 @@ struct ggml_backend_ork_context {
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
+    // reuse the quantized activation across consecutive matmuls that share the same src1 input
+    // (Q/K/V off the normed hidden state; FFN gate/up off the same x) — skips redundant per-matmul
+    // activation int8-quant. Holds for the data in ctx->ai/as while last_* matches.
+    const void * last_src1 = nullptr; int last_M = 0, last_K = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
@@ -108,9 +112,13 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const ork_weight & ow = it->second;
 
             const double t0 = ctx->profile ? ork_now_us() : 0;
-            // activation: per-row int8 quant. SIMD-vectorizable inner loops (precomputed inverse
-            // scale + branchless round, no per-element divide or lrintf). NOT threaded: the per-call
-            // work is small relative to NPU submit latency, and OpenMP region overhead net-hurt here.
+            // activation: per-row int8 quant, SIMD-vectorizable inner loops (precomputed inverse
+            // scale + branchless round). Reused if the previous matmul had the SAME src1 (QKV /
+            // gate-up share their input) — ai/as still hold it. (NOT threaded: OpenMP region overhead
+            // net-hurt; the per-call work is small vs NPU submit latency.)
+            const bool reuse_act = (src1->data == ctx->last_src1) && (M == ctx->last_M) && (K == ctx->last_K)
+                                   && i12 == 0 && i13 == 0;
+            if (!reuse_act) {
             for (int m = 0; m < M; m++) {
                 const float * yr = y + (size_t) m*K;
                 int8_t * ar = ai + (size_t) m*K;
@@ -123,6 +131,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                     int qi = (int) (q + copysignf(0.5f, q));
                     ar[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                 }
+            }
+            ctx->last_src1 = src1->data; ctx->last_M = M; ctx->last_K = K;
             }
 
             const double t1 = ctx->profile ? ork_now_us() : 0;
@@ -264,6 +274,7 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     const ork_weight & ow = it->second;
 
     ctx->ai.resize((size_t) M*K); ctx->as.resize(M); ctx->ci.resize((size_t) M*Ntot);
+    ctx->last_src1 = nullptr;                            // group overwrote ctx->ai — kill reuse cache
     int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
     const float * y = (const float *) src1->data;
     for (int m = 0; m < M; m++) {                        // quantize the shared activation once
