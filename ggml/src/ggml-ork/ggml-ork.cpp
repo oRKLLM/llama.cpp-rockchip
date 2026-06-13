@@ -14,6 +14,7 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <ctime>
 #include <utility>
 #include <unordered_map>
 
@@ -41,7 +42,10 @@ struct ggml_backend_ork_context {
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
+    // ORK_PROFILE=1: accumulate where time goes, report on free
+    double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
 };
+static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
@@ -102,6 +106,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
+            const double t0 = ctx->profile ? ork_now_us() : 0;
             // activation: per-row int8 quant. SIMD-vectorizable inner loops (precomputed inverse
             // scale + branchless round, no per-element divide or lrintf). NOT threaded: the per-call
             // work is small relative to NPU submit latency, and OpenMP region overhead net-hurt here.
@@ -119,7 +124,9 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 }
             }
 
+            const double t1 = ctx->profile ? ork_now_us() : 0;
             if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;
+            const double t2 = ctx->profile ? ork_now_us() : 0;
 
             // dequant int32 -> fp32 dst: d[m][n] = aScale[m]*bScale[n]*C[m][n] (SIMD over n)
             const float * bs = ow.bscale.data();
@@ -129,6 +136,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 float * dr = d + (size_t) m*N;
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
             }
+            if (ctx->profile) { double t3 = ork_now_us();
+                ctx->t_quant += t1-t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++; }
         }
     }
     return true;
@@ -216,6 +225,12 @@ static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "
 
 static void ggml_backend_ork_free(ggml_backend_t backend) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->profile && ctx->n_mm) {
+        double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
+        GGML_LOG_INFO("ork profile: %ld matmuls | quant %.0fms (%.0f%%) run %.0fms (%.0f%%) dequant %.0fms (%.0f%%) | %.1f us/matmul (run %.1f us)\n",
+            ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/tot, ctx->t_run/1e3, 100*ctx->t_run/tot,
+            ctx->t_deq/1e3, 100*ctx->t_deq/tot, tot/ctx->n_mm, ctx->t_run/ctx->n_mm);
+    }
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
@@ -273,6 +288,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->npu = npu;
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;
+    ctx->profile = getenv("ORK_PROFILE") != nullptr;
     GGML_LOG_INFO("%s: ork backend ready (W%dA%d)\n", __func__, ctx->qbits, ctx->qbits);
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_ork_guid(),
