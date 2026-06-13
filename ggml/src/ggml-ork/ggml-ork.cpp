@@ -42,8 +42,9 @@ struct ggml_backend_ork_context {
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
-    // ORK_PROFILE=1: accumulate where time goes, report on free
+    // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
+    double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
 };
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
@@ -137,7 +138,9 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
             }
             if (ctx->profile) { double t3 = ork_now_us();
-                ctx->t_quant += t1-t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++; }
+                ctx->t_quant += t1-t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++;
+                if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; }
+                else       { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
         }
     }
     return true;
@@ -230,6 +233,9 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         GGML_LOG_INFO("ork profile: %ld matmuls | quant %.0fms (%.0f%%) run %.0fms (%.0f%%) dequant %.0fms (%.0f%%) | %.1f us/matmul (run %.1f us)\n",
             ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/tot, ctx->t_run/1e3, 100*ctx->t_run/tot,
             ctx->t_deq/1e3, 100*ctx->t_deq/tot, tot/ctx->n_mm, ctx->t_run/ctx->n_mm);
+        if (ctx->n_dec) GGML_LOG_INFO("ork profile: decode  (M=1)  %ld matmuls, run %.1f us/matmul\n", ctx->n_dec, ctx->t_run_dec/ctx->n_dec);
+        if (ctx->n_pf)  GGML_LOG_INFO("ork profile: prefill (M>1) %ld matmuls, avgM %.1f, run %.1f us/matmul (%.2f us/row)\n",
+            ctx->n_pf, (double)ctx->m_pf/ctx->n_pf, ctx->t_run_pf/ctx->n_pf, ctx->t_run_pf/ctx->m_pf);
     }
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     if (ctx->npu) ork_npu_free(ctx->npu);
