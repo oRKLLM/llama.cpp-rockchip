@@ -102,23 +102,33 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            // activation: per-row int8 quant
+            // activation: per-row int8 quant. SIMD-vectorizable inner loops (precomputed inverse
+            // scale + branchless round, no per-element divide or lrintf). NOT threaded: the per-call
+            // work is small relative to NPU submit latency, and OpenMP region overhead net-hurt here.
             for (int m = 0; m < M; m++) {
+                const float * yr = y + (size_t) m*K;
+                int8_t * ar = ai + (size_t) m*K;
                 float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(y[(size_t) m*K + k]); if (v > mx) mx = v; }
-                float s = mx / 127.0f; as[m] = s;
+                for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                as[m] = mx / 127.0f;
+                const float inv = 127.0f / mx;
                 for (int k = 0; k < K; k++) {
-                    int q = (int) lrintf(y[(size_t) m*K + k] / s);
-                    ai[(size_t) m*K + k] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                    float q = yr[k] * inv;
+                    int qi = (int) (q + copysignf(0.5f, q));
+                    ar[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                 }
             }
 
             if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;
 
-            // dequant int32 -> fp32 dst:  d[m][n] = aScale[m] * bScale[n] * C[m][n]
-            for (int m = 0; m < M; m++)
-                for (int n = 0; n < N; n++)
-                    d[(size_t) m*N + n] = as[m] * ow.bscale[n] * (float) ci[(size_t) m*N + n];
+            // dequant int32 -> fp32 dst: d[m][n] = aScale[m]*bScale[n]*C[m][n] (SIMD over n)
+            const float * bs = ow.bscale.data();
+            for (int m = 0; m < M; m++) {
+                const float rs = as[m];
+                const int32_t * cr = ci + (size_t) m*N;
+                float * dr = d + (size_t) m*N;
+                for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+            }
         }
     }
     return true;
