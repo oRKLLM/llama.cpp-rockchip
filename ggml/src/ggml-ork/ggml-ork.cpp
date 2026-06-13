@@ -303,6 +303,8 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
+    if (ork_off) return false;
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     switch (op->op) {
