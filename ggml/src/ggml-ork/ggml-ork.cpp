@@ -1,10 +1,11 @@
 // ork-driver NPU matmul backend for ggml (Rockchip RK35xx).
 //
 // Modeled on the BLAS backend: a mul-mat-only accelerator that offloads GGML_OP_MUL_MAT to the
-// Rockchip NPU via ork-driver and leaves all other ops to the CPU backend. First cut uses the fp16
-// path (W16A16): weights are dequantized to fp16, activations converted F32->fp16, the matmul runs
-// on the NPU, and the fp32 result is written straight into dst. Correct and accurate; weight packing
-// happens per call (to be cached later). int8/int4 fast paths can be added on top.
+// Rockchip NPU via ork-driver and leaves all other ops to the CPU backend. Uses the int8 (W8A8)
+// path: weights are dequantized then per-channel int8-quantized and packed once (cached, NPU-
+// resident); activations are per-row int8-quantized each call; the NPU computes the int32 product
+// which is dequantized (aScale[m]*bScale[n]) into the fp32 dst. ~1% vs fp32 on real weights, half
+// the weight bytes of fp16. (int4/W4A4 + per-group scales is the next step down.)
 
 #include "ggml-impl.h"
 #include "ggml-ork.h"
@@ -12,20 +13,30 @@
 
 #include <vector>
 #include <cstring>
+#include <cmath>
+#include <utility>
 #include <unordered_map>
 
 extern "C" {
 #include "ork_npu.h"
 }
 
+// a packed int8 weight + its per-output-channel scales (W8A8): kept NPU-resident and reused.
+struct ork_weight {
+    ork_w * w = nullptr;
+    std::vector<float> bscale;   // [N] per-channel weight scale
+};
+
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
-    std::vector<float>   f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
-    std::vector<ork_f16> bf;    // weights as fp16 B[K*N]      (cache-miss scratch)
-    std::vector<ork_f16> af;    // activations as fp16 A[M*K]
-    // model weights are constant during inference, so pack each once (NPU-resident) and reuse,
-    // keyed by the weight plane's host pointer. This is the transformer pattern ork-driver is for.
-    std::unordered_map<const void *, ork_w *> wcache;
+    std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
+    std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
+    std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
+    std::vector<float>    as;    // per-row activation scale [M]
+    std::vector<int32_t>  ci;    // int32 matmul result [M*N] before dequant
+    // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
+    // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
+    std::unordered_map<const void *, ork_weight> wcache;
 };
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
@@ -44,11 +55,15 @@ static bool ggml_backend_ork_mul_mat(ggml_backend_ork_context * ctx, struct ggml
     ggml_to_float_t const to_float = tt->to_float;
 
     ctx->f32.resize((size_t) N * K);
-    ctx->bf .resize((size_t) K * N);
-    ctx->af .resize((size_t) M * K);
+    ctx->bi .resize((size_t) K * N);
+    ctx->ai .resize((size_t) M * K);
+    ctx->as .resize((size_t) M);
+    ctx->ci .resize((size_t) M * N);
     float   * f32 = ctx->f32.data();
-    ork_f16 * bf  = ctx->bf.data();
-    ork_f16 * af  = ctx->af.data();
+    int8_t  * bi  = ctx->bi.data();
+    int8_t  * ai  = ctx->ai.data();
+    float   * as  = ctx->as.data();
+    int32_t * ci  = ctx->ci.data();
 
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
@@ -59,30 +74,47 @@ static bool ggml_backend_ork_mul_mat(ggml_backend_ork_context * ctx, struct ggml
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13); // [M][K] f32
                   float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);   // [M][N] f32
 
-            // pack the weight plane once (NPU-resident), reuse on later tokens
-            ork_w * w;
+            // weight: dequant -> per-channel int8 quant -> pack, ONCE (cached, NPU-resident)
             auto it = ctx->wcache.find(x);
-            if (it != ctx->wcache.end()) {
-                w = it->second;
-            } else {
-                // src0 -> fp32 [N][K]
+            if (it == ctx->wcache.end()) {
                 if (type == GGML_TYPE_F32) {
                     for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
                 } else {
                     for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
                 }
-                // -> fp16 B[K][N]   (B[k][n] = src0[n][k])
-                for (int n = 0; n < N; n++)
-                    for (int k = 0; k < K; k++) bf[(size_t) k*N + n] = (ork_f16) f32[(size_t) n*K + k];
-                w = ork_mm_pack(ctx->npu, K, N, bf);
-                if (!w) return false;
-                ctx->wcache[x] = w;
+                ork_weight ow; ow.bscale.resize(N);
+                for (int n = 0; n < N; n++) {
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+                    float s = mx / 127.0f; ow.bscale[n] = s;
+                    for (int k = 0; k < K; k++) {           // B[k][n] = src0[n][k]
+                        int q = (int) lrintf(f32[(size_t) n*K + k] / s);
+                        bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                    }
+                }
+                ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
+                if (!ow.w) return false;
+                it = ctx->wcache.emplace(x, std::move(ow)).first;
             }
-            // src1 -> fp16 A[M][K]
-            for (int64_t i = 0; i < (int64_t) M*K; i++) af[i] = (ork_f16) y[i];
+            const ork_weight & ow = it->second;
 
-            int rc = ork_mm_run(ctx->npu, w, M, af, d);
-            if (rc) return false;
+            // activation: per-row int8 quant
+            for (int m = 0; m < M; m++) {
+                float mx = 1e-9f;
+                for (int k = 0; k < K; k++) { float v = fabsf(y[(size_t) m*K + k]); if (v > mx) mx = v; }
+                float s = mx / 127.0f; as[m] = s;
+                for (int k = 0; k < K; k++) {
+                    int q = (int) lrintf(y[(size_t) m*K + k] / s);
+                    ai[(size_t) m*K + k] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                }
+            }
+
+            if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;
+
+            // dequant int32 -> fp32 dst:  d[m][n] = aScale[m] * bScale[n] * C[m][n]
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                    d[(size_t) m*N + n] = as[m] * ow.bscale[n] * (float) ci[(size_t) m*N + n];
         }
     }
     return true;
@@ -94,7 +126,7 @@ static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "
 
 static void ggml_backend_ork_free(ggml_backend_t backend) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
-    for (auto & kv : ctx->wcache) ork_w_free(kv.second);
+    for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     delete backend;
@@ -198,7 +230,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const int64_t min_batch = 32;                 // NPU only pays off on large matmuls
             return ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
-                   K % 32 == 0 && N % 16 == 0 &&           // ork fp16 path: K%32, N%16
+                   K % 32 == 0 && N % 32 == 0 &&           // ork int8 (W8A8) path: K%32, N%32
                    (M >= min_batch || N >= min_batch) && K >= min_batch &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
