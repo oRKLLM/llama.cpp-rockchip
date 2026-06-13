@@ -34,6 +34,8 @@ struct ork_weight {
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
     int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
+    int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
+    int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
@@ -116,7 +118,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             // scale + branchless round). Reused if the previous matmul had the SAME src1 (QKV /
             // gate-up share their input) — ai/as still hold it. (NOT threaded: OpenMP region overhead
             // net-hurt; the per-call work is small vs NPU submit latency.)
-            const bool reuse_act = (src1->data == ctx->last_src1) && (M == ctx->last_M) && (K == ctx->last_K)
+            const bool reuse_act = !ctx->no_reuse && (src1->data == ctx->last_src1) && (M == ctx->last_M) && (K == ctx->last_K)
                                    && i12 == 0 && i13 == 0;
             if (!reuse_act) {
             for (int m = 0; m < M; m++) {
@@ -151,6 +153,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 ctx->t_quant += t1-t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++;
                 if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; }
                 else       { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
+            if (ctx->no_cache) { ork_w_free(it->second.w); ctx->wcache.erase(it); }  // re-pack next call (A/B)
         }
     }
     return true;
@@ -405,6 +408,8 @@ ggml_backend_t ggml_backend_ork_init(void) {
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
+    ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
+    ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     GGML_LOG_INFO("%s: ork backend ready (W%dA%d)\n", __func__, ctx->qbits, ctx->qbits);
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_ork_guid(),
