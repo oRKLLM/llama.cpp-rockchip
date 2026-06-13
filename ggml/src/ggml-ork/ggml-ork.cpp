@@ -315,6 +315,15 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         if (ctx->n_dec) GGML_LOG_INFO("ork profile: decode  (M=1)  %ld matmuls, run %.1f us/matmul\n", ctx->n_dec, ctx->t_run_dec/ctx->n_dec);
         if (ctx->n_pf)  GGML_LOG_INFO("ork profile: prefill (M>1) %ld matmuls, avgM %.1f, run %.1f us/matmul (%.2f us/row)\n",
             ctx->n_pf, (double)ctx->m_pf/ctx->n_pf, ctx->t_run_pf/ctx->n_pf, ctx->t_run_pf/ctx->m_pf);
+        // run_multicore phase split: where the per-matmul "run" time actually goes (kernel vs machinery)
+        double rt_s = 0, rt_sub = 0, rt_cp = 0; long rt_n = 0;
+        ork_npu_run_timing(&rt_s, &rt_sub, &rt_cp, &rt_n);
+        if (rt_n) {
+            double rt_tot = rt_s + rt_sub + rt_cp;
+            GGML_LOG_INFO("ork profile: run_multicore %ld calls | setup %.0fms (%.0f%%) submit %.0fms (%.0f%%) copy %.0fms (%.0f%%) | %.1f us/call (setup %.1f submit %.1f copy %.1f)\n",
+                rt_n, rt_s/1e3, 100*rt_s/rt_tot, rt_sub/1e3, 100*rt_sub/rt_tot, rt_cp/1e3, 100*rt_cp/rt_tot,
+                rt_tot/rt_n, rt_s/rt_n, rt_sub/rt_n, rt_cp/rt_n);
+        }
     }
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     if (ctx->npu) ork_npu_free(ctx->npu);
@@ -446,11 +455,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
-            const int64_t min_batch = 32;                 // NPU only pays off on large matmuls
+            // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
+            // DECODE (M=1) a net LOSS vs CPU (4.7 vs 9.4 tok/s) — ~197 submits/token at 365us each is
+            // ~72ms before any compute benefit, and M=1 matmuls are tiny. PREFILL (large M) is the
+            // opposite: M>1 amortizes the floor over many rows, so NPU wins (39.6 vs 13.6 tok/s).
+            // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
+            // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
+            static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
             return ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
-                   (M >= min_batch || N >= min_batch) && K >= min_batch &&
+                   M >= min_m && K >= 32 &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
         default:
