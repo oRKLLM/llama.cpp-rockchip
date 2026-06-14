@@ -58,6 +58,10 @@ static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_M
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    if (getenv("ORK_BUFPROBE")) { static int once=0; if(!once++) fprintf(stderr,
+        "[ork bufprobe] src1(act) buft=%s | dst(out) buft=%s\n",
+        src1->buffer?ggml_backend_buffer_name(src1->buffer):"(none)",
+        dst->buffer?ggml_backend_buffer_name(dst->buffer):"(none)"); }
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const enum ggml_type type = src0->type;
