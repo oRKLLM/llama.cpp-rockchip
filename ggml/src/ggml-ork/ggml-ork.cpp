@@ -404,11 +404,13 @@ static ggml_guid_t ggml_backend_ork_guid(void) {
     return &guid;
 }
 
+static ork_npu * g_ork_npu = nullptr;   // for the zero-copy DMA buffer type (single NPU per process)
 ggml_backend_t ggml_backend_ork_init(void) {
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
+    g_ork_npu = npu;   // for the zero-copy DMA buffer type (single NPU per process)
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
@@ -446,8 +448,41 @@ static void ggml_backend_ork_device_get_props(ggml_backend_dev_t dev, struct ggm
 static ggml_backend_t ggml_backend_ork_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     return ggml_backend_ork_init(); GGML_UNUSED(dev); GGML_UNUSED(params);
 }
+// ---- zero-copy DMA buffer type ------------------------------------------------------------------
+// Allocates compute buffers in ork's NPU-coherent, CPU-mapped DMA memory (ork_dma_alloc). is_host=true
+// so ggml treats it like host memory: CPU ops read/write it in place AND no cross-backend copies are
+// inserted — yet ork's mul_mat sees the tensors via dma_find() and runs zero-copy (no host gather/
+// writeout). EXPERIMENTAL (feature/zerocopy-buft): only effective if ggml-sched actually uses this
+// buft for the compute tensors — probe with ORK_BUFPROBE. ORK_DMA_BUFT=0 disables (→ plain CPU buft).
+static const char * ggml_backend_ork_dma_buft_name(ggml_backend_buffer_type_t buft) { return "ORK-DMA"; GGML_UNUSED(buft); }
+static ggml_backend_buffer_t ggml_backend_ork_dma_buft_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    void * p = g_ork_npu ? ork_dma_alloc(g_ork_npu, size) : nullptr;
+    if (!p) return ggml_backend_cpu_buffer_type()->iface.alloc_buffer(ggml_backend_cpu_buffer_type(), size); // fallback (table full / no npu)
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(p, size);   // host-buffer semantics over the DMA ptr
+    buf->buft = buft;                                                        // tag it as ORK-DMA (freed at ork_npu teardown)
+    return buf;
+}
+static size_t ggml_backend_ork_dma_buft_align(ggml_backend_buffer_type_t buft) { return 64; GGML_UNUSED(buft); }
+static bool   ggml_backend_ork_dma_buft_is_host(ggml_backend_buffer_type_t buft) { return true; GGML_UNUSED(buft); }
+static ggml_backend_buffer_type_t ggml_backend_ork_dma_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name      = */ ggml_backend_ork_dma_buft_name,
+            /* .alloc_buffer  = */ ggml_backend_ork_dma_buft_alloc,
+            /* .get_alignment = */ ggml_backend_ork_dma_buft_align,
+            /* .get_max_size  = */ NULL,
+            /* .get_alloc_size= */ NULL,
+            /* .is_host       = */ ggml_backend_ork_dma_buft_is_host,
+        },
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+    return &buft;
+}
 static ggml_backend_buffer_type_t ggml_backend_ork_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type(); GGML_UNUSED(dev);
+    static const int use_dma = getenv("ORK_DMA_BUFT") ? atoi(getenv("ORK_DMA_BUFT")) : 1;  // default on (this branch)
+    return use_dma ? ggml_backend_ork_dma_buffer_type() : ggml_backend_cpu_buffer_type();
+    GGML_UNUSED(dev);
 }
 static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     return ggml_backend_cpu_buffer_from_ptr(ptr, size); GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
