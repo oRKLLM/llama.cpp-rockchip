@@ -34,6 +34,7 @@ struct ork_weight {
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
     int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
+    int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
@@ -41,6 +42,7 @@ struct ggml_backend_ork_context {
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
     std::vector<float>    as;    // per-row activation scale [M]
     std::vector<int32_t>  ci;    // int32 matmul result [M*N] before dequant
+    std::vector<float>    arot;  // rotated activation row [K] scratch (Hadamard int4 path)
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
@@ -239,6 +241,107 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
     return true;
 }
 
+// In-place normalized fast Walsh-Hadamard transform on each contiguous b-block of v[K] (b a power of
+// 2). The operator R = diag(H_b,...,H_b)/sqrt(b) is orthonormal+symmetric, so A·B = (A·R)·(R·B) is
+// exact in fp32 while spreading per-block outliers — making per-CHANNEL int4 quant of A,B accurate
+// (QuaRot/SpinQuant). b = K&(-K) (largest power of 2 dividing K) maximizes the block (full FWHT when K
+// is a power of 2). See ork-driver tools/hadamard_*.c and ROADMAP Tier 4a.
+static void ork_fwht_block(float * v, int K, int b) {
+    const float s = 1.0f / sqrtf((float) b);
+    for (int off = 0; off < K; off += b) {
+        float * x = v + off;
+        for (int len = 1; len < b; len <<= 1)
+            for (int i = 0; i < b; i += len << 1)
+                for (int j = i; j < i + len; j++) { float a = x[j], c = x[j + len]; x[j] = a + c; x[j + len] = a - c; }
+        for (int i = 0; i < b; i++) x[i] *= s;
+    }
+}
+
+// int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (ORK_HADAMARD=1). Weights are
+// rotated (R·B) and per-channel int4-quantized once at load (cached); activations are rotated (A·R)
+// and per-row int4-quantized each matmul; the rotation cancels in fp32 (A·B = (A·R)·(R·B)) but lets
+// the coarse per-channel int4 quant stay accurate. Per-channel = full-K SINGLE submit (ork_mm_run_i4),
+// not the grouped path's K/G submits. The NPU int MAC is exact; the only loss is the int4 quant the
+// rotation tames. See ROADMAP Tier 4a/4b.
+static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const enum ggml_type type = src0->type;
+    const int K = (int) ne00, N = (int) ne01, M = (int) ne11;
+    const int b = K & (-K);                          // largest power-of-2 block dividing K (full FWHT if K is pow2)
+
+    const int64_t r2 = ne12/ne02, r3 = ne13/ne03;
+    const auto * tt = ggml_get_type_traits(type);
+    ggml_to_float_t const to_float = tt->to_float;
+
+    ctx->f32.resize((size_t) N * K);
+    ctx->bi .resize((size_t) K * N);
+    ctx->ai .resize((size_t) M * K);
+    ctx->as .resize((size_t) M);
+    ctx->ci .resize((size_t) M * N);
+    ctx->arot.resize((size_t) K);
+    float   * f32  = ctx->f32.data();
+    int8_t  * bi   = ctx->bi.data();
+    int8_t  * ai   = ctx->ai.data();
+    float   * as   = ctx->as.data();
+    int32_t * ci   = ctx->ci.data();
+    float   * arow = ctx->arot.data();
+
+    for (int64_t i13 = 0; i13 < ne13; i13++) {
+        for (int64_t i12 = 0; i12 < ne12; i12++) {
+            const char  * x = (const char *) src0->data + (i13/r3)*nb03 + (i12/r2)*nb02;
+            const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
+                  float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);
+
+            auto it = ctx->wcache.find(x);
+            if (it == ctx->wcache.end()) {
+                if (type == GGML_TYPE_F32) {
+                    for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
+                } else {
+                    for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
+                }
+                ork_weight ow; ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
+                for (int n = 0; n < N; n++) {
+                    float * col = f32 + (size_t) n*K;
+                    ork_fwht_block(col, K, b);                              // rotate weight column R·B
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                    float s = mx / 7.0f; ow.bscale[n] = s;
+                    for (int k = 0; k < K; k++) {
+                        int q = (int) lrintf(col[k] / s);
+                        bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                    }
+                }
+                ow.w = ork_mm_pack_i4(ctx->npu, K, N, bi);
+                if (!ow.w) return false;
+                it = ctx->wcache.emplace(x, std::move(ow)).first;
+            }
+            const ork_weight & ow = it->second;
+
+            // activations: rotate each row (A·R), per-row int4 quant
+            for (int m = 0; m < M; m++) {
+                memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+                ork_fwht_block(arow, K, b);
+                float mx = 1e-9f;
+                for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                float s = mx / 7.0f; as[m] = s;
+                for (int k = 0; k < K; k++) {
+                    int q = (int) lrintf(arow[k] / s);
+                    ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                }
+            }
+
+            if (ork_mm_run_i4(ctx->npu, ow.w, M, ai, ci)) return false;    // full-K single submit, int32 C
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                    d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
+        }
+    }
+    return true;
+}
+
 // Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V
 // projections off the normed hidden state; FFN gate/up off the same x). Concatenates their weights
 // along N into one packed weight, quantizes the shared activation ONCE, runs ONE NPU matmul, then
@@ -363,8 +466,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (ng >= 2) {
                     if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
                     i += ng - 1;
-                } else if (ctx->qbits == 4 ? !ggml_backend_ork_mul_mat_i4(ctx, node)
-                                           : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
+                } else if (ctx->qbits == 4
+                               ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
+                                                : !ggml_backend_ork_mul_mat_i4(ctx, node))
+                               : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
                     return GGML_STATUS_FAILED;
                 }
                 break;
@@ -414,7 +519,9 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
-    GGML_LOG_INFO("%s: ork backend ready (W%dA%d)\n", __func__, ctx->qbits, ctx->qbits);
+    ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
+    GGML_LOG_INFO("%s: ork backend ready (W%dA%d%s)\n", __func__, ctx->qbits, ctx->qbits,
+                  ctx->hadamard ? "+Hadamard" : "");
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_ork_guid(),
         /* .interface = */ ork_backend_i,
