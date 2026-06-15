@@ -1,0 +1,84 @@
+name: Auto-Sync Controller
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Run daily at midnight UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check-and-dispatch:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Clone Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Fetch Upstream Tags
+        run: |
+          git remote add upstream https://github.com/ggerganov/llama.cpp.git
+          git fetch upstream --tags
+
+      - name: Find New Tags and Dispatch Builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const execSync = require('child_process').execSync;
+            
+            // Get all tags sorted by creation date, then filter for those in the last 30 days
+            const getTagsCmd = 'git for-each-ref --sort=-creatordate --format="%(refname:short) %(creatordate:unix)" refs/tags/';
+            const output = execSync(getTagsCmd).toString().trim().split('\n').filter(Boolean);
+            
+            const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+            const upstreamTags = [];
+            
+            for (const line of output) {
+              const [tag, unixStr] = line.split(' ');
+              if (/^b[0-9]+$/.test(tag)) {
+                const unix = parseInt(unixStr, 10);
+                if (!isNaN(unix) && unix >= cutoff) {
+                  upstreamTags.push(tag);
+                }
+              }
+            }
+            
+            console.log(`Upstream tags from the last 30 days: ${upstreamTags.join(', ')}`);
+            
+            for (const tag of upstreamTags) {
+              const ourTag = `${tag}-ork`;
+              
+              // Check if the tag already exists on our origin remote
+              let tagExists = false;
+              try {
+                const checkTagCmd = `git ls-remote --tags origin refs/tags/${ourTag}`;
+                const result = execSync(checkTagCmd).toString().trim();
+                if (result.includes(ourTag)) {
+                  tagExists = true;
+                }
+              } catch (e) {
+                // Command returns non-zero if remote has no matching tags
+              }
+              
+              if (!tagExists) {
+                console.log(`New tag detected: ${tag}. Dispatching builder for ${ourTag}...`);
+                
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'build-rockchip.yml',
+                  ref: 'master',
+                  inputs: {
+                    upstream_tag: tag,
+                    our_tag: ourTag
+                  }
+                });
+              } else {
+                console.log(`Tag ${ourTag} already exists on remote. Skipping.`);
+              }
+            }
