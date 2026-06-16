@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 
 #include <vector>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <ctime>
@@ -69,35 +70,48 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
     const enum ggml_type type = src0->type;
     const int K = (int) ne00, N = (int) ne01, M = (int) ne11;
 
-    const int64_t r2 = ne12/ne02;        // broadcast factors (e.g. GQA / attention)
-    const int64_t r3 = ne13/ne03;
+    const int64_t r2 = ne02 > 0 ? ne12/ne02 : 1;        // broadcast factors (e.g. GQA / attention)
+    const int64_t r3 = ne03 > 0 ? ne13/ne03 : 1;
 
     const auto * tt = ggml_get_type_traits(type);
     ggml_to_float_t const to_float = tt->to_float;
 
+    const int S = (int)(ne12 * ne13);
+
+    // Temp buffers for weight packing
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
-    ctx->ai .resize((size_t) M * K);
-    ctx->as .resize((size_t) M);
-    ctx->ci .resize((size_t) M * N);
-    float   * f32 = ctx->f32.data();
-    int8_t  * bi  = ctx->bi.data();
-    int8_t  * ai  = ctx->ai.data();
-    float   * as  = ctx->as.data();
-    int32_t * ci  = ctx->ci.data();
 
-    for (int64_t i13 = 0; i13 < ne13; i13++) {
-        for (int64_t i12 = 0; i12 < ne12; i12++) {
-            const int64_t i03 = i13/r3;
-            const int64_t i02 = i12/r2;
+    for (int chunk_start = 0; chunk_start < S; chunk_start += 64) {
+        int chunk_size = std::min(64, S - chunk_start);
 
-            const char  * x = (const char *) src0->data + i02*nb02 + i03*nb03;   // [N][K], type
-            const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13); // [M][K] f32
-                  float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);   // [M][N] f32
+        ctx->ai .resize((size_t) chunk_size * M * K);
+        ctx->as .resize((size_t) chunk_size * M);
+        ctx->ci .resize((size_t) chunk_size * M * N);
 
-            // weight: dequant -> per-channel int8 quant -> pack, ONCE (cached, NPU-resident)
+        int8_t  * ai  = ctx->ai.data();
+        float   * as  = ctx->as.data();
+        int32_t * ci  = ctx->ci.data();
+
+        std::vector<ork_mm_task_i8> tasks(chunk_size);
+
+        const double t0 = ctx->profile ? ork_now_us() : 0;
+
+        for (int t = 0; t < chunk_size; t++) {
+            const int s = chunk_start + t;
+            const int i13 = s / ne12;
+            const int i12 = s % ne12;
+            const int64_t i03 = r3 > 0 ? i13/r3 : 0;
+            const int64_t i02 = r2 > 0 ? i12/r2 : 0;
+
+            const char  * x = (const char *) src0->data + i02*nb02 + i03*nb03;
+            const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
+
+            // weight: check cache / pack
             auto it = ctx->wcache.find(x);
             if (it == ctx->wcache.end()) {
+                float * f32 = ctx->f32.data();
+                int8_t * bi = ctx->bi.data();
                 if (type == GGML_TYPE_F32) {
                     for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
                 } else {
@@ -107,9 +121,9 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 for (int n = 0; n < N; n++) {
                     float mx = 1e-9f;
                     for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-                    float s = mx / 127.0f; ow.bscale[n] = s;
-                    for (int k = 0; k < K; k++) {           // B[k][n] = src0[n][k]
-                        int q = (int) lrintf(f32[(size_t) n*K + k] / s);
+                    float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
+                    for (int k = 0; k < K; k++) {
+                        int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
                         bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
                     }
                 }
@@ -119,49 +133,100 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            const double t0 = ctx->profile ? ork_now_us() : 0;
-            // activation: per-row int8 quant, SIMD-vectorizable inner loops (precomputed inverse
-            // scale + branchless round). Reused if the previous matmul had the SAME src1 (QKV /
-            // gate-up share their input) — ai/as still hold it. (NOT threaded: OpenMP region overhead
-            // net-hurt; the per-call work is small vs NPU submit latency.)
-            const bool reuse_act = !ctx->no_reuse && (src1->data == ctx->last_src1) && (M == ctx->last_M) && (K == ctx->last_K)
-                                   && i12 == 0 && i13 == 0;
-            if (!reuse_act) {
+            tasks[t].w = ow.w;
+            tasks[t].M = M;
+            tasks[t].A = ai + t * M * K;
+            tasks[t].C = ci + t * M * N;
+
+            // activation: per-row int8 quant
+            int8_t * ar = ai + t * M * K;
+            float * asr = as + t * M;
             for (int m = 0; m < M; m++) {
                 const float * yr = y + (size_t) m*K;
-                int8_t * ar = ai + (size_t) m*K;
+                int8_t * amr = ar + (size_t) m*K;
                 float mx = 1e-9f;
                 for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                as[m] = mx / 127.0f;
+                asr[m] = mx / 127.0f;
                 const float inv = 127.0f / mx;
                 for (int k = 0; k < K; k++) {
                     float q = yr[k] * inv;
                     int qi = (int) (q + copysignf(0.5f, q));
-                    ar[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                    amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                 }
             }
-            ctx->last_src1 = src1->data; ctx->last_M = M; ctx->last_K = K;
+        }
+
+        const double t1 = ctx->profile ? ork_now_us() : 0;
+
+        int ok = ork_mm_run_chain_i8(ctx->npu, chunk_size, tasks.data());
+        if (ok != 0) {
+            // Fallback to sequential single-task run
+            for (int t = 0; t < chunk_size; t++) {
+                if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
+                    return false;
+                }
             }
+        }
 
-            const double t1 = ctx->profile ? ork_now_us() : 0;
-            if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;
-            const double t2 = ctx->profile ? ork_now_us() : 0;
+        const double t2 = ctx->profile ? ork_now_us() : 0;
 
-            // dequant int32 -> fp32 dst: d[m][n] = aScale[m]*bScale[n]*C[m][n] (SIMD over n)
+        // Dequantize results
+        for (int t = 0; t < chunk_size; t++) {
+            const int s = chunk_start + t;
+            const int i13 = s / ne12;
+            const int i12 = s % ne12;
+            const int64_t i03 = r3 > 0 ? i13/r3 : 0;
+            const int64_t i02 = r2 > 0 ? i12/r2 : 0;
+            const char  * x = (const char *) src0->data + i02*nb02 + i03*nb03;
+            float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);
+
+            auto it = ctx->wcache.find(x);
+            const ork_weight & ow = it->second;
             const float * bs = ow.bscale.data();
+            const float * asr = as + t * M;
+            const int32_t * ctr = ci + t * M * N;
+
             for (int m = 0; m < M; m++) {
-                const float rs = as[m];
-                const int32_t * cr = ci + (size_t) m*N;
+                const float rs = asr[m];
+                const int32_t * cr = ctr + (size_t) m*N;
                 float * dr = d + (size_t) m*N;
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
             }
-            if (ctx->profile) { double t3 = ork_now_us();
-                ctx->t_quant += t1-t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++;
-                if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; }
-                else       { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
-            if (ctx->no_cache) { ork_w_free(it->second.w); ctx->wcache.erase(it); }  // re-pack next call (A/B)
+        }
+
+        if (ctx->profile) {
+            double t3 = ork_now_us();
+            ctx->t_quant += t1 - t0;
+            ctx->t_run   += t2 - t1;
+            ctx->t_deq   += t3 - t2;
+            ctx->n_mm    += chunk_size;
+            if (M > 1) {
+                ctx->t_run_pf  += t2 - t1;
+                ctx->n_pf      += chunk_size;
+                ctx->m_pf      += chunk_size * M;
+            } else {
+                ctx->t_run_dec += t2 - t1;
+                ctx->n_dec     += chunk_size;
+            }
+        }
+
+        if (ctx->no_cache) {
+            for (int t = 0; t < chunk_size; t++) {
+                const int s = chunk_start + t;
+                const int i13 = s / ne12;
+                const int i12 = s % ne12;
+                const int64_t i03 = r3 > 0 ? i13/r3 : 0;
+                const int64_t i02 = r2 > 0 ? i12/r2 : 0;
+                const char  * x = (const char *) src0->data + i02*nb02 + i03*nb03;
+                auto it = ctx->wcache.find(x);
+                if (it != ctx->wcache.end()) {
+                    ork_w_free(it->second.w);
+                    ctx->wcache.erase(it);
+                }
+            }
         }
     }
+
     return true;
 }
 
@@ -581,11 +646,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
-            return op->ne[2] == 1 && op->ne[3] == 1 &&
+            return (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
-                   M >= min_m && K >= 32 &&
+                   K >= 32 &&
+                   src1->ne[2] % src0->ne[2] == 0 &&
+                   src1->ne[3] % src0->ne[3] == 0 &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
         default:
