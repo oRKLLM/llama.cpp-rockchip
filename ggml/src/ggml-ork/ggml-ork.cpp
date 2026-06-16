@@ -581,7 +581,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
-            return ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+            return op->ne[2] == 1 && op->ne[3] == 1 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
                    M >= min_m && K >= 32 &&
