@@ -79,10 +79,20 @@ jobs:
           # Push the tag to remote
           git push origin "$OUR_TAG"
 
-      - name: Install ARM64 Cross-Compiler and ccache
+      - name: Install ARM64 Cross-Compiler, ccache and Vulkan dependencies
         run: |
+          sudo dpkg --add-architecture arm64
+          # Restrict default sources to amd64 and i386 to avoid 404 package errors on arm64
+          sudo sed -i 's/Types: deb/Types: deb\nArchitectures: amd64 i386/g' /etc/apt/sources.list.d/ubuntu.sources
+          # Add dedicated arm64 ports repositories
+          cat << EOF | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-updates main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-security main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-backports main universe restricted
+          EOF
           sudo apt-get update
-          sudo apt-get install -y crossbuild-essential-arm64 ccache
+          sudo apt-get install -y crossbuild-essential-arm64 ccache libvulkan-dev:arm64
           
       - name: Setup ccache
         uses: actions/cache@v4
@@ -92,11 +102,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ccache-
 
+      - name: Get latest Vulkan SDK version
+        id: vulkan_sdk_version
+        run: |
+          echo "VULKAN_SDK_VERSION=$(curl https://vulkan.lunarg.com/sdk/latest/linux.txt)" >> "$GITHUB_ENV"
+
+      - name: Use Vulkan SDK Cache
+        uses: actions/cache@v4
+        id: cache-sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+
+      - name: Setup Vulkan SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+
       - name: Configure CMake
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_ORK=ON \
+            -DGGML_VULKAN=ON \
+            -DVulkan_GLSLC_EXECUTABLE=${{ github.workspace }}/vulkan_sdk/bin/glslc \
+            -DVulkan_LIBRARY=/usr/lib/aarch64-linux-gnu/libvulkan.so \
+            -DVulkan_INCLUDE_DIR=/usr/include \
             -DGGML_CCACHE=ON \
             -DGGML_OPENMP=OFF \
             -DBUILD_SHARED_LIBS=ON \
@@ -137,7 +170,7 @@ jobs:
           UPSTREAM_TAG="${{ inputs.upstream_tag }}"
           gh release view "$UPSTREAM_TAG" --repo ggerganov/llama.cpp --json body --jq .body > upstream_body.md 2>/dev/null || echo "No upstream release notes available." > upstream_body.md
           
-          echo "Automated release of llama.cpp for Rockchip NPU (\`ggml-ork\`), rebased on upstream version \`$UPSTREAM_TAG\`." > release_body.md
+          echo "Automated release of llama.cpp with Rockchip NPU (\`ggml-ork\`) and GPU (\`ggml-vulkan\`) backends, rebased on upstream version \`$UPSTREAM_TAG\`." > release_body.md
           echo "" >> release_body.md
           echo "Included binaries (ARM64 / Linux):" >> release_body.md
           echo "- \`llama-cli\`" >> release_body.md
