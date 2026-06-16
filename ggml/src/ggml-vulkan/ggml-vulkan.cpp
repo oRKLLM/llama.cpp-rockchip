@@ -2521,8 +2521,13 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT pipeline_shader_stage_required_subgroup_size_create_info;
     pipeline_shader_stage_required_subgroup_size_create_info.requiredSubgroupSize = required_subgroup_size;
     if (device->subgroup_size_control && required_subgroup_size > 0) {
-        GGML_ASSERT(device->subgroup_min_size <= required_subgroup_size && required_subgroup_size <= device->subgroup_max_size);
-        pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
+        if (device->subgroup_min_size <= required_subgroup_size && required_subgroup_size <= device->subgroup_max_size) {
+            pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
+        } else {
+            std::cerr << "ggml-vulkan: warning: requested subgroup size " << required_subgroup_size
+                      << " is unsupported by hardware [" << device->subgroup_min_size
+                      << ".." << device->subgroup_max_size << "]. letting driver choose default." << std::endl;
+        }
     }
 
     vk::ComputePipelineCreateInfo compute_pipeline_create_info(
