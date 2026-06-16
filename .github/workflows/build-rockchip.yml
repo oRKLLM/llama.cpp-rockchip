@@ -39,24 +39,17 @@ jobs:
           git remote add upstream https://github.com/ggerganov/llama.cpp.git
           git fetch upstream --tags --force
 
-      - name: Checkout Tag and Apply Patches
+      - name: Prepare Release Tag and Strip Workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           UPSTREAM_TAG="${{ inputs.upstream_tag }}"
           OUR_TAG="${{ inputs.our_tag }}"
           
-          # Generate a patch of all custom changes on our branch relative to the upstream merge base,
-          # explicitly excluding any workflow/action files in the .github directory
-          git diff upstream/master...master -- . ':!.github' > npu_changes.patch
+          # Create and checkout a temporary branch for stripping workflows
+          git checkout -b "release-$OUR_TAG"
           
-          # Checkout the upstream tag
-          git checkout "tags/$UPSTREAM_TAG"
-          
-          # Apply the patch containing NPU changes
-          git apply npu_changes.patch
-          
-          # Completely delete the .github directory from this tag commit.
+          # Completely delete the .github directory from this release commit.
           # Pushing a new tag that contains workflow files requires "workflows" write permission
           # which the default GITHUB_TOKEN is not allowed to have. Since the tag is just a release snapshot,
           # we can safely strip the workflow files to bypass this security restriction.
@@ -67,7 +60,7 @@ jobs:
           
           # Commit the changes under the new tag
           git add .
-          git commit -m "feat: add ggml-ork backend (rebased on $UPSTREAM_TAG)"
+          git commit -m "feat: add ggml-ork backend (built directly from master for $UPSTREAM_TAG)"
           
           # Delete the existing remote release and tag if they exist
           gh release delete "$OUR_TAG" --cleanup-tag --yes 2>/dev/null || true
@@ -77,7 +70,8 @@ jobs:
           git tag "$OUR_TAG"
           
           # Push the tag to remote
-          git push origin "$OUR_TAG"
+          git push origin "$OUR_TAG" --force
+
 
       - name: Install ARM64 Cross-Compiler, ccache and Vulkan dependencies
         run: |
