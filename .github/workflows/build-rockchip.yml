@@ -1,0 +1,189 @@
+name: Build and Release NPU Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to build (e.g. b9653)'
+        required: true
+        type: string
+      our_tag:
+        description: 'Target tag to push (e.g. b9653-ork)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+    steps:
+      - name: Clone Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          ref: master
+
+      - name: Setup Git Configuration
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        run: |
+          git remote add upstream https://github.com/ggerganov/llama.cpp.git
+          git fetch upstream --tags --force
+
+      - name: Prepare Release Tag and Strip Workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG="${{ inputs.upstream_tag }}"
+          OUR_TAG="${{ inputs.our_tag }}"
+          
+          # Create and checkout a temporary branch for stripping workflows
+          git checkout -b "release-$OUR_TAG"
+          
+          # Delete the .github/workflows directory from this release commit.
+          # Pushing a new tag that contains workflow files requires "workflows" write permission
+          # which the default GITHUB_TOKEN is not allowed to have. Since the tag is just a release snapshot,
+          # we can safely strip the workflow files to bypass this security restriction.
+          git rm -rf .github/workflows
+          
+          # Update submodules at this ref
+          git submodule update --init --recursive
+          
+          # Commit the changes under the new tag
+          git add .
+          git commit -m "feat: add ggml-ork backend (built directly from master for $UPSTREAM_TAG)"
+          
+          # Delete the existing remote release and tag if they exist
+          gh release delete "$OUR_TAG" --cleanup-tag --yes 2>/dev/null || true
+          
+          # Force delete local tag if it exists and recreate it
+          git tag -d "$OUR_TAG" 2>/dev/null || true
+          git tag "$OUR_TAG"
+          
+          # Push the tag to remote
+          git push origin "$OUR_TAG" --force
+
+
+      - name: Install ARM64 Cross-Compiler, ccache and Vulkan dependencies
+        run: |
+          sudo dpkg --add-architecture arm64
+          # Restrict default sources to amd64 and i386 to avoid 404 package errors on arm64
+          sudo sed -i 's/Types: deb/Types: deb\nArchitectures: amd64 i386/g' /etc/apt/sources.list.d/ubuntu.sources
+          # Add dedicated arm64 ports repositories
+          cat << EOF | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-updates main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-security main universe restricted
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-backports main universe restricted
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y crossbuild-essential-arm64 ccache libvulkan-dev:arm64
+          
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-${{ inputs.upstream_tag }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Get latest Vulkan SDK version
+        id: vulkan_sdk_version
+        run: |
+          echo "VULKAN_SDK_VERSION=$(curl https://vulkan.lunarg.com/sdk/latest/linux.txt)" >> "$GITHUB_ENV"
+
+      - name: Use Vulkan SDK Cache
+        uses: actions/cache@v4
+        id: cache-sdk
+        with:
+          path: ./vulkan_sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}-${{ runner.os }}
+
+      - name: Setup Vulkan SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: ./.github/actions/linux-setup-vulkan
+        with:
+          path: ./vulkan_sdk
+          version: ${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_ORK=ON \
+            -DGGML_VULKAN=ON \
+            -DVulkan_GLSLC_EXECUTABLE=${{ github.workspace }}/vulkan_sdk/x86_64/bin/glslc \
+            -DVulkan_LIBRARY=/usr/lib/aarch64-linux-gnu/libvulkan.so \
+            -DVulkan_INCLUDE_DIR=${{ github.workspace }}/vulkan_sdk/x86_64/include \
+            -DGGML_CCACHE=ON \
+            -DGGML_OPENMP=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+
+      - name: Build
+        run: |
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Package Binaries
+        run: |
+          OUR_TAG="${{ inputs.our_tag }}"
+          LLAMA_SHA=$(git rev-parse --short HEAD)
+          ORK_SHA=$(git -C ggml/src/ggml-ork/ork-driver rev-parse --short HEAD)
+
+          mkdir release-bin
+          cp build/bin/llama-cli release-bin/
+          cp build/bin/llama-server release-bin/
+          cp -P build/bin/lib*.so* release-bin/
+
+          printf '{"tag":"%s","llamaCommit":"%s","orkDriverCommit":"%s"}\n' \
+            "$OUR_TAG" "$LLAMA_SHA" "$ORK_SHA" > release-bin/manifest.json
+
+          tar -czvf "llama-cpp-rockchip-npu-${OUR_TAG}.tar.gz" -C release-bin .
+
+      - name: Generate Release Notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG="${{ inputs.upstream_tag }}"
+          gh release view "$UPSTREAM_TAG" --repo ggerganov/llama.cpp --json body --jq .body > upstream_body.md 2>/dev/null || echo "No upstream release notes available." > upstream_body.md
+          
+          echo "Automated release of llama.cpp with Rockchip NPU (\`ggml-ork\`) and GPU (\`ggml-vulkan\`) backends, rebased on upstream version \`$UPSTREAM_TAG\`." > release_body.md
+          echo "" >> release_body.md
+          echo "Included binaries (ARM64 / Linux):" >> release_body.md
+          echo "- \`llama-cli\`" >> release_body.md
+          echo "- \`llama-server\`" >> release_body.md
+          echo "- \`libllama.so\` and \`libggml*.so\` shared libraries" >> release_body.md
+          echo "" >> release_body.md
+          echo "### Upstream Release Notes" >> release_body.md
+          echo "---" >> release_body.md
+          
+          cat upstream_body.md >> release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.our_tag }}
+          files: llama-cpp-rockchip-npu-*.tar.gz
+          draft: false
+          prerelease: false
+          name: Release ${{ inputs.our_tag }}
+          body_path: release_body.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
