@@ -158,6 +158,12 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 struct ggml_backend_vk_context;
 
+static ggml_vk_mode g_vk_mode = GGML_VK_MODE_ALL;
+
+GGML_BACKEND_API void ggml_vk_set_mode(enum ggml_vk_mode mode) {
+    g_vk_mode = mode;
+}
+
 #define MAX_PARAMETER_COUNT 12
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
@@ -16874,6 +16880,60 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     }
     if (!tensor_size_supported(ggml_nbytes(op))) {
         return false;
+    }
+
+    switch (g_vk_mode) {
+        case GGML_VK_MODE_ALL: break;
+        case GGML_VK_MODE_TURBOQUANT: {
+            bool is_tq = false;
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (op->src[i]) {
+                    ggml_type t = op->src[i]->type;
+                    if (t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TQ3_1S || t == GGML_TYPE_TQ4_1S) {
+                        is_tq = true;
+                    }
+                }
+            }
+            if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TQ3_1S || op->type == GGML_TYPE_TQ4_1S) {
+                is_tq = true;
+            }
+            // WHT operations for TurboQuant are UNARY ops but their output tensor shape might help, or we just allow UNARY ops.
+            // Let's also allow UNARY ops because TurboQuant requires them for pre-rotation.
+            if (op->op == GGML_OP_UNARY) {
+                is_tq = true; 
+            }
+            // TurboQuant also requires GET_ROWS / SET_ROWS if KV cache is using them, so allow them.
+            if (op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_SET_ROWS || op->op == GGML_OP_CPY) {
+                is_tq = true;
+            }
+            if (!is_tq) {
+                return false;
+            }
+            break;
+        }
+        case GGML_VK_MODE_PREFILL: {
+            bool is_prefill = false;
+            if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+                if (op->src[1] && op->src[1]->ne[1] > 1) is_prefill = true;
+            } else if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+                if (op->src[0] && op->src[0]->ne[1] > 1) is_prefill = true;
+            } else if (op->op == GGML_OP_GET_ROWS) {
+                if (op->src[1] && op->src[1]->ne[0] > 1) is_prefill = true;
+            } else {
+                // If it's a large operation or an initialization, it could be part of prefill.
+                if (ggml_nbytes(op) >= 16384) {
+                    is_prefill = true;
+                }
+            }
+            // Always allow copies to move tensors
+            if (op->op == GGML_OP_CPY) {
+                is_prefill = true;
+            }
+            if (!is_prefill) {
+                return false;
+            }
+            break;
+        }
     }
 
     switch (op->op) {
