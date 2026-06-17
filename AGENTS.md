@@ -11,6 +11,8 @@ A clean, understandable history is vital for long-term project maintenance, debu
 * **Avoid Dangerous Git Flags:** Do not use `--no-verify` to bypass pre-commit checks, avoid force pushes to shared branches, and do not amend already published commits.
 * **Targeted Cherry-Picking:** Cherry-pick single commits (e.g., hotfixes, docs) directly to destination branches rather than merging an entire branch when only a specific change is relevant.
 * **Diverged History and Main Branch Structure:** All development and feature commits must go to the `diverged-history` branch to preserve granular commit history. The `main` branch must contain exactly two commits on top of the upstream repository: one commit for GitHub Actions changes, and one commit for all other changes. These two commits on `main` are to be squashed from the `diverged-history` branch from GitHub user `mafischer`.
+* **Upstream Workflows Restriction:** To avoid cluttering the actions UI and consuming redundant runner capacity, do not re-add upstream `.github/workflows/` files. Only our custom workflows (`build-rockchip.yml`, `auto-sync-controller.yml`, and `tqp-release.yml`) must exist in the repository on any branch. All other upstream workflow files must remain deleted.
+
 
 ---
 
