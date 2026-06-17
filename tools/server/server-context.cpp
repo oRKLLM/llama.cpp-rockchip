@@ -1,4 +1,3 @@
-
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -15,6 +14,11 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "ggml-cpp.h"
+
+// TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
+#include "../../src/llama-ext.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -22,6 +26,7 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -35,6 +40,21 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static uint32_t server_n_outputs_max(const common_params & params) {
+    const uint32_t n_batch  = params.n_batch;
+
+    if (params.embedding ||
+            (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        return n_batch;
+    }
+
+    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+
+    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+
+    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -241,6 +261,11 @@ struct server_slot {
     bool need_embd() const {
         GGML_ASSERT(task);
         return task->need_embd() || (spec && common_speculative_need_embd(spec));
+    }
+
+    bool need_embd_nextn() const {
+        GGML_ASSERT(task);
+        return spec && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -668,6 +693,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    std::unordered_map<std::string, int> cache_key_slots;
 
     int trace = 0;
     int slots_debug = 0;
@@ -682,6 +708,8 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+    float  slot_cache_key_similarity = 0.0f;
+    size_t slot_cache_key_min_prefix = 0;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -734,6 +762,11 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        // note: upstream's --fit VRAM pre-estimation for the mmproj / draft-MTP
+        // context (mtmd_get_memory_usage + common_get_device_memory_data) is not
+        // carried on this fork yet; MTP itself does not depend on it.
 
         llama_init = common_init_from_params(params_base);
 
@@ -785,16 +818,17 @@ private:
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                             params_base.speculative.types.end(),
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
             //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq = 0;
-            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            cparams.n_rs_seq  = 0;
+            cparams.ctx_other = ctx_tgt;
 
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -804,16 +838,18 @@ private:
                     params_base.model.path.c_str());
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.n_rs_seq = 0;
+            cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
+            cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
+            cparams_mtp.n_rs_seq      = 0;
+            cparams_mtp.n_outputs_max = params_base.n_parallel;
+            cparams_mtp.ctx_other     = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create MTP context\n");
                 return false;
             }
-
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -873,6 +909,8 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_cache_key_similarity = params_base.slot_cache_key_similarity;
+        slot_cache_key_min_prefix = std::max<int32_t>(0, params_base.slot_cache_key_min_prefix);
 
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
@@ -881,8 +919,8 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
+            // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
         }
 
         slots.clear();
@@ -908,6 +946,10 @@ private:
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
+        }
+
+        if (ctx_dft) {
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
         }
 
         if (spec) {
@@ -1106,13 +1148,82 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_slot_by_cache_key(const std::string & cache_key) {
+        if (cache_key.empty()) {
+            return nullptr;
+        }
+
+        auto it = cache_key_slots.find(cache_key);
+        if (it == cache_key_slots.end()) {
+            return nullptr;
+        }
+
+        server_slot * slot = get_slot_by_id(it->second);
+        if (slot == nullptr) {
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->prompt.tokens.empty()) {
+            SLT_INF(*slot, "ignoring cache_key slot with empty prompt, key = %s\n", cache_key.c_str());
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->is_processing()) {
+            SLT_INF(*slot, "ignoring busy cache_key slot, key = %s\n", cache_key.c_str());
+            return nullptr;
+        }
+
+        return slot;
+    }
+
+    bool cache_key_slot_has_enough_similarity(const server_slot & slot, const server_task & task) const {
+        if (slot.prompt.tokens.empty() || task.tokens.empty()) {
+            SLT_INF(slot, "ignoring cache_key slot with empty prompt or task, key = %s\n", task.cache_key.c_str());
+            return false;
+        }
+
+        const size_t n_common = slot.prompt.tokens.get_common_prefix(task.tokens);
+        const float  sim_cur  = float(n_common) / task.tokens.size();
+        const bool enough_prefix = n_common >= slot_cache_key_min_prefix;
+        const bool enough_similarity = slot_cache_key_similarity <= 0.0f || sim_cur >= slot_cache_key_similarity;
+        if (enough_prefix && enough_similarity) {
+            SLT_INF(slot, "selected slot by cache_key, sim = %.3f (>= %.3f thold), common = %zu (>= %zu), key = %s\n",
+                    sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+            return true;
+        }
+
+        SLT_INF(slot, "ignoring cache_key slot, sim = %.3f (< %.3f thold) or common = %zu (< %zu), key = %s\n",
+                sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+        return false;
+    }
+
+    void clear_cache_keys_for_slot(int id_slot) {
+        for (auto it = cache_key_slots.begin(); it != cache_key_slots.end(); ) {
+            if (it->second == id_slot) {
+                it = cache_key_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void bind_cache_key_to_slot(const std::string & cache_key, int id_slot) {
+        clear_cache_keys_for_slot(id_slot);
+
+        if (!cache_key.empty()) {
+            cache_key_slots[cache_key] = id_slot;
+        }
+    }
+
+    server_slot * get_available_slot(const server_task & task, bool allow_prompt_similarity = true) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
 
         // find the slot that has at least n% prompt similarity
-        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+        if (allow_prompt_similarity && ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1365,6 +1476,8 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        bind_cache_key_to_slot(slot.task->cache_key, slot.id);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -1898,7 +2011,18 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
-                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
+                    server_slot * slot = nullptr;
+                    if (id_slot != -1) {
+                        slot = get_slot_by_id(id_slot);
+                    } else if (!task.cache_key.empty()) {
+                        server_slot * slot_cache_key = get_slot_by_cache_key(task.cache_key);
+                        if (slot_cache_key != nullptr && cache_key_slot_has_enough_similarity(*slot_cache_key, task)) {
+                            slot = slot_cache_key;
+                        }
+                    }
+                    if (slot == nullptr) {
+                        slot = get_available_slot(task, task.cache_key.empty());
+                    }
 
                     //
                     // slot scheduling logic
@@ -2577,10 +2701,13 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa);
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+                            const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
-                            if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                            // the largest pos_min required for a checkpoint to be useful
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+
+                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -2764,10 +2891,11 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft) {
+                        if (ctx_dft && llama_get_ctx_other(ctx_dft.get()) != ctx_tgt) {
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+                            //       [TAG_MTMD_DRAFT_PROCESSING]
                             res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
@@ -2803,7 +2931,7 @@ private:
 
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // streaming hook can mirror t_h_nextn into ctx_dft.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
@@ -3456,6 +3584,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            task.cache_key = json_value(data, "cache_key", json_value(data, "session_id", std::string()));
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

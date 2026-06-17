@@ -299,11 +299,13 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
+    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
-    float p_split = 0.1f;  // speculative decoding split probability
-    float p_min   = 0.75f; // minimum speculative decoding probability (greedy) // TODO: change default to 0.0f
+    float p_split = 0.1f; // speculative decoding split probability
+    float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+
+    bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
 
@@ -428,6 +430,7 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_outputs_max         =     0; // max outputs supported by the context (0 = derive)
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
@@ -617,8 +620,6 @@ struct common_params {
     // UI configs
 #ifdef LLAMA_UI_DEFAULT_ENABLED
     bool ui = LLAMA_UI_DEFAULT_ENABLED != 0;
-#elif defined(LLAMA_WEBUI_DEFAULT_ENABLED)
-    bool ui = LLAMA_WEBUI_DEFAULT_ENABLED != 0;
 #else
     bool ui = true; // default to enabled when not set
 #endif
@@ -650,7 +651,9 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    float slot_prompt_similarity = 0.1f;
+    float   slot_prompt_similarity        = 0.1f;
+    float   slot_cache_key_similarity     = 0.5f;
+    int32_t slot_cache_key_min_prefix     = 32;
 
     // batched-bench params
     bool is_pp_shared   = false;

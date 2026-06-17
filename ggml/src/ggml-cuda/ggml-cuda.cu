@@ -58,6 +58,8 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -104,6 +106,16 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
+// Forward declarations for host-staged cross-GPU copy helpers
+// (used by buffer ops before their definition site).
+static cudaError_t ggml_cuda_copy_across_devices(
+    void * dst, int dst_device, const void * src, int src_device,
+    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream);
+static cudaError_t ggml_cuda_copy2d_across_devices(
+    void * dst, int dst_device, size_t dpitch,
+    const void * src, int src_device, size_t spitch,
+    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream);
+
 void ggml_cuda_set_device(int device) {
     int current_device;
     CUDA_CHECK(cudaGetDevice(&current_device));
@@ -340,6 +352,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
                 if (can_access_peer) {
                     CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
+                    info.peer_access[id][id_other] = true;
                 }
             }
         }
@@ -679,10 +692,49 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// TQ4_1S load-time q8_0 conversion: ON by default for best prefill speed.
+// Native TQ4_1S decode is faster (+29-33%) but prefill is 2× slower because
+// cuBLAS dequant-to-f16 requires per-element inverse WHT.
+// Opt-out: GGML_TQ_NATIVE=1 for decode-heavy workloads (saves 1.7× VRAM).
+static bool ggml_tq_convert_q8() {
+    static int val = -1;
+    if (val == -1) {
+        const char * env = getenv("GGML_TQ_NATIVE");
+        val = (env && env[0] == '1') ? 0 : 1;  // default ON, GGML_TQ_NATIVE=1 disables
+    }
+    return val == 1;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    // TQ4_1S → q8_0 load-time conversion (opt-in: GGML_TQ_CONVERT_Q8=1)
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor)) {
+        const int64_t n_elements = ggml_nelements(tensor);
+
+        // Upload TQ4_1S to a temp GPU buffer
+        void * tmp_tq4;
+        CUDA_CHECK(cudaMalloc(&tmp_tq4, size));
+        CUDA_CHECK(cudaMemcpyAsync(tmp_tq4, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+        // Convert TQ4_1S (tmp) → q8_0 (tensor->data, which has q8_0-sized allocation)
+        ggml_cuda_convert_tq4_1s_to_q8_0(tmp_tq4, tensor->data, n_elements, cudaStreamPerThread);
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+        CUDA_CHECK(cudaFree(tmp_tq4));
+
+        // Update tensor metadata to q8_0
+        tensor->type = GGML_TYPE_Q8_0;
+        tensor->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+        tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(GGML_TYPE_Q8_0));
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            tensor->nb[i] = tensor->nb[i-1] * tensor->ne[i-1];
+        }
+
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -721,11 +773,16 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        } else if (ggml_cuda_info().peer_access[src_ctx->device][dst_ctx->device]) {
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
+            // host-staged fallback
+            CUDA_CHECK(ggml_cuda_copy_across_devices(
+                dst->data, dst_ctx->device, src->data, src_ctx->device,
+                ggml_nbytes(src), cudaStreamPerThread, cudaStreamPerThread));
 #endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -740,8 +797,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaMemset(ctx->dev_ptr, value, buffer->size));
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -802,6 +858,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
+
+    // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+        // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
+        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
+        size = n_blocks * sizeof(block_q8_0);
+    }
 
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
@@ -1798,6 +1861,129 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// Pinned host staging buffer for cross-GPU copies without peer access.
+// Reuses a single buffer across calls, growing as needed, to avoid the
+// overhead of per-call cudaMallocHost/cudaFreeHost.
+struct ggml_cuda_host_staging_pool {
+    void * buf = nullptr;
+    size_t size = 0;
+
+    cudaError_t ensure(size_t needed) {
+        if (needed <= size) {
+            return cudaSuccess;
+        }
+        if (buf) {
+            CUDA_CHECK(cudaFreeHost(buf));
+        }
+        cudaError_t err = cudaMallocHost(&buf, needed);
+        if (err != cudaSuccess) {
+            buf = nullptr;
+            size = 0;
+            return err;
+        }
+        size = needed;
+        return cudaSuccess;
+    }
+};
+
+static ggml_cuda_host_staging_pool & ggml_cuda_get_staging() {
+    static thread_local ggml_cuda_host_staging_pool pool;
+    return pool;
+}
+
+// Host-staged cross-device copy for GPUs without peer access.
+// Copies data from src_device to dst_device via a pinned host buffer.
+// Returns cudaSuccess on success, error code on failure.
+static cudaError_t ggml_cuda_copy_across_devices(
+    void * dst, int dst_device, const void * src, int src_device,
+    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream) {
+
+    const auto & info = ggml_cuda_info();
+    if (info.peer_access[src_device][dst_device]) {
+        return cudaMemcpyPeerAsync(dst, dst_device, src, src_device, size, dst_stream);
+    }
+
+    // Fallback: stage through pinned host memory via reusable pool
+    int prev_device = ggml_cuda_get_device();
+    auto & pool = ggml_cuda_get_staging();
+    cudaError_t err = pool.ensure(size);
+    if (err != cudaSuccess) { return err; }
+
+    ggml_cuda_set_device(src_device);
+    err = cudaMemcpyAsync(pool.buf, src, size, cudaMemcpyDeviceToHost, src_stream);
+    if (err != cudaSuccess) { goto cleanup; }
+
+    err = cudaStreamSynchronize(src_stream);
+    if (err != cudaSuccess) { goto cleanup; }
+
+    ggml_cuda_set_device(dst_device);
+    err = cudaMemcpyAsync(dst, pool.buf, size, cudaMemcpyHostToDevice, dst_stream);
+
+cleanup:
+    ggml_cuda_set_device(prev_device);
+    return err;
+}
+
+// 2D host-staged cross-device copy for strided data (used in split mul_mat output).
+// Batches all rows into a single contiguous staging buffer to replace the
+// original row-by-row approach (one sync per row → two syncs total).
+static cudaError_t ggml_cuda_copy2d_across_devices(
+    void * dst, int dst_device, size_t dpitch,
+    const void * src, int src_device, size_t spitch,
+    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream) {
+
+    const auto & info = ggml_cuda_info();
+    if (info.peer_access[src_device][dst_device]) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        cudaMemcpy3DPeerParms p = {};
+        p.dstDevice = dst_device;
+        p.dstPtr = make_cudaPitchedPtr(dst, dpitch, dpitch, height);
+        p.srcDevice = src_device;
+        p.srcPtr = make_cudaPitchedPtr(const_cast<void *>(src), spitch, spitch, height);
+        p.extent = make_cudaExtent(width, height, 1);
+        return cudaMemcpy3DPeerAsync(&p, dst_stream);
+#else
+        // HIP/MUSA do not provide cudaMemcpy3DPeerAsync; with peer access
+        // enabled a plain device-to-device 2D copy works across devices
+        // (same approach as ggml_cuda_Memcpy2DPeerAsync above).
+        return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, dst_stream);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    }
+
+    // Fallback: stage all rows through a single contiguous pinned buffer
+    int prev_device = ggml_cuda_get_device();
+    auto & pool = ggml_cuda_get_staging();
+    cudaError_t err = pool.ensure(width * height);
+    if (err != cudaSuccess) { return err; }
+
+    // Batch D2H for all rows
+    ggml_cuda_set_device(src_device);
+    for (size_t r = 0; r < height; r++) {
+        err = cudaMemcpyAsync(
+            (char *)pool.buf + r * width,
+            (const char *)src + r * spitch,
+            width, cudaMemcpyDeviceToHost, src_stream);
+        if (err != cudaSuccess) { goto cleanup; }
+    }
+    err = cudaStreamSynchronize(src_stream);
+    if (err != cudaSuccess) { goto cleanup; }
+
+    // Batch H2D for all rows
+    ggml_cuda_set_device(dst_device);
+    for (size_t r = 0; r < height; r++) {
+        err = cudaMemcpyAsync(
+            (char *)dst + r * dpitch,
+            (char *)pool.buf + r * width,
+            width, cudaMemcpyHostToDevice, dst_stream);
+        if (err != cudaSuccess) { goto cleanup; }
+    }
+    err = cudaStreamSynchronize(dst_stream);
+
+cleanup:
+    ggml_cuda_set_device(prev_device);
+    return err;
+}
+
 static void ggml_cuda_op_mul_mat(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_cuda_op_mul_mat_t op,
@@ -2028,7 +2214,41 @@ static void ggml_cuda_op_mul_mat(
 
                 // copy src0, src1 to device if necessary
                 if (src1_is_contiguous) {
-                    if (id != ctx.device) {
+                    if (id != ctx.device && !ggml_cuda_info().peer_access[ctx.device][id]) {
+                        // No peer access — use host-staged fallback.
+                        // We need to wait for ctx.device to finish writing src1 first.
+                        if (split) {
+                            CUDA_CHECK(cudaStreamWaitEvent(stream,
+                                src0_extra->events[ctx.device][0], 0));
+                        }
+                        if (quantize_src1) {
+                            if (quantize_src1 == quantize_mmq_q8_1_cuda) {
+                                // MMQ stores rows at ne11 pitch, not src1_ncols pitch:
+                                // a flat contiguous copy would read from wrong rows.
+                                const size_t pitch = ne11*sizeof(block_q8_1_mmq);
+                                const size_t width = src1_ncols*sizeof(block_q8_1_mmq);
+                                const size_t height = src1_padded_col_size/(4*QK8_1);
+                                CUDA_CHECK(ggml_cuda_copy2d_across_devices(
+                                    dev[id].src1_ddq + src1_ddq_i_offset, id, pitch,
+                                    dev[ctx.device].src1_ddq + src1_ddq_i_offset, ctx.device, pitch,
+                                    width, height, stream, ctx.stream()));
+                            } else {
+                                CUDA_CHECK(ggml_cuda_copy_across_devices(
+                                    dev[id].src1_ddq + src1_ddq_i_offset, id,
+                                    dev[ctx.device].src1_ddq + src1_ddq_i_offset, ctx.device,
+                                    src1_ncols*src1_padded_col_size*q8_1_ts/q8_1_bs,
+                                    stream, ctx.stream()));
+                            }
+                        } else {
+                            float * dst_p = dev[id].src1_ddf + (i0*ne11 + src1_col_0) * ne10;
+                            float * src_p = (float *) src1->data;
+                            src_p += (i0*ne11 + src1_col_0) * ne10;
+                            CUDA_CHECK(ggml_cuda_copy_across_devices(
+                                dst_p, id, src_p, ctx.device,
+                                src1_ncols*ne10*sizeof(float),
+                                stream, ctx.stream()));
+                        }
+                    } else if (id != ctx.device) {
                         if (quantize_src1) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
                             if (quantize_src1 == quantize_mmq_q8_1_cuda) {
@@ -2083,8 +2303,16 @@ static void ggml_cuda_op_mul_mat(
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02*nb2 + i03*nb3);
                         GGML_ASSERT(dst->nb[1] == ne0*sizeof(float));
                         dhf_dst_i += src1_col_0*ne0 + dev[id].row_low;
-                        CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(
-                            dhf_dst_i, ctx.device, ne0*sizeof(float), dst_dd_i, id, row_diff*sizeof(float), row_diff*sizeof(float), src1_ncols, stream));
+                        if (!ggml_cuda_info().peer_access[id][ctx.device]) {
+                            CUDA_CHECK(ggml_cuda_copy2d_across_devices(
+                                dhf_dst_i, ctx.device, ne0*sizeof(float),
+                                dst_dd_i, id, row_diff*sizeof(float),
+                                row_diff*sizeof(float), src1_ncols,
+                                ctx.stream(), stream));
+                        } else {
+                            CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(
+                                dhf_dst_i, ctx.device, ne0*sizeof(float), dst_dd_i, id, row_diff*sizeof(float), row_diff*sizeof(float), src1_ncols, stream));
+                        }
                     } else {
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02*nb2 + i03*nb3);
                         GGML_ASSERT(dst->nb[1] == ne0*sizeof(float));
@@ -2505,7 +2733,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
+                             src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2547,10 +2777,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // TQ weight types use fused dp4a path (all batch sizes), not mmvq/mmq
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2614,6 +2846,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+    } else if (!split && is_tq_weight && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
+        // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
+        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+    } else if (!split && is_tq_weight && src0->type == GGML_TYPE_TQ4_1S) {
+        // Large prefill: runtime TQ4_1S → q8_0 scratch conversion + cuBLAS
+        // Gets tensor core throughput without permanent 1.7× VRAM cost
+        ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
@@ -2633,16 +2873,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+    // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
+    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
-            } else {
+            } else if (!ggml_is_quantized(src0->type)) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
@@ -2799,6 +3041,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_turbo_wht(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -3204,11 +3449,16 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // copy on src stream
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_info().peer_access[cuda_ctx_src->device][cuda_ctx_dst->device]) {
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            CUDA_CHECK(ggml_cuda_copy_across_devices(
+                dst->data, cuda_ctx_dst->device,
+                src->data, cuda_ctx_src->device,
+                ggml_nbytes(dst), cuda_ctx_dst->stream(), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -3258,10 +3508,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+        const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            if (!ggml_is_quantized(node->src[0]->type) || is_tq_w || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -5160,6 +5411,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
                         return false;
@@ -5180,6 +5433,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
                         return false;
@@ -5191,9 +5446,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
+                // turbo types require head_dim divisible by appropriate group size
+                if ((op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0) && op->src[0]->ne[0] % 64 != 0) {
+                    return false;
+                }
+                // turbo4 block size is 128, so head_dim must be divisible by 128
+                if (op->type == GGML_TYPE_TURBO4_0 && op->src[0]->ne[0] % 128 != 0) {
+                    return false;
+                }
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                       op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5316,6 +5580,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
             return true;
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] % 32 == 0;  // supports 32, 64, and 128 WHT groups
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -5454,7 +5721,7 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
     ggml_cuda_set_device(dev_ctx->device);
 
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&event));
 
     return new ggml_backend_event {
         /* .device  = */ dev,

@@ -1,110 +1,44 @@
-# Instructions for llama.cpp
+# Agent Instructions and Development Philosophy
 
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+This document outlines the philosophical and behavioral guidelines for AI agents and human contributors working across our projects. These principles ensure code quality, maintainability, and a clean repository history.
 
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below).
+## 1. Git Hygiene and Linear History
 
----
+A clean, understandable history is vital for long-term project maintenance, debugging, and bisecting.
 
-## Guidelines for Contributors Using AI
+* **Prefer Fast-Forward Merges:** Whenever practical, keep history strictly linear. Use `git merge --ff-only` or rebase rather than creating unnecessary merge commits.
+* **Keep History Linear and Clean:** A flat history is significantly easier to bisect, revert, and understand. Avoid complex merge networks.
+* **Avoid Dangerous Git Flags:** Do not use `--no-verify` to bypass pre-commit checks, avoid force pushes to shared branches, and do not amend already published commits.
+* **Targeted Cherry-Picking:** Cherry-pick single commits (e.g., hotfixes, docs) directly to destination branches rather than merging an entire branch when only a specific change is relevant.
+* **Diverged History and Main Branch Structure:** All development and feature commits must go to the `diverged-history` branch to preserve granular commit history. The `main` branch must contain exactly two commits on top of the upstream repository: one commit for GitHub Actions changes, and one commit for all other changes. These two commits on `main` are to be squashed from the `diverged-history` branch from GitHub user `mafischer`.
+* **Upstream Workflows Restriction:** To avoid cluttering the actions UI and consuming redundant runner capacity, do not re-add upstream `.github/workflows/` files. Only our custom workflows (`build-rockchip.yml`, `auto-sync-controller.yml`, and `tqp-release.yml`) must exist in the repository on any branch. All other upstream workflow files must remain deleted.
 
-llama.cpp is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
-
-Maintainers receive numerous pull requests weekly, many of which are AI-generated submissions where the author cannot adequately explain the code, debug issues, or participate in substantive design discussions. Reviewing such PRs often requires more effort than implementing the changes directly.
-
-**A pull request represents a long-term commitment.** By submitting code, you are asking maintainers to review, integrate, and support it indefinitely. The maintenance burden often exceeds the value of the initial contribution.
-
-Most maintainers already have access to AI tools. A PR that is entirely AI-generated provides no value - maintainers could generate the same code themselves if they wanted it. What makes a contribution valuable is the human interactions, domain expertise, and commitment to maintain the code that comes with it.
-
-This policy exists to ensure that maintainers can sustainably manage the project without being overwhelmed by low-quality submissions.
 
 ---
 
-## Guidelines for Contributors
+## 2. Commit Message and PR Standards
 
-Contributors are expected to:
-
-1. **Demonstrate full understanding of their code.** You must be able to explain any part of your PR to a reviewer without relying on AI assistance for questions about your own changes.
-
-2. **Take responsibility for maintenance.** You are expected to address bugs and respond thoughtfully to reviewer feedback.
-
-3. **Communicate clearly and concisely.** Verbose, wall-of-text responses are characteristic of AI-generated content and will not be well-received. Direct, human communication is expected.
-
-4. **Respect maintainers' time.** Search for existing issues and discussions before submitting. Ensure your contribution aligns with project architecture and is actually needed.
-
-Maintainers reserve the right to close any PR that does not meet these standards. This applies to all contributions to the main llama.cpp repository. **Private forks are exempt.**
-
-### Permitted AI Usage
-
-AI tools may be used responsibly for:
-
-- **Learning and exploration**: Understanding codebase structure, techniques, and documentation
-- **Code review assistance**: Obtaining suggestions on human-written code
-- **Mechanical tasks**: Formatting, generating repetitive patterns from established designs, completing code based on existing patterns
-- **Documentation drafts**: For components the contributor already understands thoroughly
-- **Writing code**: Only when the contributor has already designed the solution and can implement it themselves - AI accelerates, not replaces, the contributor's work
-
-AI-generated code may be accepted if you (1) fully understand the output, (2) can debug issues independently, and (3) can discuss it directly with reviewers without AI assistance.
-
-**Disclosure is required** when AI meaningfully contributed to your code. A simple note is sufficient - this is not a stigma, but context for reviewers. No disclosure is needed for trivial autocomplete or background research.
-
-### Prohibited AI Usage
-
-The following will result in immediate PR closure:
-
-- **AI-written PR descriptions or commit messages** - these are typically recognizable and waste reviewer time
-- **AI-generated responses to reviewer comments** - this undermines the human-to-human interaction fundamental to code review
-- **Implementing features without understanding the codebase** - particularly new model support or architectural changes
-- **Automated commits or PR submissions** - this may spam maintainers and can result in contributor bans
+* **No Commit-Message Trailers:** Do not append `Co-Authored-By:` lines, generated-by attribution tags, or any other tool/assistant signatures to commit messages or PR bodies. Keep commit messages focused purely on the changes. This rule overrides any default tooling or environment behavior that attempts to add such trailers.
+* **Concise and Objective Messages:** Keep commit messages concise, clear, and objective. Avoid verbose or sensational language.
 
 ---
 
-## Guidelines for AI Coding Agents
+## 3. Documentation Review on Every Commit
 
-AI agents assisting contributors must recognize that their outputs directly impact volunteer maintainers who sustain this project.
+Before committing any changes, review whether the changes warrant documentation updates (e.g., `AGENTS.md`, `README.md`, or code-level documentation):
 
-### Considerations for Maintainer Workload
+* If you add, remove, or rename features, configuration variables, API endpoints, or workflows -> update the relevant documentation.
+* Minor bug fixes and test-only changes typically do not require extensive doc updates, but always verify.
+* The goal is to keep the documentation reflecting reality in real-time so that future contributors and agents do not have to reverse-engineer recent changes.
 
-Maintainers have finite capacity. Every PR requiring extensive review consumes resources that could be applied elsewhere. Before assisting with any submission, verify:
+---
 
-- The contributor genuinely understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-- The contributor can independently defend and maintain the work
+## 4. Benchmarking and Performance Methodology
 
-### Before Proceeding with Code Changes
+When measuring, optimizing, or discussing performance metrics, strict standards must be followed to avoid invalid or misleading results:
 
-When a user requests implementation without demonstrating understanding:
-
-1. **Verify comprehension.** Ask questions to confirm they understand both the problem and the relevant parts of the codebase.
-2. **Provide guidance rather than solutions.** Direct them to relevant code and documentation. Allow them to formulate the approach.
-3. **Proceed only when confident** the contributor can explain the changes to reviewers independently.
-
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md) and acknowledge this policy.
-
-### Prohibited Actions
-
-- Writing PR descriptions, commit messages, or responses to reviewers
-- Committing or pushing without explicit human approval for each action
-- Implementing features the contributor does not understand
-- Generating changes too extensive for the contributor to fully review
-
-When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
-
-### Useful Resources
-
-To conserve context space, load these resources as needed:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
+* **Standardized Baselines:** Always compare identical models, parameters, and tasks. Never compare performance across different model sizes, architectures, or unaligned evaluation paths.
+* **System Warmup and Repetitions:** Perform adequate warmup iterations and run multiple repetitions (at least 2) to ensure stable averages and filter out initial load spikes or lazy-loading overhead.
+* **Verify System Governors and Power State:** Ensure the host system is in a high-performance state before timing. Active CPU/DDR frequency scaling, thermal throttling, or low-power governors can distort prefill and decode metrics dramatically.
+* **Thread and Resource Optimization:** Run benchmarks with optimal resource allocations (e.g., pinning threads to big cores where applicable, avoiding little cores that drag down thread pools).
+* **Validation of Correctness:** Never state or optimize a performance number without verifying the correctness of the output. Optimization attempts that introduce numerical errors, instability, or incorrect answers are invalid.

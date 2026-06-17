@@ -206,6 +206,7 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turbo-quant.c
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
@@ -452,6 +453,7 @@ ggml_add_backend(CUDA)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
+ggml_add_backend(ORK)
 ggml_add_backend(RPC)
 ggml_add_backend(VirtGPU)
 ggml_add_backend(SYCL)

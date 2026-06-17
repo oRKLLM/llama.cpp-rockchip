@@ -804,12 +804,12 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
-    // but CDNA3 supports only e4m3_fnuz (no inf).
+    // but CDNA3 supports only e4m3_fnuz (no inf). CDNA4 (gfx950) uses standard e4m3fn.
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
     const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
     return static_cast<float>(xf) / 2;
 #else
-#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= 900
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
     const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
     return static_cast<float>(xf) / 2;
@@ -1105,6 +1105,11 @@ struct ggml_cuda_device_info {
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
+
+    // peer access availability: peer_access[from][to] = true when
+    // cudaDeviceEnablePeerAccess(from, to) succeeded at init time.
+    // When false, cross-device copies must use host staging instead.
+    bool peer_access[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {{}};
 
     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
 };

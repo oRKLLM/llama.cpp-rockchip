@@ -511,6 +511,13 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 byte_encode = false;
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_MINICPM5:
+                regex_exprs = {
+                    // original regex from tokenizer.json (openbmb/MiniCPM5-1B)
+                    "\\p{N}{1,3}",
+                    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                };
+                break;
             default:
                 // default regex for BPE tokenization pre-processing
                 regex_exprs = {
@@ -1676,6 +1683,8 @@ struct llama_vocab::impl {
     // set of all tokens that cause "end of generation"
     std::set<llama_token> special_eog_ids;
 
+    std::vector<llama_token> suppress_tokens;
+
     std::unique_ptr<llm_tokenizer> tokenizer;
 
     std::vector<char> precompiled_charsmap;
@@ -2019,6 +2028,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 escape_whitespaces = true;
                 clean_spaces = false;
             } else if (
+                    tokenizer_pre == "minicpm5") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_MINICPM5;
+                ignore_merges = true;
+            } else if (
                     tokenizer_pre == "jina-v1-en" ||
                     tokenizer_pre == "jina-v2-code" ||
                     tokenizer_pre == "roberta-bpe") {
@@ -2354,6 +2367,16 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 add_bos = true;
 
                 LLAMA_LOG_WARN("%s: override '%s' to 'true' for Gemma4\n", __func__, kv(LLM_KV_TOKENIZER_ADD_BOS).c_str());
+            }
+        }
+
+        // suppress tokens
+        {
+            const int suppress_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_SUPPRESS_TOKENS).c_str());
+            if (suppress_idx != -1) {
+                const int n = gguf_get_arr_n(ctx, suppress_idx);
+                const int32_t * data = (const int32_t *) gguf_get_arr_data(ctx, suppress_idx);
+                suppress_tokens.assign(data, data + n);
             }
         }
 
@@ -3769,6 +3792,10 @@ bool llama_vocab::get_escape_whitespaces() const {
 
 bool llama_vocab::get_treat_whitespace_as_suffix() const {
     return pimpl->treat_whitespace_as_suffix;
+}
+
+const std::vector<llama_token> & llama_vocab::get_suppress_tokens() const {
+    return pimpl->suppress_tokens;
 }
 
 int llama_vocab::max_token_len() const {
