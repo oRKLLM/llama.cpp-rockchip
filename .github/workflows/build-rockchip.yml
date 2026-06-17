@@ -49,11 +49,11 @@ jobs:
           # Create and checkout a temporary branch for stripping workflows
           git checkout -b "release-$OUR_TAG"
           
-          # Completely delete the .github directory from this release commit.
+          # Delete the .github/workflows directory from this release commit.
           # Pushing a new tag that contains workflow files requires "workflows" write permission
           # which the default GITHUB_TOKEN is not allowed to have. Since the tag is just a release snapshot,
           # we can safely strip the workflow files to bypass this security restriction.
-          git rm -rf .github
+          git rm -rf .github/workflows
           
           # Update submodules at this ref
           git submodule update --init --recursive
