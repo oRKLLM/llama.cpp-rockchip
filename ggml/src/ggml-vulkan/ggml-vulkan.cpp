@@ -17469,8 +17469,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     ggml_is_contiguous(op->src[1]) &&
                     ggml_is_contiguous(op));
             }
-        case GGML_OP_TURBO_WHT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
+
         default:
             return false;
     }

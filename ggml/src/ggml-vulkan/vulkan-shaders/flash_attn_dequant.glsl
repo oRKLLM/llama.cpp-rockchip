@@ -183,7 +183,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
         FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)
     }
 }
-}
+
 #else
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
