@@ -84,17 +84,19 @@ jobs:
                 ref: 'tags/',
               });
               for (const ref of refs) {
-                if (ref.ref.endsWith('-ork')) {
-                  console.log(`Deleting tag ${ref.ref}`);
+                console.log(`Deleting tag ${ref.ref}`);
+                try {
                   await github.rest.git.deleteRef({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     ref: ref.ref.replace('refs/', ''),
                   });
+                } catch (delErr) {
+                  console.warn(`Could not delete tag ${ref.ref}: ${delErr.message}`);
                 }
               }
             } catch (e) {
-              console.error(`Error deleting tags: ${e.message}`);
+              console.error(`Error fetching tags to delete: ${e.message}`);
             }
             
             async function dispatch(tag, ourTag) {
