@@ -116,6 +116,8 @@ jobs:
           version: ${{ env.VULKAN_SDK_VERSION }}
 
       - name: Configure CMake
+        env:
+          VULKAN_SDK: ${{ github.workspace }}/vulkan_sdk/x86_64
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
