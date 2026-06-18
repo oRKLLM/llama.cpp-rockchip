@@ -877,8 +877,16 @@ private:
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
-        }
-
+        const std::string mmproj_path = params_base.mmproj.path;
+        const bool has_mmproj = !mmproj_path.empty();
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = params_base.mmproj_use_gpu;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = params_base.warmup;
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();

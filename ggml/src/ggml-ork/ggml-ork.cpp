@@ -521,11 +521,23 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (ng >= 2) {
                     if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
                     i += ng - 1;
-                } else if (ctx->qbits == 4
-                               ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
-                                                : !ggml_backend_ork_mul_mat_i4(ctx, node))
-                               : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
-                    return GGML_STATUS_FAILED;
+                } else {
+                    const char * name = node->src[0]->name;
+                    bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
+                    bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
+                    
+                    int target_qbits = ctx->qbits;
+                    if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) { // default to hybrid if ORK_QUANT not forced, or explicit
+                        if (is_ffn) target_qbits = 4;
+                        else if (is_attn) target_qbits = 8;
+                    }
+
+                    if (target_qbits == 4
+                           ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
+                                            : !ggml_backend_ork_mul_mat_i4(ctx, node))
+                           : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
+                        return GGML_STATUS_FAILED;
+                    }
                 }
                 break;
             }
@@ -636,6 +648,15 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
+            if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) {
+                const char * name = src0->name;
+                bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
+                bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
+                if (!is_ffn && !is_attn) {
+                    return false; // Keep on CPU NEON or Mali GPU
+                }
+            }
+
             return (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&

@@ -1629,14 +1629,7 @@ struct clip_model_loader {
                         hparams.eps               = 1e-6f;
                         hparams.n_mel_bins        = 640;
                     } break;
-                case PROJECTOR_TYPE_GEMMA4UA:
-                    {
-                        // Encoder-free: raw 16 kHz waveform chunked into 640-sample frames.
-                        hparams.audio_chunk_len   = 0;
-                        hparams.audio_sample_rate = 16000;
-                        hparams.eps               = 1e-6f;
-                        hparams.n_mel_bins        = 640;
-                    } break;
+
                 case PROJECTOR_TYPE_GRANITE_SPEECH:
                     {
                         hparams.audio_chunk_len        = 0;
