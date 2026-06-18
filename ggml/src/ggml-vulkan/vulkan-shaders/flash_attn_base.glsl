@@ -153,35 +153,6 @@ uint fa_quant_r_mmq(uint ty) {
 #define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
 #define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
 
-#if defined(DATA_A_TURBO3_0)
-const float T3C[8] = float[8](
-    -0.190685, -0.117832, -0.065717, -0.021460,
-     0.021460,  0.065717,  0.117832,  0.190685
-);
-FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
-    FLOAT_TYPEV4 r;
-    for (int k = 0; k < 4; k++) {
-        uint  j  = iqs + uint(k);
-        float nm;
-        uint  qb;
-        uint  sb;
-        if (binding_idx == BINDING_IDX_K) {
-            nm = float(data_k_t3[a_offset + ib].norm);
-            qb = uint(data_k_t3[a_offset + ib].qs[j / 4]);
-            sb = uint(data_k_t3[a_offset + ib].signs[j / 8]);
-        } else {
-            nm = float(data_v_t3[a_offset + ib].norm);
-            qb = uint(data_v_t3[a_offset + ib].qs[j / 4]);
-            sb = uint(data_v_t3[a_offset + ib].signs[j / 8]);
-        }
-        uint lo = (qb >> ((j % 4) * 2)) & 0x3;
-        uint hi = (sb >> (j % 8)) & 0x1;
-        r[k] = FLOAT_TYPE(T3C[lo | (hi << 2)] * nm);
-    }
-    return r;
-}
-#endif
-
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 
