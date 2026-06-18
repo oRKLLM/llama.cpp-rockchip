@@ -55,10 +55,12 @@ struct ggml_backend_ork_context {
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
 };
+static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     if (getenv("ORK_BUFPROBE")) { static int once=0; if(!once++) fprintf(stderr,
@@ -82,8 +84,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
 
-    for (int chunk_start = 0; chunk_start < S; chunk_start += 64) {
-        int chunk_size = std::min(64, S - chunk_start);
+    for (int chunk_start = 0; chunk_start < S; chunk_start += 1) {
+        int chunk_size = std::min(1, S - chunk_start);
 
         ctx->ai .resize((size_t) chunk_size * M * K);
         ctx->as .resize((size_t) chunk_size * M);
@@ -158,6 +160,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 
         const double t1 = ctx->profile ? ork_now_us() : 0;
 
+        fprintf(stderr, "[ORK] i8 chain: M=%d, chunk_size=%d (S=%d, K=%d, N=%d)\n", M, chunk_size, S, K, N);
+        fflush(stderr);
         int ok = ork_mm_run_chain_i8(ctx->npu, chunk_size, tasks.data());
         if (ok != 0) {
             // Fallback to sequential single-task run
@@ -235,6 +239,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 // the NPU dequantizes each group's int partial in fp32. ~9.5% matmul error (W4A4 floor; weights at
 // 0.5 B/elem). Submit-heavy (K/G submits/core), so coarser/larger G is cheaper but less accurate.
 static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    fprintf(stderr, "[ORK] START mul_mat_i4\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -300,6 +305,8 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                 }
 
             // grouped run dequantizes per group into the fp32 dst directly
+            fprintf(stderr, "[ORK] i4 grouped: M=%d, K=%d, N=%d, G=%d\n", M, K, N, G);
+            fflush(stderr);
             if (ork_mm_run_i4_grouped(ctx->npu, ow.w, M, ai, as, ow.bscale.data(), d)) return false;
         }
     }
@@ -314,6 +321,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 // not the grouped path's K/G submits. The NPU int MAC is exact; the only loss is the int4 quant the
 // rotation tames. See ROADMAP Tier 4a/4b.
 static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    fprintf(stderr, "[ORK] START mul_mat_i4_hadamard\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -388,6 +396,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             }
 
             ork_mm_task_i4 task = { ow.w, M, ai, ci };
+            fprintf(stderr, "[ORK] i4 chain: M=%d, K=%d, N=%d\n", M, K, N);
+            fflush(stderr);
             if (ork_mm_run_chain_i4(ctx->npu, 1, &task)) return false;    // full-K single submit, int32 C
             for (int m = 0; m < M; m++)
                 for (int n = 0; n < N; n++)
@@ -403,6 +413,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
 // scatters the wide int32 result into each dst — turning n submits into 1, amortizing the per-matmul
 // submit floor. All g[i] are 2D (ne2==ne3==1), same K and M. Weight cached by g[0]->src0->data.
 static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
+    fprintf(stderr, "[ORK] START mul_mat_group_i8 ng=%d\n", ng); fflush(stderr);
     const struct ggml_tensor * src1 = g[0]->src[1];
     const int K = (int) g[0]->src[0]->ne[0];
     const int M = (int) src1->ne[1];
@@ -451,6 +462,8 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
             ar[k] = (int8_t)(qi > 127 ? 127 : qi < -127 ? -127 : qi); }
     }
     const double t1 = ctx->profile ? ork_now_us() : 0;
+    fprintf(stderr, "[ORK] mul_mat_id i8: M=%d, K=%d, N=%d (ng=%d)\n", M, K, Ntot, ng);
+    fflush(stderr);
     if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;     // ONE submit for all ng matmuls
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
@@ -493,11 +506,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
+    g_ork_ctx = nullptr;
     delete backend;
 }
 
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
     // QKV/gate-up fusion: implemented + correct, but measured SLOWER on RK3588 (decode 9.4->6.4
     // tok/s) — one wide multi-core matmul + strided scatter costs more than the 2 saved submits, i.e.
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
@@ -584,6 +599,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
+    g_ork_ctx = ctx;
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
@@ -662,6 +678,21 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
     return ggml_backend_cpu_buffer_from_ptr(ptr, size); GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
 }
 
+static bool is_npu_resident(const struct ggml_tensor * weights) {
+    if (!g_ork_ctx || !weights->data) {
+        return false;
+    }
+    const char * start = (const char *) weights->data;
+    const char * end = start + ggml_nbytes(weights);
+    for (const auto & kv : g_ork_ctx->wcache) {
+        const char * ptr = (const char *) kv.first;
+        if (ptr >= start && ptr < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
     if (ork_off) return false;
@@ -689,7 +720,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 }
             }
 
-            return (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1) &&
+            bool pass_m_threshold = false;
+            if (is_npu_resident(src0)) {
+                pass_m_threshold = (M >= 1);
+            } else {
+                pass_m_threshold = (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1);
+            }
+
+            return pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
