@@ -95,7 +95,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
         float   * as  = ctx->as.data();
         int32_t * ci  = ctx->ci.data();
 
-        std::vector<ork_mm_task_i8> tasks(chunk_size);
+        std::vector<ork_mm_task_i8> tasks;
 
         const double t0 = ctx->profile ? ork_now_us() : 0;
 
@@ -135,11 +135,6 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            tasks[t].w = ow.w;
-            tasks[t].M = M;
-            tasks[t].A = ai + t * M * K;
-            tasks[t].C = ci + t * M * N;
-
             // activation: per-row int8 quant
             int8_t * ar = ai + t * M * K;
             float * asr = as + t * M;
@@ -156,16 +151,22 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                     amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                 }
             }
+            tasks.push_back({
+                ow.w,
+                M,
+                ai + t * M * K,
+                ci + t * M * N
+            });
         }
 
         const double t1 = ctx->profile ? ork_now_us() : 0;
 
-        fprintf(stderr, "[ORK] i8 chain: M=%d, chunk_size=%d (S=%d, K=%d, N=%d)\n", M, chunk_size, S, K, N);
+        fprintf(stderr, "[ORK] i8 chain: M=%d, tasks=%zu (S=%d, K=%d, N=%d)\n", M, tasks.size(), S, K, N);
         fflush(stderr);
-        int ok = ork_mm_run_chain_i8(ctx->npu, chunk_size, tasks.data());
+        int ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
         if (ok != 0) {
             // Fallback to sequential single-task run
-            for (int t = 0; t < chunk_size; t++) {
+            for (size_t t = 0; t < tasks.size(); t++) {
                 if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
                     return false;
                 }
@@ -398,7 +399,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             ork_mm_task_i4 task = { ow.w, M, ai, ci };
             fprintf(stderr, "[ORK] i4 chain: M=%d, K=%d, N=%d\n", M, K, N);
             fflush(stderr);
-            if (ork_mm_run_chain_i4(ctx->npu, 1, &task)) return false;    // full-K single submit, int32 C
+            if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
             for (int m = 0; m < M; m++)
                 for (int n = 0; n < N; n++)
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
@@ -711,6 +712,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
+            int target_qbits = 8;
+            if (getenv("ORK_QUANT")) target_qbits = atoi(getenv("ORK_QUANT"));
             if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) {
                 const char * name = src0->name;
                 bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
@@ -718,7 +721,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 if (!is_ffn && !is_attn) {
                     return false; // Keep on CPU NEON or Mali GPU
                 }
+                if (is_ffn) target_qbits = 4;
             }
+            if (target_qbits == 4 && M > 8) return false;
 
             bool pass_m_threshold = false;
             if (is_npu_resident(src0)) {

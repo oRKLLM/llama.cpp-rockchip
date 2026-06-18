@@ -43,3 +43,11 @@ When measuring, optimizing, or discussing performance metrics, strict standards 
 * **Verify System Governors and Power State:** Ensure the host system is in a high-performance state before timing. Active CPU/DDR frequency scaling, thermal throttling, or low-power governors can distort prefill and decode metrics dramatically.
 * **Thread and Resource Optimization:** Run benchmarks with optimal resource allocations (e.g., pinning threads to big cores where applicable, avoiding little cores that drag down thread pools).
 * **Validation of Correctness:** Never state or optimize a performance number without verifying the correctness of the output. Optimization attempts that introduce numerical errors, instability, or incorrect answers are invalid.
+
+---
+
+## 5. Target SBC Deployment and Compilation
+
+* **Build on Target Board:** To avoid "Exec format error" and binary incompatibility, always compile `llama.cpp` directly on the target Rockchip SBC.
+* **No macOS Binary Transfers:** Never push or copy local macOS binaries (from arm64/x86_64 Mac workstation builds) to the target SBC. Only source files should be synchronized (e.g., via git or targeted rsync) and then built natively on the board.
+
