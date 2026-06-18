@@ -152,6 +152,7 @@ jobs:
           mkdir release-bin
           cp build/bin/llama-cli release-bin/
           cp build/bin/llama-server release-bin/
+          cp build/bin/llama-bench release-bin/
           cp -P build/bin/lib*.so* release-bin/
 
           printf '{"tag":"%s","llamaCommit":"%s","orkDriverCommit":"%s"}\n' \
