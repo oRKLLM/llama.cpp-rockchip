@@ -12,7 +12,7 @@ A clean, understandable history is vital for long-term project maintenance, debu
 * **Targeted Cherry-Picking:** Cherry-pick single commits (e.g., hotfixes, docs) directly to destination branches rather than merging an entire branch when only a specific change is relevant.
 * **Diverged History and Main Branch Structure:** All development and feature commits must go to the `diverged-history` branch to preserve granular commit history. The `master` branch must contain exactly two commits on top of the upstream repository: one commit for GitHub Actions changes, and one commit for all other changes. These two commits on `master` are to be squashed from the `diverged-history` branch from GitHub user `mafischer`.
 * **Push and Squash Protocol:** After committing to the `diverged-history` branch, you must always perform the squash activity onto the `master` branch (recreating the two-commit structure), and then push both branches (`diverged-history` and `master`) to the remote repository.
-* **Upstream Workflows Restriction:** To avoid cluttering the actions UI and consuming redundant runner capacity, do not re-add upstream `.github/workflows/` files. Only our custom workflows (`build-rockchip.yml`, `auto-sync-controller.yml`, and `tqp-release.yml`) must exist in the repository on any branch. All other upstream workflow files must remain deleted.
+* **Upstream Workflows Restriction:** To avoid cluttering the actions UI and consuming redundant runner capacity, do not re-add upstream `.github/workflows/` files. Only our custom workflows (`build-rockchip.yml`, `auto-sync-controller.yml`, `tqp-release.yml`, and `rebuild-on-push.yml`) must exist in the repository on any branch. All other upstream workflow files must remain deleted.
 
 
 ---
