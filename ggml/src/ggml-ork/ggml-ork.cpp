@@ -609,7 +609,39 @@ bool ggml_backend_is_ork(ggml_backend_t backend) {
 
 static const char * ggml_backend_ork_device_get_name(ggml_backend_dev_t dev) { return "ORK"; GGML_UNUSED(dev); }
 static const char * ggml_backend_ork_device_get_description(ggml_backend_dev_t dev) { return "Rockchip NPU (ork-driver)"; GGML_UNUSED(dev); }
-static void ggml_backend_ork_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) { *free = 0; *total = 0; GGML_UNUSED(dev); }
+#include <unistd.h>
+#include <fstream>
+#include <string>
+
+static void ggml_backend_ork_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    *free = 0;
+    *total = 0;
+    
+    std::ifstream meminfo("/proc/meminfo");
+    if (meminfo.is_open()) {
+        std::string line;
+        while (std::getline(meminfo, line)) {
+            if (line.compare(0, 9, "MemTotal:") == 0) {
+                size_t kb;
+                if (sscanf(line.c_str(), "MemTotal: %zu kB", &kb) == 1) {
+                    *total = kb * 1024;
+                }
+            } else if (line.compare(0, 13, "MemAvailable:") == 0) {
+                size_t kb;
+                if (sscanf(line.c_str(), "MemAvailable: %zu kB", &kb) == 1) {
+                    *free = kb * 1024;
+                }
+            }
+        }
+    }
+    
+    // Fallback if parsing fails
+    if (*total == 0) {
+        *total = 8ull * 1024 * 1024 * 1024;
+        *free = 8ull * 1024 * 1024 * 1024;
+    }
+    GGML_UNUSED(dev);
+}
 static enum ggml_backend_dev_type ggml_backend_ork_device_get_type(ggml_backend_dev_t dev) { return GGML_BACKEND_DEVICE_TYPE_ACCEL; GGML_UNUSED(dev); }
 
 static void ggml_backend_ork_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
@@ -684,7 +716,7 @@ static const struct ggml_backend_device_i ggml_backend_ork_device_i = {
     /* .get_props            = */ ggml_backend_ork_device_get_props,
     /* .init_backend         = */ ggml_backend_ork_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_ork_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ ggml_backend_ork_device_get_buffer_type,
     /* .buffer_from_host_ptr = */ ggml_backend_ork_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_ork_device_supports_op,
     /* .supports_buft        = */ ggml_backend_ork_device_supports_buft,
