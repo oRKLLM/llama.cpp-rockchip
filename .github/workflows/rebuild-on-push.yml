@@ -14,49 +14,69 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: master
-
-      - name: Fetch Upstream Tags
-        run: |
-          git remote add upstream https://github.com/ggerganov/llama.cpp.git
-          LATEST_TAGS=$(git ls-remote --tags --sort=-v:refname upstream "refs/tags/b*" | head -n 20 | awk '{print $2}')
-          for tag in $LATEST_TAGS; do
-            # the awk command returns strings like "refs/tags/b1234"
-            # we need to strip "refs/tags/" to get "b1234"
-            tag_name=$(echo "$tag" | sed 's/refs\/tags\///')
-            git fetch upstream "$tag_name:$tag_name" --force
-          done
-
-      - name: Delete Old Releases/Tags and Dispatch
+      - name: Calculate Tags and Dispatch
         uses: actions/github-script@v7
         with:
           script: |
-            const execSync = require('child_process').execSync;
             const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000);
             
-            // Delete all releases
-            try {
-              const releases = await github.paginate(github.rest.repos.listReleases, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+            console.log("Fetching existing releases to rebuild...");
+            const ourReleases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const existingTags = ourReleases
+              .map(r => r.tag_name.replace(/-ork$/, ''))
+              .filter(t => /^b[0-9]+$/.test(t));
+              
+            console.log("Fetching upstream releases from the last 48 hours...");
+            const recentTags = [];
+            let page = 1;
+            while(true) {
+              const { data: releases } = await github.rest.repos.listReleases({
+                owner: 'ggerganov',
+                repo: 'llama.cpp',
+                per_page: 30,
+                page: page
               });
-              for (const release of releases) {
-                console.log(`Deleting release ${release.tag_name}`);
+              if (releases.length === 0) break;
+              let done = false;
+              for (const r of releases) {
+                if (new Date(r.published_at) < twoDaysAgo) {
+                  done = true;
+                  break;
+                }
+                if (/^b[0-9]+$/.test(r.tag_name)) {
+                  recentTags.push(r.tag_name);
+                }
+              }
+              if (done) break;
+              page++;
+            }
+            
+            const allTagsToRebuild = Array.from(new Set([...existingTags, ...recentTags])).sort((a, b) => {
+               // sort descending: b1234, b1233
+               return parseInt(b.substring(1)) - parseInt(a.substring(1));
+            });
+            
+            console.log(`Tags to rebuild: ${allTagsToRebuild.join(', ')}`);
+            
+            // Delete all our releases
+            for (const release of ourReleases) {
+              console.log(`Deleting release ${release.tag_name}`);
+              try {
                 await github.rest.repos.deleteRelease({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   release_id: release.id,
                 });
+              } catch (e) {
+                console.error(`Error deleting release ${release.tag_name}: ${e.message}`);
               }
-            } catch (e) {
-              console.error(`Error deleting releases: ${e.message}`);
             }
 
-            // Delete all tags
+            // Delete all our tags
             try {
               const refs = await github.paginate(github.rest.git.listMatchingRefs, {
                 owner: context.repo.owner,
@@ -64,12 +84,14 @@ jobs:
                 ref: 'tags/',
               });
               for (const ref of refs) {
-                console.log(`Deleting tag ${ref.ref}`);
-                await github.rest.git.deleteRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  ref: ref.ref.replace('refs/', ''),
-                });
+                if (ref.ref.endsWith('-ork')) {
+                  console.log(`Deleting tag ${ref.ref}`);
+                  await github.rest.git.deleteRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: ref.ref.replace('refs/', ''),
+                  });
+                }
               }
             } catch (e) {
               console.error(`Error deleting tags: ${e.message}`);
@@ -94,20 +116,7 @@ jobs:
               console.error(`Failed to dispatch ${ourTag} after 3 attempts`);
             }
             
-            const getTagsCmd = 'git for-each-ref --sort=-creatordate --format="%(refname:short)" refs/tags/';
-            const output = execSync(getTagsCmd).toString().trim().split('\n').filter(Boolean);
-            
-            const upstreamTags = [];
-            for (const tag of output) {
-              if (/^b[0-9]+$/.test(tag)) {
-                upstreamTags.push(tag);
-                if (upstreamTags.length >= 20) break;
-              }
-            }
-            
-            console.log(`Latest 20 upstream tags: ${upstreamTags.join(', ')}`);
-            
-            for (const tag of upstreamTags) {
+            for (const tag of allTagsToRebuild) {
               const ourTag = `${tag}-ork`;
               console.log(`Dispatching builder for ${ourTag}...`);
               await dispatch(tag, ourTag);
