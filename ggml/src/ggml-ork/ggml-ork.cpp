@@ -513,8 +513,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
 
 enum ork_chain_type {
     ORK_CHAIN_NONE,
-    ORK_CHAIN_I8,
-    ORK_CHAIN_I4_HADAMARD
+    ORK_CHAIN_I8
 };
 
 static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
@@ -532,8 +531,6 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     }
     if (target_qbits == 8) {
         return ORK_CHAIN_I8;
-    } else if (target_qbits == 4 && ctx->hadamard) {
-        return ORK_CHAIN_I4_HADAMARD;
     }
     return ORK_CHAIN_NONE;
 }
@@ -732,206 +729,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
     return true;
 }
 
-static bool ggml_backend_ork_mul_mat_chain_i4_hadamard(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
-    fprintf(stderr, "[ORK] START mul_mat_chain_i4_hadamard, count=%d\n", count); fflush(stderr);
 
-    size_t total_ai_size = 0;
-    size_t total_as_size = 0;
-    size_t total_ci_size = 0;
-    for (int i = 0; i < count; i++) {
-        struct ggml_tensor * dst = nodes[i];
-        int K = dst->src[0]->ne[0];
-        int N = dst->src[0]->ne[1];
-        int M = dst->src[1]->ne[1];
-        total_ai_size += (size_t)M * K;
-        total_as_size += (size_t)M;
-        total_ci_size += (size_t)M * N;
-    }
-    ctx->ai.resize(total_ai_size);
-    ctx->as.resize(total_as_size);
-    ctx->ci.resize(total_ci_size);
-
-    int8_t  * ai_base = ctx->ai.data();
-    float   * as_base = ctx->as.data();
-    int32_t * ci_base = ctx->ci.data();
-
-    size_t ai_offset = 0;
-    size_t as_offset = 0;
-    size_t ci_offset = 0;
-
-    std::vector<ork_mm_task_i4> tasks;
-    const double t0 = ctx->profile ? ork_now_us() : 0;
-
-    // Cache to share quantized activations for nodes sharing the same src1
-    std::unordered_map<const void *, std::pair<int8_t *, float *>> chain_act_cache;
-
-    for (int i = 0; i < count; i++) {
-        struct ggml_tensor * dst = nodes[i];
-        const struct ggml_tensor * src0 = dst->src[0];
-        const struct ggml_tensor * src1 = dst->src[1];
-
-        const enum ggml_type type = src0->type;
-        const int K = (int) src0->ne[0];
-        const int N = (int) src0->ne[1];
-        const int M = (int) src1->ne[1];
-        const int b = K & (-K);
-
-        const auto * tt = ggml_get_type_traits(type);
-        ggml_to_float_t const to_float = tt->to_float;
-
-        const char  * x = (const char *) src0->data;
-        const float * y = (const float *) src1->data;
-
-        // weight: check cache / pack
-        auto it = ctx->wcache.find(x);
-        if (it == ctx->wcache.end()) {
-            ctx->f32.resize((size_t) N * K);
-            ctx->bi .resize((size_t) K * N);
-            float * f32 = ctx->f32.data();
-            int8_t * bi = ctx->bi.data();
-            if (type == GGML_TYPE_F32) {
-                for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*src0->nb[1], (size_t) K*sizeof(float));
-            } else {
-                for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*src0->nb[1], f32 + n*K, K);
-            }
-            ork_weight ow; ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
-            for (int n = 0; n < N; n++) {
-                float * col = f32 + (size_t) n*K;
-                for (int off = 0; off < K; off += b) {
-                    ork_fwht_norm(col + off, b);                        // rotate weight column R·B
-                }
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                float s = mx / 7.0f; ow.bscale[n] = s;
-                for (int k = 0; k < K; k++) {
-                    int q = (int) lrintf(col[k] / s);
-                    bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                }
-            }
-            ow.w = ork_mm_pack_i4(ctx->npu, K, N, bi);
-            if (!ow.w) return false;
-            it = ctx->wcache.emplace(x, std::move(ow)).first;
-        }
-        const ork_weight & ow = it->second;
-
-        // activation: check cache or rotate & quantize
-        int8_t * task_A = nullptr;
-        float  * task_as = nullptr;
-        auto act_it = chain_act_cache.find(src1->data);
-        if (act_it != chain_act_cache.end()) {
-            task_A = act_it->second.first;
-            task_as = act_it->second.second;
-        } else {
-            task_A = ai_base + ai_offset;
-            task_as = as_base + as_offset;
-            ctx->arot.resize((size_t) K);
-            float * arow = ctx->arot.data();
-            for (int m = 0; m < M; m++) {
-                memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
-                for (int off = 0; off < K; off += b) {
-                    ork_fwht_norm(arow + off, b);
-                }
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
-                float s = mx / 7.0f;
-                task_as[m] = s;
-                for (int k = 0; k < K; k++) {
-                    int q = (int) lrintf(arow[k] / s);
-                    task_A[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                }
-            }
-            chain_act_cache[src1->data] = {task_A, task_as};
-            ai_offset += (size_t)M * K;
-            as_offset += (size_t)M;
-        }
-
-        tasks.push_back({
-            ow.w,
-            M,
-            task_A,
-            ci_base + ci_offset
-        });
-
-        ci_offset += (size_t)M * N;
-    }
-
-    const double t1 = ctx->profile ? ork_now_us() : 0;
-
-    fprintf(stderr, "[ORK] i4 chain submit: tasks=%zu\n", tasks.size());
-    fflush(stderr);
-    int ok = ork_mm_run_chain_i4(ctx->npu, tasks.size(), tasks.data());
-    if (ok != 0) {
-        // Fallback to sequential single-task run
-        fprintf(stderr, "[ORK] i4 chain failed (%d), falling back to sequential\n", ok); fflush(stderr);
-        for (size_t t = 0; t < tasks.size(); t++) {
-            if (ork_mm_run_i4(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
-                return false;
-            }
-        }
-    }
-
-    const double t2 = ctx->profile ? ork_now_us() : 0;
-
-    // Dequantize results
-    ci_offset = 0;
-    for (int i = 0; i < count; i++) {
-        struct ggml_tensor * dst = nodes[i];
-        const char * x = (const char *) dst->src[0]->data;
-        const struct ggml_tensor * src1 = dst->src[1];
-        float * d = (float *) dst->data;
-        int N = dst->src[0]->ne[1];
-        int M = dst->src[1]->ne[1];
-
-        auto it = ctx->wcache.find(x);
-        const ork_weight & ow = it->second;
-
-        auto act_it = chain_act_cache.find(src1->data);
-        const float * task_as = act_it->second.second;
-        const int32_t * ctr = ci_base + ci_offset;
-
-        for (int m = 0; m < M; m++) {
-            for (int n = 0; n < N; n++) {
-                d[(size_t) m*N + n] = (float) ctr[(size_t) m*N + n] * task_as[m] * ow.bscale[n];
-            }
-        }
-
-        ci_offset += (size_t)M * N;
-    }
-
-    if (ctx->profile) {
-        double t3 = ork_now_us();
-        ctx->t_quant += t1 - t0;
-        ctx->t_run   += t2 - t1;
-        ctx->t_deq   += t3 - t2;
-        ctx->n_mm    += count;
-        for (int i = 0; i < count; i++) {
-            int M = nodes[i]->src[1]->ne[1];
-            double part_run = (t2 - t1) / count;
-            if (M > 1) {
-                ctx->t_run_pf  += part_run;
-                ctx->n_pf      += 1;
-                ctx->m_pf      += M;
-            } else {
-                ctx->t_run_dec += part_run;
-                ctx->n_dec     += 1;
-            }
-        }
-    }
-
-    if (ctx->no_cache) {
-        for (int i = 0; i < count; i++) {
-            struct ggml_tensor * dst = nodes[i];
-            const char * x = (const char *) dst->src[0]->data;
-            auto it = ctx->wcache.find(x);
-            if (it != ctx->wcache.end()) {
-                ork_w_free(it->second.w);
-                ctx->wcache.erase(it);
-            }
-        }
-    }
-
-    return true;
-}
 
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
@@ -976,8 +774,6 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     bool chain_ok = false;
                     if (type == ORK_CHAIN_I8) {
                         chain_ok = ggml_backend_ork_mul_mat_chain_i8(ctx, chain_nodes.data(), chain_nodes.size());
-                    } else if (type == ORK_CHAIN_I4_HADAMARD) {
-                        chain_ok = ggml_backend_ork_mul_mat_chain_i4_hadamard(ctx, chain_nodes.data(), chain_nodes.size());
                     }
                     if (!chain_ok) return GGML_STATUS_FAILED;
                     i += chain_nodes.size() - 1;
