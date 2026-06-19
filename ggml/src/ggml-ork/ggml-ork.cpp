@@ -955,6 +955,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
+            // Explicitly block output and lm_head (vocabulary projection) layers from offloading to NPU.
+            // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
+            // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
+            const char * name = src0->name;
+            if (strstr(name, "output") || strstr(name, "lm_head")) {
+                return false;
+            }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
             // DECODE (M=1) a net LOSS vs CPU (4.7 vs 9.4 tok/s) — ~197 submits/token at 365us each is
             // ~72ms before any compute benefit, and M=1 matmuls are tiny. PREFILL (large M) is the
