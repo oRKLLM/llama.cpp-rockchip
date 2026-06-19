@@ -4003,6 +4003,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
 #endif
             name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
+        } else {
+            if (device->fp16) {
+                if (device->dot2_f16) {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
+                    else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
+                } else {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
+                    else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
+                }
+            } else {
+                spv_data = flash_attn_f32_f16_fp32_data;
+                spv_size = flash_attn_f32_f16_fp32_len;
+            }
+            name = aligned ? "flash_attn_f32_f16_aligned" : "flash_attn_f32_f16";
         }
         ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -10122,6 +10136,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // Need to use the coopmat2 variant that clamps loads when HSK/HSV aren't sufficiently aligned.
     if (((HSK | HSV) % 16) != 0 && tuning_params.path == FA_COOPMAT2) {
         aligned = false;
+    }
+
+    // Prevent silent CPU/GPU fallbacks for TurboQuant under unaligned MoE layout
+    const bool is_turbo = k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 ||
+                        v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0;
+    if (is_turbo && !aligned) {
+        fprintf(stderr, "ggml_vulkan: Tensor layout not supported by TurboQuant MoE shader (alignment required). Aborting submission to prevent hardware lockup.\n");
+        GGML_ASSERT(false && "Vulkan: TurboQuant requires aligned layouts");
     }
 
     float scale         = 1.0f;
