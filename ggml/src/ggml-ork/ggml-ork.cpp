@@ -943,20 +943,6 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
     return ggml_backend_cpu_buffer_from_ptr(ptr, size); GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
 }
 
-static bool is_npu_resident(const struct ggml_tensor * weights) {
-    if (!g_ork_ctx || !weights->data) {
-        return false;
-    }
-    const char * start = (const char *) weights->data;
-    const char * end = start + ggml_nbytes(weights);
-    for (const auto & kv : g_ork_ctx->wcache) {
-        const char * ptr = (const char *) kv.first;
-        if (ptr >= start && ptr < end) {
-            return true;
-        }
-    }
-    return false;
-}
 
 static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
@@ -989,12 +975,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 else if (is_attn) target_qbits = 8;
             }
 
-            bool pass_m_threshold = false;
-            if (is_npu_resident(src0)) {
-                pass_m_threshold = (M >= 1);
-            } else {
-                pass_m_threshold = (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1);
-            }
+            // Residency does NOT make single-token (M=1) decode worth it — the per-submit
+            // floor dominates regardless. Keep the M threshold so decode stays on CPU.
+            bool pass_m_threshold = (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1);
 
             return pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
