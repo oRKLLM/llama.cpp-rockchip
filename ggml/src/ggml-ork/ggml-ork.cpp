@@ -38,6 +38,7 @@ struct ggml_backend_ork_context {
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
+    bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
@@ -56,6 +57,11 @@ struct ggml_backend_ork_context {
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
+static bool g_ork_hybrid_loading = false;
+
+void ggml_backend_ork_set_hybrid(bool use_hybrid) {
+    g_ork_hybrid_loading = use_hybrid;
+}
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
@@ -525,7 +531,7 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
     
     int target_qbits = ctx->qbits;
-    if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) {
+    if (ctx->hybrid) {
         if (is_ffn) target_qbits = 4;
         else if (is_attn) target_qbits = 8;
     }
@@ -797,7 +803,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
                         
                         int target_qbits = ctx->qbits;
-                        if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) {
+                        if (ctx->hybrid) {
                             if (is_ffn) target_qbits = 4;
                             else if (is_attn) target_qbits = 8;
                         }
@@ -857,12 +863,15 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->npu = npu;
     g_ork_ctx = ctx;
     const char * q = getenv("ORK_QUANT");
-    ctx->qbits = (q && q[0] == '4') ? 4 : 8;
+    ctx->qbits = (q && q[0] == '8') ? 8 : 4;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
+    ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
-    GGML_LOG_INFO("%s: ork backend ready (W%dA%d%s)\n", __func__, ctx->qbits, ctx->qbits,
+    GGML_LOG_INFO("%s: ork backend ready (%sW%dA%d%s)\n", __func__,
+                  ctx->hybrid ? "Hybrid " : "",
+                  ctx->qbits, ctx->qbits,
                   ctx->hadamard ? "+Hadamard" : "");
     ggml_backend_t backend = new ggml_backend {
         /* .guid      = */ ggml_backend_ork_guid(),
@@ -967,9 +976,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
-            int target_qbits = 8;
-            if (getenv("ORK_QUANT")) target_qbits = atoi(getenv("ORK_QUANT"));
-            if (getenv("ORK_HYBRID") || getenv("ORK_QUANT") == nullptr) {
+            int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '8') ? 8 : 4);
+            bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
+            if (hybrid) {
                 const char * name = src0->name;
                 bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
                 bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
@@ -977,8 +986,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                     return false; // Keep on CPU NEON or Mali GPU
                 }
                 if (is_ffn) target_qbits = 4;
+                else if (is_attn) target_qbits = 8;
             }
-            if (target_qbits == 4 && M > 8) return false;
 
             bool pass_m_threshold = false;
             if (is_npu_resident(src0)) {

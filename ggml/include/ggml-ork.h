@@ -14,6 +14,7 @@ extern "C" {
 GGML_BACKEND_API ggml_backend_t      ggml_backend_ork_init(void);
 GGML_BACKEND_API bool                ggml_backend_is_ork(ggml_backend_t backend);
 GGML_BACKEND_API ggml_backend_reg_t  ggml_backend_ork_reg(void);
+GGML_BACKEND_API void                ggml_backend_ork_set_hybrid(bool use_hybrid);
 
 #ifdef  __cplusplus
 }
