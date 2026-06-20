@@ -39,7 +39,7 @@ int main() {
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024,
         /* .mem_buffer = */ NULL,
-        /* .no_alloc   = */ false,
+        /* .no_alloc   = */ true,
     };
     struct ggml_context * ctx = ggml_init(params);
 
