@@ -620,13 +620,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
-            for (uint32_t j = 0; j < size; ++j) {
-                int32_t & tail = cells[j].tail;
-                if (tail == src_id) {
-                    tail = dst_id;
-                } else if (tail == dst_id) {
-                    tail = src_id;
-                }
+            for (llama_seq_id seq_id : dst_cell.seq_id) {
+                cells[seq_id].tail = dst_id;
+            }
+            for (llama_seq_id seq_id : src_cell.seq_id) {
+                cells[seq_id].tail = src_id;
             }
         }
     }

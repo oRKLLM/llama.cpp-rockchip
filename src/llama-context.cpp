@@ -1185,6 +1185,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
+    if (sampler && sampling.samplers.count(seq_id) > 0 && sampling.samplers[seq_id] == sampler) {
+        return true;
+    }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 

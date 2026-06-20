@@ -1028,7 +1028,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // floor dominates regardless. Keep the M threshold so dense decode stays on CPU.
             // Bypassed for expert layers (MoE) where CPU weight streaming is a catastrophic ~32ms bottleneck.
             int threshold = is_expert ? 1 : min_m;
-            bool pass_m_threshold = (M >= threshold || op->ne[2] > 1 || op->ne[3] > 1);
+            bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
             return pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
