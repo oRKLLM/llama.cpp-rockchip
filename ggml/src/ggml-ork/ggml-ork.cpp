@@ -146,6 +146,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 // activation: per-row int8 quant
                 int8_t * ar = ai + t * M * K;
                 float * asr = as + t * M;
+                #pragma omp parallel for if (M >= 16)
                 for (int m = 0; m < M; m++) {
                     const float * yr = y + (size_t) m*K;
                     int8_t * amr = ar + (size_t) m*K;
@@ -207,6 +208,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const float * asr = as + t * M;
             const int32_t * ctr = ci + t * M * N;
 
+            #pragma omp parallel for if (M >= 16)
             for (int m = 0; m < M; m++) {
                 const float rs = asr[m];
                 const int32_t * cr = ctr + (size_t) m*N;
@@ -312,7 +314,8 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 && !ctx->no_reuse);
             if (!reuse) {
                 // activations: per-row, per-group int4 quant
-                for (int m = 0; m < M; m++)
+                #pragma omp parallel for if (M >= 16)
+                for (int m = 0; m < M; m++) {
                     for (int g = 0; g < NG; g++) {
                         float mx = 1e-9f;
                         for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
@@ -322,6 +325,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                             ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
                         }
                     }
+                }
                 ctx->last_src1 = y;
                 ctx->last_M = M;
                 ctx->last_K = K;
@@ -410,16 +414,18 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
             if (!reuse) {
                 // activations: rotate each row (A·R), per-row int4 quant
+                #pragma omp parallel for if (M >= 16)
                 for (int m = 0; m < M; m++) {
-                    memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+                    float arow_local[K];
+                    memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
                     for (int off = 0; off < K; off += b) {
-                        ork_fwht_norm(arow + off, b);
+                        ork_fwht_norm(arow_local + off, b);
                     }
                     float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                    for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
                     float s = mx / 7.0f; as[m] = s;
                     for (int k = 0; k < K; k++) {
-                        int q = (int) lrintf(arow[k] / s);
+                        int q = (int) lrintf(arow_local[k] / s);
                         ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
                     }
                 }
@@ -436,9 +442,12 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             fprintf(stderr, "[ORK] i4 chain: M=%d, K=%d, N=%d\n", M, K, N);
             fflush(stderr);
             if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
-            for (int m = 0; m < M; m++)
-                for (int n = 0; n < N; n++)
+            #pragma omp parallel for if (M >= 16)
+            for (int m = 0; m < M; m++) {
+                for (int n = 0; n < N; n++) {
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
+                }
+            }
         }
     }
     return true;
