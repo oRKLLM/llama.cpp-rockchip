@@ -51,7 +51,7 @@ struct ggml_backend_ork_context {
     // reuse the quantized activation across consecutive matmuls that share the same src1 input
     // (Q/K/V off the normed hidden state; FFN gate/up off the same x) — skips redundant per-matmul
     // activation int8-quant. Holds for the data in ctx->ai/as while last_* matches.
-    const void * last_src1 = nullptr; int last_M = 0, last_K = 0;
+    const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
@@ -141,21 +141,31 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            // activation: per-row int8 quant
-            int8_t * ar = ai + t * M * K;
-            float * asr = as + t * M;
-            for (int m = 0; m < M; m++) {
-                const float * yr = y + (size_t) m*K;
-                int8_t * amr = ar + (size_t) m*K;
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                asr[m] = mx / 127.0f;
-                const float inv = 127.0f / mx;
-                for (int k = 0; k < K; k++) {
-                    float q = yr[k] * inv;
-                    int qi = (int) (q + copysignf(0.5f, q));
-                    amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 1 && !ctx->no_reuse);
+            if (!reuse) {
+                // activation: per-row int8 quant
+                int8_t * ar = ai + t * M * K;
+                float * asr = as + t * M;
+                for (int m = 0; m < M; m++) {
+                    const float * yr = y + (size_t) m*K;
+                    int8_t * amr = ar + (size_t) m*K;
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                    asr[m] = mx / 127.0f;
+                    const float inv = 127.0f / mx;
+                    for (int k = 0; k < K; k++) {
+                        float q = yr[k] * inv;
+                        int qi = (int) (q + copysignf(0.5f, q));
+                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                    }
                 }
+                ctx->last_src1 = y;
+                ctx->last_M = M;
+                ctx->last_K = K;
+                ctx->last_type = 1;
+            } else {
+                fprintf(stderr, "[ORK] i8: reuse activation cache for y=%p\n", y);
+                fflush(stderr);
             }
             tasks.push_back({
                 ow.w,
@@ -299,17 +309,27 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            // activations: per-row, per-group int4 quant
-            for (int m = 0; m < M; m++)
-                for (int g = 0; g < NG; g++) {
-                    float mx = 1e-9f;
-                    for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
-                    float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
-                    for (int j = 0; j < G; j++) {
-                        int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
-                        ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 && !ctx->no_reuse);
+            if (!reuse) {
+                // activations: per-row, per-group int4 quant
+                for (int m = 0; m < M; m++)
+                    for (int g = 0; g < NG; g++) {
+                        float mx = 1e-9f;
+                        for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
+                        for (int j = 0; j < G; j++) {
+                            int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
+                            ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
                     }
-                }
+                ctx->last_src1 = y;
+                ctx->last_M = M;
+                ctx->last_K = K;
+                ctx->last_type = 2;
+            } else {
+                fprintf(stderr, "[ORK] i4 grouped: reuse activation cache for y=%p\n", y);
+                fflush(stderr);
+            }
 
             // grouped run dequantizes per group into the fp32 dst directly
             fprintf(stderr, "[ORK] i4 grouped: M=%d, K=%d, N=%d, G=%d\n", M, K, N, G);
@@ -387,19 +407,29 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             }
             const ork_weight & ow = it->second;
 
-            // activations: rotate each row (A·R), per-row int4 quant
-            for (int m = 0; m < M; m++) {
-                memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
-                for (int off = 0; off < K; off += b) {
-                    ork_fwht_norm(arow + off, b);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
+            if (!reuse) {
+                // activations: rotate each row (A·R), per-row int4 quant
+                for (int m = 0; m < M; m++) {
+                    memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+                    for (int off = 0; off < K; off += b) {
+                        ork_fwht_norm(arow + off, b);
+                    }
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                    float s = mx / 7.0f; as[m] = s;
+                    for (int k = 0; k < K; k++) {
+                        int q = (int) lrintf(arow[k] / s);
+                        ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                    }
                 }
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
-                float s = mx / 7.0f; as[m] = s;
-                for (int k = 0; k < K; k++) {
-                    int q = (int) lrintf(arow[k] / s);
-                    ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                }
+                ctx->last_src1 = y;
+                ctx->last_M = M;
+                ctx->last_K = K;
+                ctx->last_type = 3;
+            } else {
+                fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
+                fflush(stderr);
             }
 
             ork_mm_task_i4 task = { ow.w, M, ai, ci };
@@ -458,6 +488,7 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
     ctx->ai.resize((size_t) M*K); ctx->as.resize(M); ctx->ci.resize((size_t) M*Ntot);
     ctx->last_src1 = nullptr;                            // group overwrote ctx->ai — kill reuse cache
+    ctx->last_type = 0;
     int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
     const float * y = (const float *) src1->data;
     for (int m = 0; m < M; m++) {                        // quantize the shared activation once
