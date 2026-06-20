@@ -971,10 +971,11 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
             int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '8') ? 8 : 4);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
+            const char * name_src = src0->name;
+            bool is_expert = strstr(name_src, "expert") != nullptr;
             if (hybrid) {
-                const char * name = src0->name;
-                bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
-                bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
+                bool is_ffn = strstr(name_src, "ffn_") || is_expert;
+                bool is_attn = strstr(name_src, "attn_q") || strstr(name_src, "attn_k") || strstr(name_src, "attn_v") || strstr(name_src, "attn_output");
                 if (!is_ffn && !is_attn) {
                     return false; // Keep on CPU NEON or Mali GPU
                 }
@@ -982,9 +983,11 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 else if (is_attn) target_qbits = 8;
             }
 
-            // Residency does NOT make single-token (M=1) decode worth it — the per-submit
-            // floor dominates regardless. Keep the M threshold so decode stays on CPU.
-            bool pass_m_threshold = (M >= min_m || op->ne[2] > 1 || op->ne[3] > 1);
+            // Residency does NOT make single-token (M=1) decode worth it for dense layers — the per-submit
+            // floor dominates regardless. Keep the M threshold so dense decode stays on CPU.
+            // Bypassed for expert layers (MoE) where CPU weight streaming is a catastrophic ~32ms bottleneck.
+            int threshold = is_expert ? 1 : min_m;
+            bool pass_m_threshold = (M >= threshold || op->ne[2] > 1 || op->ne[3] > 1);
 
             return pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
