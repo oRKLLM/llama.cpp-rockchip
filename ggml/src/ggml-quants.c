@@ -405,6 +405,51 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
     const int nb = k / qk;
 
+#if defined(__ARM_NEON)
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float32x4_t vd = vdupq_n_f32(d);
+
+        // Load 16 bytes of quantized scales (each byte has 2 nibbles, total 32 values)
+        const uint8x16_t qs = vld1q_u8(x[i].qs);
+
+        // Get low nibbles and subtract 8
+        const int8x16_t x0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qs, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+
+        // Get high nibbles and subtract 8
+        const int8x16_t x1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qs, 4)), vdupq_n_s8(8));
+
+        // Widen low nibbles x0 to 16-bit integers
+        const int16x8_t x0_l = vmovl_s8(vget_low_s8(x0));
+        const int16x8_t x0_h = vmovl_s8(vget_high_s8(x0));
+
+        // Widen high nibbles x1 to 16-bit integers
+        const int16x8_t x1_l = vmovl_s8(vget_low_s8(x1));
+        const int16x8_t x1_h = vmovl_s8(vget_high_s8(x1));
+
+        // Convert low-nibbles 16-bit integers to 32-bit float vectors, multiply by vd, and store
+        const float32x4_t f0_0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(x0_l))), vd);
+        const float32x4_t f0_1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(x0_l))), vd);
+        const float32x4_t f0_2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(x0_h))), vd);
+        const float32x4_t f0_3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(x0_h))), vd);
+
+        vst1q_f32(y + i*qk + 0,  f0_0);
+        vst1q_f32(y + i*qk + 4,  f0_1);
+        vst1q_f32(y + i*qk + 8,  f0_2);
+        vst1q_f32(y + i*qk + 12, f0_3);
+
+        // Convert high-nibbles 16-bit integers to 32-bit float vectors, multiply by vd, and store
+        const float32x4_t f1_0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(x1_l))), vd);
+        const float32x4_t f1_1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(x1_l))), vd);
+        const float32x4_t f1_2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(x1_h))), vd);
+        const float32x4_t f1_3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(x1_h))), vd);
+
+        vst1q_f32(y + i*qk + 16 + 0,  f1_0);
+        vst1q_f32(y + i*qk + 16 + 4,  f1_1);
+        vst1q_f32(y + i*qk + 16 + 8,  f1_2);
+        vst1q_f32(y + i*qk + 16 + 12, f1_3);
+    }
+#else
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
 
@@ -416,6 +461,7 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
             y[i*qk + j + qk/2] = x1*d;
         }
     }
+#endif
 }
 
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
