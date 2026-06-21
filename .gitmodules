@@ -1,3 +1,4 @@
 [submodule "ggml/src/ggml-ork/ork-driver"]
 	path = ggml/src/ggml-ork/ork-driver
 	url = git@github.com:oRKLLM/ork-driver.git
+	branch = main

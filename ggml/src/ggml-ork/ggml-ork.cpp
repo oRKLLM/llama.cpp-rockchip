@@ -19,6 +19,10 @@
 #include <utility>
 #include <unordered_map>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 extern "C" {
 #include "ork_npu.h"
 }
@@ -213,7 +217,29 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 const float rs = asr[m];
                 const int32_t * cr = ctr + (size_t) m*N;
                 float * dr = d + (size_t) m*N;
+#if defined(__ARM_NEON)
+                float32x4_t v_rs = vdupq_n_f32(rs);
+                int n = 0;
+                for (; n <= N - 8; n += 8) {
+                    int32x4_t v_cr0 = vld1q_s32(cr + n);
+                    int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                    float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                    float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                    float32x4_t v_bs0 = vld1q_f32(bs + n);
+                    float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                    float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                    float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                    float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                    float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                    vst1q_f32(dr + n, v_dr0);
+                    vst1q_f32(dr + n + 4, v_dr1);
+                }
+                for (; n < N; n++) {
+                    dr[n] = rs * bs[n] * (float) cr[n];
+                }
+#else
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+#endif
             }
         }
 
@@ -518,8 +544,34 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     for (int i = 0; i < ng; i++) {
         const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
         float * dbase = (float *) g[i]->data;
-        for (int m = 0; m < M; m++) { const float rs = as[m]; const int32_t * cr = ci + (size_t) m*Ntot + o;
-            float * dr = dbase + (size_t) m*Ni; for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n]; }
+        for (int m = 0; m < M; m++) {
+            const float rs = as[m];
+            const int32_t * cr = ci + (size_t) m*Ntot + o;
+            float * dr = dbase + (size_t) m*Ni;
+#if defined(__ARM_NEON)
+            float32x4_t v_rs = vdupq_n_f32(rs);
+            int n = 0;
+            for (; n <= Ni - 8; n += 8) {
+                int32x4_t v_cr0 = vld1q_s32(cr + n);
+                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                float32x4_t v_bs0 = vld1q_f32(bs + o + n);
+                float32x4_t v_bs1 = vld1q_f32(bs + o + n + 4);
+                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                vst1q_f32(dr + n, v_dr0);
+                vst1q_f32(dr + n + 4, v_dr1);
+            }
+            for (; n < Ni; n++) {
+                dr[n] = rs * bs[o + n] * (float) cr[n];
+            }
+#else
+            for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
+#endif
+        }
     }
     if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
         if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
@@ -734,7 +786,29 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
             const float rs = task_as[m];
             const int32_t * cr = ctr + (size_t) m*N;
             float * dr = d + (size_t) m*N;
+#if defined(__ARM_NEON)
+            float32x4_t v_rs = vdupq_n_f32(rs);
+            int n = 0;
+            for (; n <= N - 8; n += 8) {
+                int32x4_t v_cr0 = vld1q_s32(cr + n);
+                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                float32x4_t v_bs0 = vld1q_f32(bs + n);
+                float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                vst1q_f32(dr + n, v_dr0);
+                vst1q_f32(dr + n + 4, v_dr1);
+            }
+            for (; n < N; n++) {
+                dr[n] = rs * bs[n] * (float) cr[n];
+            }
+#else
             for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+#endif
         }
 
         ci_offset += (size_t)M * N;
