@@ -618,7 +618,14 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     if (node->op != GGML_OP_MUL_MAT) {
         return ORK_CHAIN_NONE;
     }
-    const char * name = node->src[0]->name;
+    struct ggml_tensor * src0 = node->src[0];
+    int64_t K = src0->ne[0];
+    int64_t N = src0->ne[1];
+    if (K > 1024 || N > 8192) {
+        return ORK_CHAIN_NONE;
+    }
+
+    const char * name = src0->name;
     bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
     bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
     
@@ -1074,7 +1081,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
             // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
             const char * name = src0->name;
-            if (strstr(name, "output") || strstr(name, "lm_head")) {
+            fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
+            fflush(stderr);
+            if (strstr(name, "output") || strstr(name, "lm_head") || N > 16384) {
                 return false;
             }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
@@ -1101,7 +1110,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Residency does NOT make single-token (M=1) decode worth it for dense layers — the per-submit
             // floor dominates regardless. Keep the M threshold so dense decode stays on CPU.
             // Bypassed for expert layers (MoE) where CPU weight streaming is a catastrophic ~32ms bottleneck.
-            int threshold = is_expert ? 1 : min_m;
+            bool hadamard = g_ork_ctx ? g_ork_ctx->hadamard : (getenv("ORK_HADAMARD") != nullptr);
+            bool is_grouped = (src0->type == GGML_TYPE_Q4_0  ||
+                               src0->type == GGML_TYPE_Q4_1  ||
+                               src0->type == GGML_TYPE_Q4_K  ||
+                               src0->type == GGML_TYPE_IQ4_NL ||
+                               src0->type == GGML_TYPE_IQ4_XS) && !hadamard;
+            int threshold = is_expert ? 1 : (is_grouped ? min_m : (min_m > 32 ? 32 : min_m));
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
             return pass_m_threshold &&
