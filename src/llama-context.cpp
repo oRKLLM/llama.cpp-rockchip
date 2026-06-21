@@ -3735,6 +3735,25 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
+int32_t llama_kv_self_used_cells(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return 0;
+    }
+    int32_t max_pos = -1;
+    uint32_t n_seq = ctx->n_seq_max();
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        int32_t pos = llama_memory_seq_pos_max(mem, i);
+        if (pos > max_pos) {
+            max_pos = pos;
+        }
+    }
+    return max_pos >= 0 ? max_pos + 1 : 0;
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 

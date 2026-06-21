@@ -663,7 +663,8 @@ static bool ork_is_expert(const char * name) {
 
 enum ork_chain_type {
     ORK_CHAIN_NONE,
-    ORK_CHAIN_I8
+    ORK_CHAIN_I8,
+    ORK_CHAIN_I4
 };
 
 static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
@@ -673,9 +674,6 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     struct ggml_tensor * src0 = node->src[0];
     int64_t K = src0->ne[0];
     int64_t N = src0->ne[1];
-    if (K > 1024 || N > 8192) {
-        return ORK_CHAIN_NONE;
-    }
 
     const char * name = src0->name;
     bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
@@ -687,9 +685,266 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
         else if (is_attn) target_qbits = 8;
     }
     if (target_qbits == 8) {
-        return ORK_CHAIN_I8;
+        if (K <= 1024 && N <= 4096 && (K % 32 == 0) && (N % 32 == 0)) {
+            return ORK_CHAIN_I8;
+        }
+    } else if (target_qbits == 4) {
+        if (K <= 10752 && N <= 4096 && (K % 32 == 0) && (N % 64 == 0)) {
+            return ORK_CHAIN_I4;
+        }
     }
     return ORK_CHAIN_NONE;
+}
+
+
+static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
+    fprintf(stderr, "[ORK] START mul_mat_chain_i4, count=%d\n", count); fflush(stderr);
+
+    const int M = nodes[0]->src[1]->ne[1];
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
+    size_t total_ai_size = 0;
+    size_t total_as_size = 0;
+    size_t total_ci_size = 0;
+    for (int i = 0; i < count; i++) {
+        struct ggml_tensor * dst = nodes[i];
+        int K = dst->src[0]->ne[0];
+        int N = dst->src[0]->ne[1];
+        total_ai_size += (size_t)M_padded * K;
+        total_as_size += (size_t)M_padded;
+        total_ci_size += (size_t)M_padded * N;
+    }
+    ctx->ai.resize(total_ai_size);
+    ctx->as.resize(total_as_size);
+    ctx->ci.resize(total_ci_size);
+
+    int8_t  * ai_base = ctx->ai.data();
+    float   * as_base = ctx->as.data();
+    int32_t * ci_base = ctx->ci.data();
+
+    size_t ai_offset = 0;
+    size_t as_offset = 0;
+    size_t ci_offset = 0;
+
+    std::vector<ork_mm_task_i4> tasks;
+    const double t0 = ctx->profile ? ork_now_us() : 0;
+
+    std::unordered_map<const void *, std::pair<int8_t *, float *>> chain_act_cache;
+
+    for (int i = 0; i < count; i++) {
+        struct ggml_tensor * dst = nodes[i];
+        const struct ggml_tensor * src0 = dst->src[0];
+        const struct ggml_tensor * src1 = dst->src[1];
+
+        const enum ggml_type type = src0->type;
+        const int K = (int) src0->ne[0];
+        const int N = (int) src0->ne[1];
+        const int M = (int) src1->ne[1];
+
+        const auto * tt = ggml_get_type_traits(type);
+        ggml_to_float_t const to_float = tt->to_float;
+
+        const char  * x = (const char *) src0->data;
+        const float * y = (const float *) src1->data;
+
+        // weight: check cache / pack
+        auto it = ctx->wcache.find(x);
+        if (it == ctx->wcache.end()) {
+            ctx->f32.resize((size_t) N * K);
+            ctx->bi .resize((size_t) K * N);
+            float * f32 = ctx->f32.data();
+            int8_t * bi = ctx->bi.data();
+            if (type == GGML_TYPE_F32) {
+                for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*src0->nb[1], (size_t) K*sizeof(float));
+            } else {
+                for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*src0->nb[1], f32 + n*K, K);
+            }
+            ork_weight ow; ow.gsize = 0; ow.bscale.resize((size_t) N);
+            if (ctx->hadamard) {
+                const int b = K & (-K);
+                for (int n = 0; n < N; n++) {
+                    float * col = f32 + (size_t) n*K;
+                    for (int off = 0; off < K; off += b) {
+                        ork_fwht_norm(col + off, b);
+                    }
+                }
+            }
+            for (int n = 0; n < N; n++) {
+                float * col = f32 + (size_t) n*K;
+                float mx = 1e-9f;
+                for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                float s = mx / 7.0f; ow.bscale[n] = s;
+                for (int k = 0; k < K; k++) {
+                    int q = (int) lrintf(col[k] / s);
+                    bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                }
+            }
+            ow.w = ork_mm_pack_i4(ctx->npu, K, N, bi);
+            if (!ow.w) return false;
+            it = ctx->wcache.emplace(x, std::move(ow)).first;
+        }
+        const ork_weight & ow = it->second;
+
+        // activation: check cache or quantize
+        int8_t * task_A = nullptr;
+        float  * task_as = nullptr;
+        auto act_it = chain_act_cache.find(src1->data);
+        if (act_it != chain_act_cache.end()) {
+            task_A = act_it->second.first;
+            task_as = act_it->second.second;
+        } else {
+            task_A = ai_base + ai_offset;
+            task_as = as_base + as_offset;
+            #pragma omp parallel for if (M_padded >= 16)
+            for (int m = 0; m < M_padded; m++) {
+                if (m < M) {
+                    if (ctx->hadamard) {
+                        int b = K & (-K);
+                        std::vector<float> arow_local(K);
+                        memcpy(arow_local.data(), y + (size_t) m*K, (size_t) K*sizeof(float));
+                        for (int off = 0; off < K; off += b) {
+                            ork_fwht_norm(arow_local.data() + off, b);
+                        }
+                        float mx = 1e-9f;
+                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; task_as[m] = s;
+                        for (int k = 0; k < K; k++) {
+                            int q = (int) lrintf(arow_local[k] / s);
+                            task_A[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
+                    } else {
+                        const float * yr = y + (size_t) m*K;
+                        int8_t * amr = task_A + (size_t) m*K;
+                        float mx = 1e-9f;
+                        for (int k = 0; k < K; k++) { float v = yr[k] >= 0.0f ? yr[k] : -yr[k]; mx = v > mx ? v : mx; }
+                        task_as[m] = mx / 7.0f;
+                        const float inv = 7.0f / mx;
+                        for (int k = 0; k < K; k++) {
+                            float q = yr[k] * inv;
+                            int qi = (int) (q + copysignf(0.5f, q));
+                            amr[k] = (int8_t) (qi > 7 ? 7 : qi < -8 ? -8 : qi);
+                        }
+                    }
+                } else {
+                    memset(task_A + (size_t) m*K, 0, K);
+                    task_as[m] = 0.0f;
+                }
+            }
+            chain_act_cache[src1->data] = {task_A, task_as};
+            ai_offset += (size_t)M_padded * K;
+            as_offset += (size_t)M_padded;
+        }
+
+        tasks.push_back({
+            ow.w,
+            M_padded,
+            task_A,
+            ci_base + ci_offset
+        });
+
+        ci_offset += (size_t)M_padded * N;
+    }
+
+    const double t1 = ctx->profile ? ork_now_us() : 0;
+
+    fprintf(stderr, "[ORK] i4 chain submit: tasks=%zu\n", tasks.size());
+    fflush(stderr);
+    int ok = ork_mm_run_chain_i4(ctx->npu, tasks.size(), tasks.data());
+    if (ok != 0) {
+        // Fallback to sequential single-task run
+        fprintf(stderr, "[ORK] i4 chain failed (%d), falling back to sequential\n", ok); fflush(stderr);
+        for (size_t t = 0; t < tasks.size(); t++) {
+            if (ork_mm_run_i4(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
+                return false;
+            }
+        }
+    }
+
+    const double t2 = ctx->profile ? ork_now_us() : 0;
+
+    // Dequantize results
+    ci_offset = 0;
+    for (int i = 0; i < count; i++) {
+        struct ggml_tensor * dst = nodes[i];
+        const char * x = (const char *) dst->src[0]->data;
+        const struct ggml_tensor * src1 = dst->src[1];
+        float * d = (float *) dst->data;
+        int N = dst->src[0]->ne[1];
+        int M = dst->src[1]->ne[1];
+
+        auto it = ctx->wcache.find(x);
+        const ork_weight & ow = it->second;
+        const float * bs = ow.bscale.data();
+        
+        auto act_it = chain_act_cache.find(src1->data);
+        const float * task_as = act_it->second.second;
+        const int32_t * ctr = ci_base + ci_offset;
+        ci_offset += (size_t)M_padded * N;
+
+        #pragma omp parallel for if (M >= 16)
+        for (int m = 0; m < M; m++) {
+            const float rs = task_as[m];
+            const int32_t * cr = ctr + (size_t) m*N;
+            float * dr = d + (size_t) m*N;
+#if defined(__ARM_NEON)
+            float32x4_t v_rs = vdupq_n_f32(rs);
+            int n = 0;
+            for (; n <= N - 8; n += 8) {
+                int32x4_t v_cr0 = vld1q_s32(cr + n);
+                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                float32x4_t v_bs0 = vld1q_f32(bs + n);
+                float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                vst1q_f32(dr + n, v_dr0);
+                vst1q_f32(dr + n + 4, v_dr1);
+            }
+            for (; n < N; n++) {
+                dr[n] = rs * bs[n] * (float) cr[n];
+            }
+#else
+            for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+#endif
+        }
+    }
+
+    if (ctx->profile) {
+        double t3 = ork_now_us();
+        ctx->t_quant += t1 - t0;
+        ctx->t_run   += t2 - t1;
+        ctx->t_deq   += t3 - t2;
+        ctx->n_mm    += count;
+        for (int i = 0; i < count; i++) {
+            int M = nodes[i]->src[1]->ne[1];
+            double part_run = (t2 - t1) / count;
+            if (M > 1) {
+                ctx->t_run_pf  += part_run;
+                ctx->n_pf      += 1;
+                ctx->m_pf      += M;
+            } else {
+                ctx->t_run_dec += part_run;
+                ctx->n_dec     += 1;
+            }
+        }
+    }
+
+    if (ctx->no_cache) {
+        for (int i = 0; i < count; i++) {
+            struct ggml_tensor * dst = nodes[i];
+            const char * x = (const char *) dst->src[0]->data;
+            auto it = ctx->wcache.find(x);
+            if (it != ctx->wcache.end()) {
+                ork_w_free(it->second.w);
+                ctx->wcache.erase(it);
+            }
+        }
+    }
+
+    return true;
 }
 
 static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
@@ -877,8 +1132,6 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
             for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
         }
-
-        ci_offset += (size_t)M * N;
     }
 
     if (ctx->profile) {
@@ -962,6 +1215,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     bool chain_ok = false;
                     if (type == ORK_CHAIN_I8) {
                         chain_ok = ggml_backend_ork_mul_mat_chain_i8(ctx, chain_nodes.data(), chain_nodes.size());
+                    } else if (type == ORK_CHAIN_I4) {
+                        chain_ok = ggml_backend_ork_mul_mat_chain_i4(ctx, chain_nodes.data(), chain_nodes.size());
                     }
                     if (!chain_ok) return GGML_STATUS_FAILED;
                     i += chain_nodes.size() - 1;
