@@ -647,6 +647,20 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static bool ork_is_expert(const char * name) {
+    if (!name) return false;
+    if (strstr(name, "expert") != nullptr) return true;
+    if (strstr(name, "exps") != nullptr) return true;
+    if (strstr(name, "shexp") != nullptr) return true;
+    const char * p = strstr(name, "ffn_gate.");
+    if (p && p[9] >= '0' && p[9] <= '9') return true;
+    p = strstr(name, "ffn_up.");
+    if (p && p[7] >= '0' && p[7] <= '9') return true;
+    p = strstr(name, "ffn_down.");
+    if (p && p[9] >= '0' && p[9] <= '9') return true;
+    return false;
+}
+
 enum ork_chain_type {
     ORK_CHAIN_NONE,
     ORK_CHAIN_I8
@@ -664,7 +678,7 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     }
 
     const char * name = src0->name;
-    bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
+    bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
     bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
     
     int target_qbits = ctx->qbits;
@@ -967,7 +981,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         i += ng - 1;
                     } else {
                         const char * name = node->src[0]->name;
-                        bool is_ffn = strstr(name, "ffn_") || strstr(name, "expert");
+                        bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
                         bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
                         
                         int target_qbits = ctx->qbits;
@@ -1142,7 +1156,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '8') ? 8 : 4);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
             const char * name_src = src0->name;
-            bool is_expert = strstr(name_src, "expert") != nullptr;
+            bool is_expert = ork_is_expert(name_src);
             if (hybrid) {
                 bool is_ffn = strstr(name_src, "ffn_") || is_expert;
                 bool is_attn = strstr(name_src, "attn_q") || strstr(name_src, "attn_k") || strstr(name_src, "attn_v") || strstr(name_src, "attn_output");
