@@ -97,9 +97,11 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
     for (int chunk_start = 0; chunk_start < S; chunk_start += 1) {
         int chunk_size = std::min(1, S - chunk_start);
 
-        ctx->ai .resize((size_t) chunk_size * M * K);
-        ctx->as .resize((size_t) chunk_size * M);
-        ctx->ci .resize((size_t) chunk_size * M * N);
+        const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
+        ctx->ai .resize((size_t) chunk_size * M_padded * K);
+        ctx->as .resize((size_t) chunk_size * M_padded);
+        ctx->ci .resize((size_t) chunk_size * M_padded * N);
 
         int8_t  * ai  = ctx->ai.data();
         float   * as  = ctx->as.data();
@@ -147,21 +149,26 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 1 && !ctx->no_reuse);
             if (!reuse) {
-                // activation: per-row int8 quant
-                int8_t * ar = ai + t * M * K;
-                float * asr = as + t * M;
-                #pragma omp parallel for if (M >= 16)
-                for (int m = 0; m < M; m++) {
-                    const float * yr = y + (size_t) m*K;
-                    int8_t * amr = ar + (size_t) m*K;
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                    asr[m] = mx / 127.0f;
-                    const float inv = 127.0f / mx;
-                    for (int k = 0; k < K; k++) {
-                        float q = yr[k] * inv;
-                        int qi = (int) (q + copysignf(0.5f, q));
-                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                // activation: per-row int8 quant with shape padding
+                int8_t * ar = ai + t * M_padded * K;
+                float * asr = as + t * M_padded;
+                #pragma omp parallel for if (M_padded >= 16)
+                for (int m = 0; m < M_padded; m++) {
+                    if (m < M) {
+                        const float * yr = y + (size_t) m*K;
+                        int8_t * amr = ar + (size_t) m*K;
+                        float mx = 1e-9f;
+                        for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                        asr[m] = mx / 127.0f;
+                        const float inv = 127.0f / mx;
+                        for (int k = 0; k < K; k++) {
+                            float q = yr[k] * inv;
+                            int qi = (int) (q + copysignf(0.5f, q));
+                            amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                        }
+                    } else {
+                        memset(ar + (size_t) m*K, 0, K);
+                        asr[m] = 0.0f;
                     }
                 }
                 ctx->last_src1 = y;
@@ -174,9 +181,9 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             }
             tasks.push_back({
                 ow.w,
-                M,
-                ai + t * M * K,
-                ci + t * M * N
+                M_padded,
+                ai + t * M_padded * K,
+                ci + t * M_padded * N
             });
         }
 
@@ -209,8 +216,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             auto it = ctx->wcache.find(x);
             const ork_weight & ow = it->second;
             const float * bs = ow.bscale.data();
-            const float * asr = as + t * M;
-            const int32_t * ctr = ci + t * M * N;
+            const float * asr = as + t * M_padded;
+            const int32_t * ctr = ci + t * M_padded * N;
 
             #pragma omp parallel for if (M >= 16)
             for (int m = 0; m < M; m++) {
@@ -298,10 +305,12 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
     const auto * tt = ggml_get_type_traits(type);
     ggml_to_float_t const to_float = tt->to_float;
 
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
-    ctx->ai .resize((size_t) M * K);
-    ctx->as .resize((size_t) M * NG);                 // per-row, per-group activation scale
+    ctx->ai .resize((size_t) M_padded * K);
+    ctx->as .resize((size_t) M_padded * NG);                 // per-row, per-group activation scale
     float  * f32 = ctx->f32.data();
     int8_t * bi  = ctx->bi.data();
     int8_t * ai  = ctx->ai.data();
@@ -339,16 +348,23 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 && !ctx->no_reuse);
             if (!reuse) {
-                // activations: per-row, per-group int4 quant
-                #pragma omp parallel for if (M >= 16)
-                for (int m = 0; m < M; m++) {
-                    for (int g = 0; g < NG; g++) {
-                        float mx = 1e-9f;
-                        for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
-                        for (int j = 0; j < G; j++) {
-                            int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
-                            ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                // activations: per-row, per-group int4 quant with shape padding
+                #pragma omp parallel for if (M_padded >= 16)
+                for (int m = 0; m < M_padded; m++) {
+                    if (m < M) {
+                        for (int g = 0; g < NG; g++) {
+                            float mx = 1e-9f;
+                            for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
+                            float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
+                            for (int j = 0; j < G; j++) {
+                                int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
+                                ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            }
+                        }
+                    } else {
+                        memset(ai + (size_t) m*K, 0, K);
+                        for (int g = 0; g < NG; g++) {
+                            as[(size_t) m*NG + g] = 0.0f;
                         }
                     }
                 }
@@ -361,10 +377,19 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                 fflush(stderr);
             }
 
-            // grouped run dequantizes per group into the fp32 dst directly
-            fprintf(stderr, "[ORK] i4 grouped: M=%d, K=%d, N=%d, G=%d\n", M, K, N, G);
+            // grouped run dequantizes per group into the fp32 dst directly (handling M != M_padded to prevent out-of-bounds write)
+            fprintf(stderr, "[ORK] i4 grouped: M_padded=%d (M=%d), K=%d, N=%d, G=%d\n", M_padded, M, K, N, G);
             fflush(stderr);
-            if (ork_mm_run_i4_grouped(ctx->npu, ow.w, M, ai, as, ow.bscale.data(), d)) return false;
+            std::vector<float> tmp_d;
+            float * d_ptr = d;
+            if (M != M_padded) {
+                tmp_d.resize((size_t) M_padded * N);
+                d_ptr = tmp_d.data();
+            }
+            if (ork_mm_run_i4_grouped(ctx->npu, ow.w, M_padded, ai, as, ow.bscale.data(), d_ptr)) return false;
+            if (M != M_padded) {
+                memcpy(d, d_ptr, (size_t) M * N * sizeof(float));
+            }
         }
     }
     return true;
@@ -391,11 +416,13 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
     const auto * tt = ggml_get_type_traits(type);
     ggml_to_float_t const to_float = tt->to_float;
 
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
-    ctx->ai .resize((size_t) M * K);
-    ctx->as .resize((size_t) M);
-    ctx->ci .resize((size_t) M * N);
+    ctx->ai .resize((size_t) M_padded * K);
+    ctx->as .resize((size_t) M_padded);
+    ctx->ci .resize((size_t) M_padded * N);
     ctx->arot.resize((size_t) K);
     float   * f32  = ctx->f32.data();
     int8_t  * bi   = ctx->bi.data();
@@ -439,20 +466,25 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
             if (!reuse) {
-                // activations: rotate each row (A·R), per-row int4 quant
-                #pragma omp parallel for if (M >= 16)
-                for (int m = 0; m < M; m++) {
-                    float arow_local[K];
-                    memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
-                    for (int off = 0; off < K; off += b) {
-                        ork_fwht_norm(arow_local + off, b);
-                    }
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                    float s = mx / 7.0f; as[m] = s;
-                    for (int k = 0; k < K; k++) {
-                        int q = (int) lrintf(arow_local[k] / s);
-                        ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                // activations: rotate each row (A·R), per-row int4 quant with shape padding
+                #pragma omp parallel for if (M_padded >= 16)
+                for (int m = 0; m < M_padded; m++) {
+                    if (m < M) {
+                        float arow_local[K];
+                        memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
+                        for (int off = 0; off < K; off += b) {
+                            ork_fwht_norm(arow_local + off, b);
+                        }
+                        float mx = 1e-9f;
+                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; as[m] = s;
+                        for (int k = 0; k < K; k++) {
+                            int q = (int) lrintf(arow_local[k] / s);
+                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
+                    } else {
+                        memset(ai + (size_t) m*K, 0, K);
+                        as[m] = 0.0f;
                     }
                 }
                 ctx->last_src1 = y;
@@ -464,8 +496,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 fflush(stderr);
             }
 
-            ork_mm_task_i4 task = { ow.w, M, ai, ci };
-            fprintf(stderr, "[ORK] i4 chain: M=%d, K=%d, N=%d\n", M, K, N);
+            ork_mm_task_i4 task = { ow.w, M_padded, ai, ci };
+            fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
             fflush(stderr);
             if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
             #pragma omp parallel for if (M >= 16)
@@ -521,23 +553,29 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     }
     const ork_weight & ow = it->second;
 
-    ctx->ai.resize((size_t) M*K); ctx->as.resize(M); ctx->ci.resize((size_t) M*Ntot);
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+    ctx->ai.resize((size_t) M_padded*K); ctx->as.resize(M_padded); ctx->ci.resize((size_t) M_padded*Ntot);
     ctx->last_src1 = nullptr;                            // group overwrote ctx->ai — kill reuse cache
     ctx->last_type = 0;
     int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
     const float * y = (const float *) src1->data;
-    for (int m = 0; m < M; m++) {                        // quantize the shared activation once
-        const float * yr = y + (size_t) m*K; int8_t * ar = ai + (size_t) m*K;
-        float mx = 1e-9f;
-        for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-        as[m] = mx / 127.0f; const float inv = 127.0f / mx;
-        for (int k = 0; k < K; k++) { float q = yr[k]*inv; int qi = (int)(q + copysignf(0.5f, q));
-            ar[k] = (int8_t)(qi > 127 ? 127 : qi < -127 ? -127 : qi); }
+    for (int m = 0; m < M_padded; m++) {                        // quantize the shared activation once with shape padding
+        if (m < M) {
+            const float * yr = y + (size_t) m*K; int8_t * ar = ai + (size_t) m*K;
+            float mx = 1e-9f;
+            for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+            as[m] = mx / 127.0f; const float inv = 127.0f / mx;
+            for (int k = 0; k < K; k++) { float q = yr[k]*inv; int qi = (int)(q + copysignf(0.5f, q));
+                ar[k] = (int8_t)(qi > 127 ? 127 : qi < -127 ? -127 : qi); }
+        } else {
+            memset(ai + (size_t) m*K, 0, K);
+            as[m] = 0.0f;
+        }
     }
     const double t1 = ctx->profile ? ork_now_us() : 0;
-    fprintf(stderr, "[ORK] mul_mat_id i8: M=%d, K=%d, N=%d (ng=%d)\n", M, K, Ntot, ng);
+    fprintf(stderr, "[ORK] mul_mat_id i8: M_padded=%d (M=%d), K=%d, N=%d (ng=%d)\n", M_padded, M, K, Ntot, ng);
     fflush(stderr);
-    if (ork_mm_run_i8(ctx->npu, ow.w, M, ai, ci)) return false;     // ONE submit for all ng matmuls
+    if (ork_mm_run_i8(ctx->npu, ow.w, M_padded, ai, ci)) return false;     // ONE submit for all ng matmuls
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
     const float * bs = ow.bscale.data();                 // scatter+dequant into each dst
@@ -643,6 +681,9 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
 static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
     fprintf(stderr, "[ORK] START mul_mat_chain_i8, count=%d\n", count); fflush(stderr);
 
+    const int M = nodes[0]->src[1]->ne[1];
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
     size_t total_ai_size = 0;
     size_t total_as_size = 0;
     size_t total_ci_size = 0;
@@ -650,10 +691,9 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         struct ggml_tensor * dst = nodes[i];
         int K = dst->src[0]->ne[0];
         int N = dst->src[0]->ne[1];
-        int M = dst->src[1]->ne[1];
-        total_ai_size += (size_t)M * K;
-        total_as_size += (size_t)M;
-        total_ci_size += (size_t)M * N;
+        total_ai_size += (size_t)M_padded * K;
+        total_as_size += (size_t)M_padded;
+        total_ci_size += (size_t)M_padded * N;
     }
     ctx->ai.resize(total_ai_size);
     ctx->as.resize(total_as_size);
@@ -726,32 +766,37 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
-            for (int m = 0; m < M; m++) {
-                const float * yr = y + (size_t) m*K;
-                int8_t * amr = task_A + (size_t) m*K;
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                task_as[m] = mx / 127.0f;
-                const float inv = 127.0f / mx;
-                for (int k = 0; k < K; k++) {
-                    float q = yr[k] * inv;
-                    int qi = (int) (q + copysignf(0.5f, q));
-                    amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+            for (int m = 0; m < M_padded; m++) {
+                if (m < M) {
+                    const float * yr = y + (size_t) m*K;
+                    int8_t * amr = task_A + (size_t) m*K;
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                    task_as[m] = mx / 127.0f;
+                    const float inv = 127.0f / mx;
+                    for (int k = 0; k < K; k++) {
+                        float q = yr[k] * inv;
+                        int qi = (int) (q + copysignf(0.5f, q));
+                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                    }
+                } else {
+                    memset(task_A + (size_t) m*K, 0, K);
+                    task_as[m] = 0.0f;
                 }
             }
             chain_act_cache[src1->data] = {task_A, task_as};
-            ai_offset += (size_t)M * K;
-            as_offset += (size_t)M;
+            ai_offset += (size_t)M_padded * K;
+            as_offset += (size_t)M_padded;
         }
 
         tasks.push_back({
             ow.w,
-            M,
+            M_padded,
             task_A,
             ci_base + ci_offset
         });
 
-        ci_offset += (size_t)M * N;
+        ci_offset += (size_t)M_padded * N;
     }
 
     const double t1 = ctx->profile ? ork_now_us() : 0;
@@ -788,6 +833,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         auto act_it = chain_act_cache.find(src1->data);
         const float * task_as = act_it->second.second;
         const int32_t * ctr = ci_base + ci_offset;
+        ci_offset += (size_t)M_padded * N;
 
         for (int m = 0; m < M; m++) {
             const float rs = task_as[m];
