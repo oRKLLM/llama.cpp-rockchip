@@ -19,6 +19,11 @@
 #include <utility>
 #include <unordered_map>
 
+#ifdef __linux__
+#include <sched.h>
+#include <pthread.h>
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -67,6 +72,17 @@ void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
 }
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
+
+static inline void ork_reset_affinity(void) {
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < 8; i++) {
+        CPU_SET(i, &cpuset);
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+}
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
@@ -152,23 +168,27 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 // activation: per-row int8 quant with shape padding
                 int8_t * ar = ai + t * M_padded * K;
                 float * asr = as + t * M_padded;
-                #pragma omp parallel for if (M_padded >= 16)
-                for (int m = 0; m < M_padded; m++) {
-                    if (m < M) {
-                        const float * yr = y + (size_t) m*K;
-                        int8_t * amr = ar + (size_t) m*K;
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                        asr[m] = mx / 127.0f;
-                        const float inv = 127.0f / mx;
-                        for (int k = 0; k < K; k++) {
-                            float q = yr[k] * inv;
-                            int qi = (int) (q + copysignf(0.5f, q));
-                            amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                #pragma omp parallel if (M_padded >= 16)
+                {
+                    ork_reset_affinity();
+                    #pragma omp for
+                    for (int m = 0; m < M_padded; m++) {
+                        if (m < M) {
+                            const float * yr = y + (size_t) m*K;
+                            int8_t * amr = ar + (size_t) m*K;
+                            float mx = 1e-9f;
+                            for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                            asr[m] = mx / 127.0f;
+                            const float inv = 127.0f / mx;
+                            for (int k = 0; k < K; k++) {
+                                float q = yr[k] * inv;
+                                int qi = (int) (q + copysignf(0.5f, q));
+                                amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                            }
+                        } else {
+                            memset(ar + (size_t) m*K, 0, K);
+                            asr[m] = 0.0f;
                         }
-                    } else {
-                        memset(ar + (size_t) m*K, 0, K);
-                        asr[m] = 0.0f;
                     }
                 }
                 ctx->last_src1 = y;
@@ -219,34 +239,38 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const float * asr = as + t * M_padded;
             const int32_t * ctr = ci + t * M_padded * N;
 
-            #pragma omp parallel for if (M >= 16)
-            for (int m = 0; m < M; m++) {
-                const float rs = asr[m];
-                const int32_t * cr = ctr + (size_t) m*N;
-                float * dr = d + (size_t) m*N;
+            #pragma omp parallel if (M >= 16)
+            {
+                ork_reset_affinity();
+                #pragma omp for
+                for (int m = 0; m < M; m++) {
+                    const float rs = asr[m];
+                    const int32_t * cr = ctr + (size_t) m*N;
+                    float * dr = d + (size_t) m*N;
 #if defined(__ARM_NEON)
-                float32x4_t v_rs = vdupq_n_f32(rs);
-                int n = 0;
-                for (; n <= N - 8; n += 8) {
-                    int32x4_t v_cr0 = vld1q_s32(cr + n);
-                    int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
-                    float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
-                    float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
-                    float32x4_t v_bs0 = vld1q_f32(bs + n);
-                    float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
-                    float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
-                    float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
-                    float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
-                    float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
-                    vst1q_f32(dr + n, v_dr0);
-                    vst1q_f32(dr + n + 4, v_dr1);
-                }
-                for (; n < N; n++) {
-                    dr[n] = rs * bs[n] * (float) cr[n];
-                }
+                    float32x4_t v_rs = vdupq_n_f32(rs);
+                    int n = 0;
+                    for (; n <= N - 8; n += 8) {
+                        int32x4_t v_cr0 = vld1q_s32(cr + n);
+                        int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                        float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                        float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                        float32x4_t v_bs0 = vld1q_f32(bs + n);
+                        float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                        float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                        float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                        float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                        float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                        vst1q_f32(dr + n, v_dr0);
+                        vst1q_f32(dr + n + 4, v_dr1);
+                    }
+                    for (; n < N; n++) {
+                        dr[n] = rs * bs[n] * (float) cr[n];
+                    }
 #else
-                for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+                    for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
+                }
             }
         }
 
@@ -349,22 +373,26 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 && !ctx->no_reuse);
             if (!reuse) {
                 // activations: per-row, per-group int4 quant with shape padding
-                #pragma omp parallel for if (M_padded >= 16)
-                for (int m = 0; m < M_padded; m++) {
-                    if (m < M) {
-                        for (int g = 0; g < NG; g++) {
-                            float mx = 1e-9f;
-                            for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
-                            float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
-                            for (int j = 0; j < G; j++) {
-                                int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
-                                ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                #pragma omp parallel if (M_padded >= 16)
+                {
+                    ork_reset_affinity();
+                    #pragma omp for
+                    for (int m = 0; m < M_padded; m++) {
+                        if (m < M) {
+                            for (int g = 0; g < NG; g++) {
+                                float mx = 1e-9f;
+                                for (int j = 0; j < G; j++) { float v = fabsf(y[(size_t) m*K + g*G + j]); if (v > mx) mx = v; }
+                                float s = mx / 7.0f; as[(size_t) m*NG + g] = s;
+                                for (int j = 0; j < G; j++) {
+                                    int q = (int) lrintf(y[(size_t) m*K + g*G + j] / s);
+                                    ai[(size_t) m*K + g*G + j] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                                }
                             }
-                        }
-                    } else {
-                        memset(ai + (size_t) m*K, 0, K);
-                        for (int g = 0; g < NG; g++) {
-                            as[(size_t) m*NG + g] = 0.0f;
+                        } else {
+                            memset(ai + (size_t) m*K, 0, K);
+                            for (int g = 0; g < NG; g++) {
+                                as[(size_t) m*NG + g] = 0.0f;
+                            }
                         }
                     }
                 }
@@ -467,24 +495,28 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
             if (!reuse) {
                 // activations: rotate each row (A·R), per-row int4 quant with shape padding
-                #pragma omp parallel for if (M_padded >= 16)
-                for (int m = 0; m < M_padded; m++) {
-                    if (m < M) {
-                        float arow_local[K];
-                        memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
-                        for (int off = 0; off < K; off += b) {
-                            ork_fwht_norm(arow_local + off, b);
+                #pragma omp parallel if (M_padded >= 16)
+                {
+                    ork_reset_affinity();
+                    #pragma omp for
+                    for (int m = 0; m < M_padded; m++) {
+                        if (m < M) {
+                            float arow_local[K];
+                            memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
+                            for (int off = 0; off < K; off += b) {
+                                ork_fwht_norm(arow_local + off, b);
+                            }
+                            float mx = 1e-9f;
+                            for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                            float s = mx / 7.0f; as[m] = s;
+                            for (int k = 0; k < K; k++) {
+                                int q = (int) lrintf(arow_local[k] / s);
+                                ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            }
+                        } else {
+                            memset(ai + (size_t) m*K, 0, K);
+                            as[m] = 0.0f;
                         }
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; as[m] = s;
-                        for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(arow_local[k] / s);
-                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                        }
-                    } else {
-                        memset(ai + (size_t) m*K, 0, K);
-                        as[m] = 0.0f;
                     }
                 }
                 ctx->last_src1 = y;
@@ -500,10 +532,14 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
             fflush(stderr);
             if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
-            #pragma omp parallel for if (M >= 16)
-            for (int m = 0; m < M; m++) {
-                for (int n = 0; n < N; n++) {
-                    d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
+            #pragma omp parallel if (M >= 16)
+            {
+                ork_reset_affinity();
+                #pragma omp for
+                for (int m = 0; m < M; m++) {
+                    for (int n = 0; n < N; n++) {
+                        d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
+                    }
                 }
             }
         }
@@ -582,33 +618,38 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     for (int i = 0; i < ng; i++) {
         const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
         float * dbase = (float *) g[i]->data;
-        for (int m = 0; m < M; m++) {
-            const float rs = as[m];
-            const int32_t * cr = ci + (size_t) m*Ntot + o;
-            float * dr = dbase + (size_t) m*Ni;
+        #pragma omp parallel if (M >= 16)
+        {
+            ork_reset_affinity();
+            #pragma omp for
+            for (int m = 0; m < M; m++) {
+                const float rs = as[m];
+                const int32_t * cr = ci + (size_t) m*Ntot + o;
+                float * dr = dbase + (size_t) m*Ni;
 #if defined(__ARM_NEON)
-            float32x4_t v_rs = vdupq_n_f32(rs);
-            int n = 0;
-            for (; n <= Ni - 8; n += 8) {
-                int32x4_t v_cr0 = vld1q_s32(cr + n);
-                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
-                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
-                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
-                float32x4_t v_bs0 = vld1q_f32(bs + o + n);
-                float32x4_t v_bs1 = vld1q_f32(bs + o + n + 4);
-                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
-                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
-                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
-                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
-                vst1q_f32(dr + n, v_dr0);
-                vst1q_f32(dr + n + 4, v_dr1);
-            }
-            for (; n < Ni; n++) {
-                dr[n] = rs * bs[o + n] * (float) cr[n];
-            }
+                float32x4_t v_rs = vdupq_n_f32(rs);
+                int n = 0;
+                for (; n <= Ni - 8; n += 8) {
+                    int32x4_t v_cr0 = vld1q_s32(cr + n);
+                    int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                    float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                    float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                    float32x4_t v_bs0 = vld1q_f32(bs + o + n);
+                    float32x4_t v_bs1 = vld1q_f32(bs + o + n + 4);
+                    float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                    float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                    float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                    float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                    vst1q_f32(dr + n, v_dr0);
+                    vst1q_f32(dr + n + 4, v_dr1);
+                }
+                for (; n < Ni; n++) {
+                    dr[n] = rs * bs[o + n] * (float) cr[n];
+                }
 #else
-            for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
+                for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
 #endif
+            }
         }
     }
     if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
@@ -795,39 +836,43 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
-            #pragma omp parallel for if (M_padded >= 16)
-            for (int m = 0; m < M_padded; m++) {
-                if (m < M) {
-                    if (ctx->hadamard) {
-                        int b = K & (-K);
-                        std::vector<float> arow_local(K);
-                        memcpy(arow_local.data(), y + (size_t) m*K, (size_t) K*sizeof(float));
-                        for (int off = 0; off < K; off += b) {
-                            ork_fwht_norm(arow_local.data() + off, b);
-                        }
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; task_as[m] = s;
-                        for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(arow_local[k] / s);
-                            task_A[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+            #pragma omp parallel if (M_padded >= 16)
+            {
+                ork_reset_affinity();
+                #pragma omp for
+                for (int m = 0; m < M_padded; m++) {
+                    if (m < M) {
+                        if (ctx->hadamard) {
+                            int b = K & (-K);
+                            std::vector<float> arow_local(K);
+                            memcpy(arow_local.data(), y + (size_t) m*K, (size_t) K*sizeof(float));
+                            for (int off = 0; off < K; off += b) {
+                                ork_fwht_norm(arow_local.data() + off, b);
+                            }
+                            float mx = 1e-9f;
+                            for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                            float s = mx / 7.0f; task_as[m] = s;
+                            for (int k = 0; k < K; k++) {
+                                int q = (int) lrintf(arow_local[k] / s);
+                                task_A[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            }
+                        } else {
+                            const float * yr = y + (size_t) m*K;
+                            int8_t * amr = task_A + (size_t) m*K;
+                            float mx = 1e-9f;
+                            for (int k = 0; k < K; k++) { float v = yr[k] >= 0.0f ? yr[k] : -yr[k]; mx = v > mx ? v : mx; }
+                            task_as[m] = mx / 7.0f;
+                            const float inv = 7.0f / mx;
+                            for (int k = 0; k < K; k++) {
+                                float q = yr[k] * inv;
+                                int qi = (int) (q + copysignf(0.5f, q));
+                                amr[k] = (int8_t) (qi > 7 ? 7 : qi < -8 ? -8 : qi);
+                            }
                         }
                     } else {
-                        const float * yr = y + (size_t) m*K;
-                        int8_t * amr = task_A + (size_t) m*K;
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = yr[k] >= 0.0f ? yr[k] : -yr[k]; mx = v > mx ? v : mx; }
-                        task_as[m] = mx / 7.0f;
-                        const float inv = 7.0f / mx;
-                        for (int k = 0; k < K; k++) {
-                            float q = yr[k] * inv;
-                            int qi = (int) (q + copysignf(0.5f, q));
-                            amr[k] = (int8_t) (qi > 7 ? 7 : qi < -8 ? -8 : qi);
-                        }
+                        memset(task_A + (size_t) m*K, 0, K);
+                        task_as[m] = 0.0f;
                     }
-                } else {
-                    memset(task_A + (size_t) m*K, 0, K);
-                    task_as[m] = 0.0f;
                 }
             }
             chain_act_cache[src1->data] = {task_A, task_as};
@@ -881,35 +926,39 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
         const int32_t * ctr = ci_base + ci_offset;
         ci_offset += (size_t)M_padded * N;
 
-        #pragma omp parallel for if (M >= 16)
-        for (int m = 0; m < M; m++) {
-            const float rs = task_as[m];
-            const int32_t * cr = ctr + (size_t) m*N;
-            float * dr = d + (size_t) m*N;
+            #pragma omp parallel if (M >= 16)
+            {
+                ork_reset_affinity();
+                #pragma omp for
+                for (int m = 0; m < M; m++) {
+                    const float rs = task_as[m];
+                    const int32_t * cr = ctr + (size_t) m*N;
+                    float * dr = d + (size_t) m*N;
 #if defined(__ARM_NEON)
-            float32x4_t v_rs = vdupq_n_f32(rs);
-            int n = 0;
-            for (; n <= N - 8; n += 8) {
-                int32x4_t v_cr0 = vld1q_s32(cr + n);
-                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
-                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
-                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
-                float32x4_t v_bs0 = vld1q_f32(bs + n);
-                float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
-                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
-                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
-                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
-                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
-                vst1q_f32(dr + n, v_dr0);
-                vst1q_f32(dr + n + 4, v_dr1);
-            }
-            for (; n < N; n++) {
-                dr[n] = rs * bs[n] * (float) cr[n];
-            }
+                    float32x4_t v_rs = vdupq_n_f32(rs);
+                    int n = 0;
+                    for (; n <= N - 8; n += 8) {
+                        int32x4_t v_cr0 = vld1q_s32(cr + n);
+                        int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                        float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                        float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                        float32x4_t v_bs0 = vld1q_f32(bs + n);
+                        float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                        float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                        float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                        float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                        float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                        vst1q_f32(dr + n, v_dr0);
+                        vst1q_f32(dr + n + 4, v_dr1);
+                    }
+                    for (; n < N; n++) {
+                        dr[n] = rs * bs[n] * (float) cr[n];
+                    }
 #else
-            for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+                    for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
-        }
+                }
+            }
     }
 
     if (ctx->profile) {
@@ -1104,6 +1153,8 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         const int32_t * ctr = ci_base + ci_offset;
         ci_offset += (size_t)M_padded * N;
 
+        ork_reset_affinity();
+        #pragma omp parallel for if (M >= 16)
         for (int m = 0; m < M; m++) {
             const float rs = task_as[m];
             const int32_t * cr = ctr + (size_t) m*N;
@@ -1171,7 +1222,18 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
 
 
 
-static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_ork_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+#ifdef __linux__
+    // Reset thread affinity to all cores (0-7) to prevent OpenMP workers from being
+    // restricted to a single core if the calling thread was pinned (e.g. by rkllm).
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < 8; i++) {
+        CPU_SET(i, &cpuset);
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
     fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
@@ -1267,6 +1329,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
+}
+
+static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ork_reset_affinity();
+    enum ggml_status status = ggml_backend_ork_graph_compute_impl(backend, cgraph);
+    ork_reset_affinity();
+    return status;
 }
 
 static struct ggml_backend_i ork_backend_i = {
@@ -1392,13 +1461,20 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
+            const char * name_src = src0->name;
+            static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
+            bool is_expert = ork_is_expert(name_src);
+
+            if (M < min_m && !is_expert) {
+                return false;
+            }
+
             // Explicitly block output and lm_head (vocabulary projection) layers from offloading to NPU.
             // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
             // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
-            const char * name = src0->name;
-            fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
+            fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name_src, (long)K, (long)N, (long)M);
             fflush(stderr);
-            if (strstr(name, "output") || strstr(name, "lm_head") || N > 16384) {
+            if (strstr(name_src, "output") || strstr(name_src, "lm_head") || N > 16384) {
                 return false;
             }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
@@ -1407,11 +1483,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // opposite: M>1 amortizes the floor over many rows, so NPU wins (39.6 vs 13.6 tok/s).
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
-            static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
             int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '8') ? 8 : 4);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
-            const char * name_src = src0->name;
-            bool is_expert = ork_is_expert(name_src);
             if (hybrid) {
                 bool is_ffn = strstr(name_src, "ffn_") || is_expert;
                 bool is_attn = strstr(name_src, "attn_q") || strstr(name_src, "attn_k") || strstr(name_src, "attn_v") || strstr(name_src, "attn_output");
