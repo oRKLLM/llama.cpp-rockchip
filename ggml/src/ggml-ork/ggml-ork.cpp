@@ -86,7 +86,7 @@ static inline void ork_reset_affinity(void) {
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
-    fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr); }
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     if (getenv("ORK_BUFPROBE")) { static int once=0; if(!once++) fprintf(stderr,
@@ -196,8 +196,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 ctx->last_K = K;
                 ctx->last_type = 1;
             } else {
-                fprintf(stderr, "[ORK] i8: reuse activation cache for y=%p\n", y);
-                fflush(stderr);
+                if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i8: reuse activation cache for y=%p\n", y); fflush(stderr); }
             }
             tasks.push_back({
                 ow.w,
@@ -209,8 +208,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 
         const double t1 = ctx->profile ? ork_now_us() : 0;
 
-        fprintf(stderr, "[ORK] i8 chain: M=%d, tasks=%zu (S=%d, K=%d, N=%d)\n", M, tasks.size(), S, K, N);
-        fflush(stderr);
+        if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i8 chain: M=%d, tasks=%zu (S=%d, K=%d, N=%d)\n", M, tasks.size(), S, K, N); fflush(stderr); }
         int ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
         if (ok != 0) {
             // Fallback to sequential single-task run
@@ -315,7 +313,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 // the NPU dequantizes each group's int partial in fp32. ~9.5% matmul error (W4A4 floor; weights at
 // 0.5 B/elem). Submit-heavy (K/G submits/core), so coarser/larger G is cheaper but less accurate.
 static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
-    fprintf(stderr, "[ORK] START mul_mat_i4\n"); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_i4\n"); fflush(stderr); }
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -401,13 +399,11 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                 ctx->last_K = K;
                 ctx->last_type = 2;
             } else {
-                fprintf(stderr, "[ORK] i4 grouped: reuse activation cache for y=%p\n", y);
-                fflush(stderr);
+                if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 grouped: reuse activation cache for y=%p\n", y); fflush(stderr); }
             }
 
             // grouped run dequantizes per group into the fp32 dst directly (handling M != M_padded to prevent out-of-bounds write)
-            fprintf(stderr, "[ORK] i4 grouped: M_padded=%d (M=%d), K=%d, N=%d, G=%d\n", M_padded, M, K, N, G);
-            fflush(stderr);
+            if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 grouped: M_padded=%d (M=%d), K=%d, N=%d, G=%d\n", M_padded, M, K, N, G); fflush(stderr); }
             std::vector<float> tmp_d;
             float * d_ptr = d;
             if (M != M_padded) {
@@ -431,7 +427,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 // not the grouped path's K/G submits. The NPU int MAC is exact; the only loss is the int4 quant the
 // rotation tames. See ROADMAP Tier 4a/4b.
 static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
-    fprintf(stderr, "[ORK] START mul_mat_i4_hadamard\n"); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_i4_hadamard\n"); fflush(stderr); }
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -524,13 +520,11 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->last_K = K;
                 ctx->last_type = 3;
             } else {
-                fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
-                fflush(stderr);
+                if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y); fflush(stderr); }
             }
 
             ork_mm_task_i4 task = { ow.w, M_padded, ai, ci };
-            fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
-            fflush(stderr);
+            if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N); fflush(stderr); }
             if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
             #pragma omp parallel if (M >= 16)
             {
@@ -553,7 +547,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
 // scatters the wide int32 result into each dst — turning n submits into 1, amortizing the per-matmul
 // submit floor. All g[i] are 2D (ne2==ne3==1), same K and M. Weight cached by g[0]->src0->data.
 static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
-    fprintf(stderr, "[ORK] START mul_mat_group_i8 ng=%d\n", ng); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_group_i8 ng=%d\n", ng); fflush(stderr); }
     const struct ggml_tensor * src1 = g[0]->src[1];
     const int K = (int) g[0]->src[0]->ne[0];
     const int M = (int) src1->ne[1];
@@ -609,8 +603,7 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
         }
     }
     const double t1 = ctx->profile ? ork_now_us() : 0;
-    fprintf(stderr, "[ORK] mul_mat_id i8: M_padded=%d (M=%d), K=%d, N=%d (ng=%d)\n", M_padded, M, K, Ntot, ng);
-    fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] mul_mat_id i8: M_padded=%d (M=%d), K=%d, N=%d (ng=%d)\n", M_padded, M, K, Ntot, ng); fflush(stderr); }
     if (ork_mm_run_i8(ctx->npu, ow.w, M_padded, ai, ci)) return false;     // ONE submit for all ng matmuls
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
@@ -739,7 +732,7 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
 
 
 static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
-    fprintf(stderr, "[ORK] START mul_mat_chain_i4, count=%d\n", count); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_chain_i4, count=%d\n", count); fflush(stderr); }
 
     const int M = nodes[0]->src[1]->ne[1];
     const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
@@ -806,7 +799,7 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
                 for (int n = 0; n < N; n++) {
                     float * col = f32 + (size_t) n*K;
                     for (int off = 0; off < K; off += b) {
-                        ork_fwht_norm(col + off, b);
+                        ork_fwht_norm(col + off, b);                        // rotate weight column R·B
                     }
                 }
             }
@@ -892,12 +885,11 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
 
     const double t1 = ctx->profile ? ork_now_us() : 0;
 
-    fprintf(stderr, "[ORK] i4 chain submit: tasks=%zu\n", tasks.size());
-    fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 chain submit: tasks=%zu\n", tasks.size()); fflush(stderr); }
     int ok = ork_mm_run_chain_i4(ctx->npu, tasks.size(), tasks.data());
     if (ok != 0) {
         // Fallback to sequential single-task run
-        fprintf(stderr, "[ORK] i4 chain failed (%d), falling back to sequential\n", ok); fflush(stderr);
+        if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i4 chain failed (%d), falling back to sequential\n", ok); fflush(stderr); }
         for (size_t t = 0; t < tasks.size(); t++) {
             if (ork_mm_run_i4(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
                 return false;
@@ -997,7 +989,7 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
 }
 
 static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** nodes, int count) {
-    fprintf(stderr, "[ORK] START mul_mat_chain_i8, count=%d\n", count); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START mul_mat_chain_i8, count=%d\n", count); fflush(stderr); }
 
     const int M = nodes[0]->src[1]->ne[1];
     const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
@@ -1119,12 +1111,12 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
 
     const double t1 = ctx->profile ? ork_now_us() : 0;
 
-    fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size()); }
     fflush(stderr);
     int ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
     if (ok != 0) {
         // Fallback to sequential single-task run
-        fprintf(stderr, "[ORK] i8 chain failed (%d), falling back to sequential\n", ok); fflush(stderr);
+        if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] i8 chain failed (%d), falling back to sequential\n", ok); fflush(stderr); }
         for (size_t t = 0; t < tasks.size(); t++) {
             if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
                 return false;
@@ -1236,7 +1228,7 @@ static enum ggml_status ggml_backend_ork_graph_compute_impl(ggml_backend_t backe
 
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
-    fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
+    if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr); }
     // QKV/gate-up fusion: implemented + correct, but measured SLOWER on RK3588 (decode 9.4->6.4
     // tok/s) — one wide multi-core matmul + strided scatter costs more than the 2 saved submits, i.e.
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
