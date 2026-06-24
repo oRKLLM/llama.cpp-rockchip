@@ -1317,33 +1317,59 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
         for (int j = 0; j < n_used; j++) buckets[idp[j]].push_back(std::make_pair(t, j));
     }
-    std::vector<int8_t> Ae; std::vector<int32_t> Ce; std::vector<float> as_e;
-    for (auto & kv : buckets) {
-        const int e = kv.first; std::vector<std::pair<int,int>> & ent = kv.second;
+    // CHAIN all active experts of this projection into ONE submit (ork_mm_run_chain_i8): each expert is
+    // one chain task with M=count rows (the chain M-tiles internally and uses each expert's Bf full-K
+    // weight). This collapses the per-expert submit floor — the MoE-prefill win. Pack each expert into a
+    // contiguous row block of bigA/bigC. All active experts (<=128/projection << pool cap) stay resident
+    // through the submit, so round-robin repack never evicts a weight the chain still needs.
+    std::vector<std::pair<int, std::vector<std::pair<int,int>>*>> active;
+    size_t total_rows = 0;
+    for (auto & kv : buckets) { active.push_back(std::make_pair(kv.first, &kv.second)); total_rows += kv.second.size(); }
+    const int S = (int) active.size();
+    if (S == 0) { if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
+
+    std::vector<int8_t>          bigA((size_t) total_rows * K);
+    std::vector<int32_t>         bigC((size_t) total_rows * N);
+    std::vector<float>           as_row(total_rows);
+    std::vector<ork_mm_task_i8>  tasks(S);
+    std::vector<ork_moe_slot *>  slots(S);
+    std::vector<size_t>          offs(S);
+
+    size_t off = 0;
+    for (int x = 0; x < S; x++) {
+        const int e = active[x].first; std::vector<std::pair<int,int>> & ent = *active[x].second;
         const int cnt = (int) ent.size();
-        const int Mp = (cnt == 1) ? 1 : ((cnt + 31) / 32) * 32;     // run_i8 wants M padded to 32 (M>1)
         ork_moe_slot * s = pack_expert((const char *) src0->data + (size_t) e * src0->nb[2]);
-        if (!s) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id PACK FAIL expert=%d resident=%zu K=%d N=%d\n", e, ctx->moe_loc.size(), K, N); return false; }
-        Ae.assign((size_t) Mp * K, 0); Ce.resize((size_t) Mp * N); as_e.assign(Mp, 0.0f);
+        if (!s) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id PACK FAIL expert=%d K=%d N=%d\n", e, K, N); return false; }
+        slots[x] = s; offs[x] = off;
+        int8_t * Ae = bigA.data() + off * K;
         for (int i = 0; i < cnt; i++) {
             const int t = ent[i].first, j = ent[i].second;
-            int8_t * ar = Ae.data() + (size_t) i * K;
-            if (bcast) { memcpy(ar, A_all.data() + (size_t) t * K, (size_t) K); as_e[i] = as_all[t]; }
+            int8_t * ar = Ae + (size_t) i * K;
+            if (bcast) { memcpy(ar, A_all.data() + (size_t) t * K, (size_t) K); as_row[off + i] = as_all[t]; }
             else {
                 const float * y = (const float *)((const char *) src1->data + (size_t) j*src1->nb[1] + (size_t) t*src1->nb[2]);
                 float mx=1e-9f; for (int k=0;k<K;k++){ float v=fabsf(y[k]); if(v>mx)mx=v; }
-                as_e[i]=mx/127.0f; float ainv=127.0f/mx;
+                as_row[off + i]=mx/127.0f; float ainv=127.0f/mx;
                 for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
             }
         }
-        int crc = ork_mm_run_i8(ctx->npu, s->w, Mp, Ae.data(), Ce.data());
-        if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id run_i8 FAIL rc=%d cnt=%d K=%d N=%d\n", crc, cnt, K, N); return false; }
-        const float * bs = s->bscale.data();
+        tasks[x].w = s->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
+        off += cnt;
+    }
+
+    int crc = ork_mm_run_chain_i8(ctx->npu, S, tasks.data());
+    if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id run_chain_i8 FAIL rc=%d S=%d rows=%zu K=%d N=%d\n", crc, S, total_rows, K, N); return false; }
+
+    for (int x = 0; x < S; x++) {
+        std::vector<std::pair<int,int>> & ent = *active[x].second;
+        const int cnt = (int) ent.size(); const size_t o = offs[x];
+        const float * bs = slots[x]->bscale.data();
         for (int i = 0; i < cnt; i++) {
             const int t = ent[i].first, j = ent[i].second;
-            const int32_t * cr = Ce.data() + (size_t) i * N;
+            const int32_t * cr = bigC.data() + (o + i) * N;
             float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
-            const float as = as_e[i];
+            const float as = as_row[o + i];
             for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
         }
     }
