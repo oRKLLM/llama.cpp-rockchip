@@ -99,6 +99,9 @@ struct ggml_backend_ork_context {
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
+    // MoE chained-handler phase breakdown (ORK_PROFILE): where the 0.97 t/s goes.
+    double moe_prequant = 0, moe_pack = 0, moe_gather = 0, moe_chain = 0, moe_scatter = 0; long moe_calls = 0;
+    double moe_deq = 0, moe_quant = 0;   // pack/repack sub-split: Q4_K->f32 dequant vs f32->int8 quant+tile
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -676,6 +679,16 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         if (ctx->n_dec) GGML_LOG_INFO("ork profile: decode  (M=1)  %ld matmuls, run %.1f us/matmul\n", ctx->n_dec, ctx->t_run_dec/ctx->n_dec);
         if (ctx->n_pf)  GGML_LOG_INFO("ork profile: prefill (M>1) %ld matmuls, avgM %.1f, run %.1f us/matmul (%.2f us/row)\n",
             ctx->n_pf, (double)ctx->m_pf/ctx->n_pf, ctx->t_run_pf/ctx->n_pf, ctx->t_run_pf/ctx->m_pf);
+        if (ctx->moe_calls) {
+            double mt = ctx->moe_prequant + ctx->moe_pack + ctx->moe_gather + ctx->moe_chain + ctx->moe_scatter;
+            fprintf(stderr, "[ork MoE-chain] %ld calls, %.0fms total | prequant %.0fms (%.0f%%) pack/repack %.0fms (%.0f%%) gather %.0fms (%.0f%%) chain-submit %.0fms (%.0f%%) scatter %.0fms (%.0f%%)\n",
+                ctx->moe_calls, mt/1e3,
+                ctx->moe_prequant/1e3, 100*ctx->moe_prequant/mt, ctx->moe_pack/1e3, 100*ctx->moe_pack/mt,
+                ctx->moe_gather/1e3, 100*ctx->moe_gather/mt, ctx->moe_chain/1e3, 100*ctx->moe_chain/mt,
+                ctx->moe_scatter/1e3, 100*ctx->moe_scatter/mt);
+            fprintf(stderr, "[ork MoE-chain] pack split: Q4_K->f32 dequant %.0fms (%.0f%%) | f32->int8 quant+tile %.0fms (%.0f%%)\n",
+                ctx->moe_deq/1e3, 100*ctx->moe_deq/ctx->moe_pack, ctx->moe_quant/1e3, 100*ctx->moe_quant/ctx->moe_pack);
+        }
         // run_multicore phase split: where the per-matmul "run" time actually goes (kernel vs machinery)
         double rt_s = 0, rt_sub = 0, rt_cp = 0; long rt_n = 0;
         ork_npu_run_timing(&rt_s, &rt_sub, &rt_cp, &rt_n);
@@ -1264,15 +1277,20 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         if (loc != ctx->moe_loc.end() && loc->second->key == x) return loc->second;   // resident hit
         ctx->f32.resize((size_t) N * K); ctx->bi.resize((size_t) K * N);
         float * f32 = ctx->f32.data(); int8_t * bi = ctx->bi.data();
+        const double d0 = ctx->profile ? ork_now_us() : 0;
         if (type == GGML_TYPE_F32) for (int n = 0; n < N; n++) memcpy(f32 + (size_t)n*K, x + (size_t)n*src0->nb[1], (size_t)K*sizeof(float));
         else                       for (int n = 0; n < N; n++) to_float(x + (size_t)n*src0->nb[1], f32 + (size_t)n*K, K);
+        const double d1 = ctx->profile ? ork_now_us() : 0; if (ctx->profile) ctx->moe_deq += d1 - d0;
         std::vector<float> bsc(N);
         for (int n = 0; n < N; n++) {
+            const float * fr = f32 + (size_t)n*K;
             float mx = 1e-9f;
-            for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t)n*K+k]); if (v>mx) mx=v; }
-            float sc = mx/127.0f; bsc[n] = sc;
-            for (int k = 0; k < K; k++) { int q=(int)lrintf(f32[(size_t)n*K+k]/sc); bi[(size_t)k*N+n]=(int8_t)(q>127?127:q<-127?-127:q); }
+            for (int k = 0; k < K; k++) { float v = fabsf(fr[k]); if (v>mx) mx=v; }
+            const float inv = 127.0f/mx; bsc[n] = mx/127.0f;     // multiply by inverse (not per-element divide)
+            int8_t * bo = bi + n;                                 // column n of the [K][N] tile input, stride N
+            for (int k = 0; k < K; k++) { int q=(int)lrintf(fr[k]*inv); bo[(size_t)k*N]=(int8_t)(q>127?127:q<-127?-127:q); }
         }
+        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;
         std::deque<ork_moe_slot> & pool = ctx->moe_pools[shape];
         ork_moe_slot * s;
         if (pool.size() < moe_cap) {                       // grow pool: one-time alloc for this slot
@@ -1296,6 +1314,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     // pre-quantize each token's input once (per-row int8); MoE broadcasts one input across a token's
     // experts (n_b1==1). Non-broadcast quantizes per (token,slot) in the gather below.
+    const double mp0 = ctx->profile ? ork_now_us() : 0;
     std::vector<int8_t> A_all; std::vector<float> as_all;
     if (bcast) {
         A_all.resize((size_t) n_tokens * K); as_all.resize(n_tokens);
@@ -1307,6 +1326,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
         }
     }
+    if (ctx->profile) ctx->moe_prequant += ork_now_us() - mp0;
 
     // GROUP TOKENS BY EXPERT: bucket every (token t, slot j) under expert ids[j,t], then run ONE matmul
     // per active expert over all its tokens (M=count). For PREFILL this amortizes the submit floor + the
@@ -1339,9 +1359,12 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     for (int x = 0; x < S; x++) {
         const int e = active[x].first; std::vector<std::pair<int,int>> & ent = *active[x].second;
         const int cnt = (int) ent.size();
+        const double pk0 = ctx->profile ? ork_now_us() : 0;
         ork_moe_slot * s = pack_expert((const char *) src0->data + (size_t) e * src0->nb[2]);
+        if (ctx->profile) ctx->moe_pack += ork_now_us() - pk0;
         if (!s) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id PACK FAIL expert=%d K=%d N=%d\n", e, K, N); return false; }
         slots[x] = s; offs[x] = off;
+        const double g0 = ctx->profile ? ork_now_us() : 0;
         int8_t * Ae = bigA.data() + off * K;
         for (int i = 0; i < cnt; i++) {
             const int t = ent[i].first, j = ent[i].second;
@@ -1354,13 +1377,17 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
             }
         }
+        if (ctx->profile) ctx->moe_gather += ork_now_us() - g0;
         tasks[x].w = s->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
         off += cnt;
     }
 
+    const double ch0 = ctx->profile ? ork_now_us() : 0;
     int crc = ork_mm_run_chain_i8(ctx->npu, S, tasks.data());
+    if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id run_chain_i8 FAIL rc=%d S=%d rows=%zu K=%d N=%d\n", crc, S, total_rows, K, N); return false; }
 
+    const double sc0 = ctx->profile ? ork_now_us() : 0;
     for (int x = 0; x < S; x++) {
         std::vector<std::pair<int,int>> & ent = *active[x].second;
         const int cnt = (int) ent.size(); const size_t o = offs[x];
@@ -1373,7 +1400,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
         }
     }
-    if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+    if (ctx->profile) { ctx->moe_scatter += ork_now_us() - sc0; ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
     return true;
 }
 
