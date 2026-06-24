@@ -1275,34 +1275,29 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     auto pack_expert = [&](const char * x) -> ork_moe_slot * {
         auto loc = ctx->moe_loc.find(x);
         if (loc != ctx->moe_loc.end() && loc->second->key == x) return loc->second;   // resident hit
-        ctx->f32.resize((size_t) N * K); ctx->bi.resize((size_t) K * N);
-        float * f32 = ctx->f32.data(); int8_t * bi = ctx->bi.data();
+        ctx->f32.resize((size_t) N * K);
+        float * f32 = ctx->f32.data();
         const double d0 = ctx->profile ? ork_now_us() : 0;
         if (type == GGML_TYPE_F32) for (int n = 0; n < N; n++) memcpy(f32 + (size_t)n*K, x + (size_t)n*src0->nb[1], (size_t)K*sizeof(float));
         else                       for (int n = 0; n < N; n++) to_float(x + (size_t)n*src0->nb[1], f32 + (size_t)n*K, K);
         const double d1 = ctx->profile ? ork_now_us() : 0; if (ctx->profile) ctx->moe_deq += d1 - d0;
+        // NEON-fused f32->int8 quant+tile in one cache-friendly pass straight from the n-major f32
+        // (no manual per-column strided transpose store — that store was the bulk of the MoE repack;
+        // measured 188s->43s / pp128 0.89->2.90 on Qwen3.6-35B-A3B). pack/repack_i8_f32 also fill bscale[].
         std::vector<float> bsc(N);
-        for (int n = 0; n < N; n++) {
-            const float * fr = f32 + (size_t)n*K;
-            float mx = 1e-9f;
-            for (int k = 0; k < K; k++) { float v = fabsf(fr[k]); if (v>mx) mx=v; }
-            const float inv = 127.0f/mx; bsc[n] = mx/127.0f;     // multiply by inverse (not per-element divide)
-            int8_t * bo = bi + n;                                 // column n of the [K][N] tile input, stride N
-            for (int k = 0; k < K; k++) { int q=(int)lrintf(fr[k]*inv); bo[(size_t)k*N]=(int8_t)(q>127?127:q<-127?-127:q); }
-        }
-        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;
         std::deque<ork_moe_slot> & pool = ctx->moe_pools[shape];
         ork_moe_slot * s;
         if (pool.size() < moe_cap) {                       // grow pool: one-time alloc for this slot
             pool.emplace_back();
             s = &pool.back();
-            s->w = ork_mm_pack_i8(ctx->npu, K, N, bi);
+            s->w = ork_mm_pack_i8_f32(ctx->npu, K, N, f32, bsc.data());
             if (!s->w) { pool.pop_back(); return (ork_moe_slot *) nullptr; }
         } else {                                           // reuse a slot in place (no alloc/free)
             s = &pool[ctx->moe_rr[shape]++ % moe_cap];
             if (s->key) ctx->moe_loc.erase(s->key);        // evict previous occupant
-            if (ork_mm_repack_i8(ctx->npu, s->w, K, N, bi) != 0) return (ork_moe_slot *) nullptr;
+            if (ork_mm_repack_i8_f32(ctx->npu, s->w, K, N, f32, bsc.data()) != 0) return (ork_moe_slot *) nullptr;
         }
+        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;   // now the fused NEON quant+tile
         s->bscale = std::move(bsc);
         s->key = x;
         ctx->moe_loc[x] = s;
