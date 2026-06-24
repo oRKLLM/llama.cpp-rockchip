@@ -21,11 +21,6 @@ ggml_add_backend_library(ggml-ork
 target_include_directories(ggml-ork PRIVATE ${ORK_DIR}/include ${ORK_DIR}/src)
 target_link_libraries     (ggml-ork PRIVATE Threads::Threads)
 
-if (GGML_OPENMP_ENABLED)
-    target_compile_definitions(ggml-ork PRIVATE GGML_USE_OPENMP)
-    target_link_libraries     (ggml-ork PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-endif()
-
 # ork-driver's npu.c is C and needs _GNU_SOURCE (set in the file); keep its C sources as C.
 set_source_files_properties(
     ${ORK_DIR}/src/npu.c ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
