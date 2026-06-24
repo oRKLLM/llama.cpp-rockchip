@@ -1543,7 +1543,12 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
-    GGML_LOG_INFO("%s: ork backend ready (%sW%dA%d%s)\n", __func__,
+    // One-line version banner to stderr — visible even under llama-bench (which suppresses
+    // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
+    // with one). Makes "which build is this?" answerable from any benchmark/run log.
+    fprintf(stderr, "[ork] ork-driver %s (W%dA%d%s)\n", ork_npu_version(),
+            ctx->qbits, ctx->qbits, ctx->hadamard ? "+Had" : "");
+    GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, %sW%dA%d%s)\n", __func__, ork_npu_version(),
                   ctx->hybrid ? "Hybrid " : "",
                   ctx->qbits, ctx->qbits,
                   ctx->hadamard ? "+Hadamard" : "");
