@@ -1246,6 +1246,16 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
 
 
 
+// Dequant one expert-weight output channel (row) -> dst[K] for ork_mm_pack_i8_dequant: fuses ggml's
+// Q4_K->f32 with ork-driver's int8 quant+tile so the full f32[N][K] is never materialized (kills the
+// DRAM round-trip — alloc + write + read-back of N*K floats — that was part of the MoE repack cost).
+struct ork_moe_deq_ctx { const char * x; size_t nb01; ggml_to_float_t to_float; bool is_f32; };
+static void ork_moe_deq_row(void * vctx, int n, float * dst, int K) {
+    const ork_moe_deq_ctx * c = (const ork_moe_deq_ctx *) vctx;
+    if (c->is_f32) memcpy(dst, c->x + (size_t) n * c->nb01, (size_t) K * sizeof(float));
+    else           c->to_float(c->x + (size_t) n * c->nb01, dst, K);
+}
+
 // MoE expert matmul (GGML_OP_MUL_MAT_ID), int8 path. Handles any n_tokens.
 // dst[N, n_used, n_tokens] = for each (token t, slot j): W[ids[j,t]] (K x N) @ x_t (K).
 // We GROUP tokens by their selected expert and run ONE M=count matmul per active expert (M-padded to 32
@@ -1275,29 +1285,25 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     auto pack_expert = [&](const char * x) -> ork_moe_slot * {
         auto loc = ctx->moe_loc.find(x);
         if (loc != ctx->moe_loc.end() && loc->second->key == x) return loc->second;   // resident hit
-        ctx->f32.resize((size_t) N * K);
-        float * f32 = ctx->f32.data();
-        const double d0 = ctx->profile ? ork_now_us() : 0;
-        if (type == GGML_TYPE_F32) for (int n = 0; n < N; n++) memcpy(f32 + (size_t)n*K, x + (size_t)n*src0->nb[1], (size_t)K*sizeof(float));
-        else                       for (int n = 0; n < N; n++) to_float(x + (size_t)n*src0->nb[1], f32 + (size_t)n*K, K);
-        const double d1 = ctx->profile ? ork_now_us() : 0; if (ctx->profile) ctx->moe_deq += d1 - d0;
-        // NEON-fused f32->int8 quant+tile in one cache-friendly pass straight from the n-major f32
-        // (no manual per-column strided transpose store — that store was the bulk of the MoE repack;
-        // measured 188s->43s / pp128 0.89->2.90 on Qwen3.6-35B-A3B). pack/repack_i8_f32 also fill bscale[].
+        // FUSED Q4_K->int8: dequant each expert channel into ork-driver's reused K-scratch + NEON
+        // quant+tile in one pass — the full f32[N][K] is never materialized, killing its DRAM round-trip.
+        // pack/repack_i8_dequant call back into ork_moe_deq_row (ggml to_float) per channel, fill bscale[].
         std::vector<float> bsc(N);
+        ork_moe_deq_ctx dq = { x, (size_t) src0->nb[1], to_float, type == GGML_TYPE_F32 };
+        const double d1 = ctx->profile ? ork_now_us() : 0;
         std::deque<ork_moe_slot> & pool = ctx->moe_pools[shape];
         ork_moe_slot * s;
         if (pool.size() < moe_cap) {                       // grow pool: one-time alloc for this slot
             pool.emplace_back();
             s = &pool.back();
-            s->w = ork_mm_pack_i8_f32(ctx->npu, K, N, f32, bsc.data());
+            s->w = ork_mm_pack_i8_dequant(ctx->npu, K, N, ork_moe_deq_row, &dq, bsc.data());
             if (!s->w) { pool.pop_back(); return (ork_moe_slot *) nullptr; }
         } else {                                           // reuse a slot in place (no alloc/free)
             s = &pool[ctx->moe_rr[shape]++ % moe_cap];
             if (s->key) ctx->moe_loc.erase(s->key);        // evict previous occupant
-            if (ork_mm_repack_i8_f32(ctx->npu, s->w, K, N, f32, bsc.data()) != 0) return (ork_moe_slot *) nullptr;
+            if (ork_mm_repack_i8_dequant(ctx->npu, s->w, K, N, ork_moe_deq_row, &dq, bsc.data()) != 0) return (ork_moe_slot *) nullptr;
         }
-        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;   // now the fused NEON quant+tile
+        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;   // fused dequant+quant+tile (moe_deq now folded in)
         s->bscale = std::move(bsc);
         s->key = x;
         ctx->moe_loc[x] = s;
