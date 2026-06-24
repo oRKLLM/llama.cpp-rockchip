@@ -1537,7 +1537,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->npu = npu;
     g_ork_ctx = ctx;
     const char * q = getenv("ORK_QUANT");
-    ctx->qbits = (q && q[0] == '8') ? 4 : 8;
+    ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
