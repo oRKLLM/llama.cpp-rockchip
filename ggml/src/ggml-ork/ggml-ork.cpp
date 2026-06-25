@@ -43,6 +43,7 @@
 #include <ctime>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 
 #if defined(__ARM_NEON)
@@ -136,6 +137,7 @@ struct ggml_backend_ork_context {
     std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
     FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
+    std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
     long persist_hits = 0, persist_misses = 0;   // weights loaded from .orkpack vs packed (diagnostic)
     // MoE expert weights are too numerous to keep ALL packed NPU-resident (the IOMMU exhausts ~2k).
     // Fixed pool PER SHAPE: a bounded set of slots allocated once, reused round-robin via repack-in-place
@@ -161,7 +163,9 @@ static bool g_ork_hybrid_loading = false;
 // the budget. Only per-tile-owned weights (int8 / per-channel int4) actually return IOVA; the current
 // op's weight is never in the cache yet, so it is never evicted.
 static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
-    const size_t budget = ork_wcache_budget();
+    // Convert mode (building .orkpack): keep ~0 resident — pack→dump→free each weight (evicted by the next
+    // pack). This makes conversion fit ANY model size (≤1 weight in the 4 GiB window) and avoids thrash.
+    const size_t budget = ctx->persist_mode == 2 ? 0 : ork_wcache_budget();
     while (ctx->wcache_bytes + need > budget && !ctx->wcache.empty()) {
         auto lru = ctx->wcache.begin();
         for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
@@ -210,6 +214,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
 // Append a freshly-packed int8 weight's tiled bytes + bscale to the write file and record its index entry.
 static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
     size_t tb = ork_w_dump(ow.w, nullptr, 0);
     std::vector<char> tmp(tb);
     ork_w_dump(ow.w, tmp.data(), tb);
