@@ -53,6 +53,46 @@ extern "C" {
 #include "ork_npu.h"
 }
 
+#include <sys/mman.h>
+#include <cstdint>
+#include <string>
+#include <fcntl.h>
+#include <unistd.h>
+
+// ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled int8 weights ----
+// File: [ blobs: per weight, tiled int8 bytes (ork_w_dump) then N bscale floats ][ index ][ footer@EOF ].
+// First run with ORK_PERSIST=<path> writes it (one slow pass); later runs mmap it and ork_mm_load_i8 the
+// bytes straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load, so a
+// stale/mismatched file can never feed wrong weights (a mismatch just falls back to packing).
+#define ORKPACK_MAGIC   "ORKPK01"
+#define ORKPACK_VERSION 1u
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
+struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; char magic[8]; };
+
+// Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
+// Evicting those mmap'd pages keeps the source's RSS shrinking as packed RSS grows (peak ~max(src,packed)
+// not src+packed). Page-aligned MADV_DONTNEED drops only clean, file-backed pages (re-faulted on demand);
+// opt-in via ORK_EVICT_SRC because with --no-mmap the mapping is anonymous and DONTNEED would zero data.
+static void ork_evict_src(const void * p, size_t n) {
+    static int on = -1;
+    if (on < 0) on = getenv("ORK_EVICT_SRC") ? 1 : 0;
+    if (!on || !p || !n) return;
+    uintptr_t a = (uintptr_t) p, end = a + n;
+    uintptr_t pa = (a + 4095u) & ~(uintptr_t) 4095u;
+    uintptr_t pe = end & ~(uintptr_t) 4095u;
+    if (pe > pa) madvise((void *) pa, (size_t) (pe - pa), MADV_DONTNEED);
+}
+
+struct ggml_backend_ork_context;   // fwd
+// Layer-streaming: the NPU IOMMU addresses only ~4 GiB at once (rk_iommu is 32-bit), so a >4 GiB model
+// can't keep every weight resident. Cap wcache resident bytes at a budget and evict the LRU weight
+// (reclaiming IOVA via ork_mm_free) to make room. In one prefill pass each weight packs once → amortizes.
+static size_t ork_wcache_budget() {
+    static size_t b = 0;
+    if (!b) { const char * e = getenv("ORK_WCACHE_BUDGET_MB"); b = (size_t)(e ? atoll(e) : 3072) * 1024 * 1024; }
+    return b;
+}
+
 // a packed quantized weight + its scales, kept NPU-resident and reused.
 //   int8 (W8A8):  gsize==0, bscale [N]            (per output channel)
 //   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
@@ -60,6 +100,8 @@ struct ork_weight {
     ork_w * w = nullptr;
     std::vector<float> bscale;
     int gsize = 0;
+    size_t   bytes = 0;       // resident NPU bytes (for the streaming LRU budget)
+    uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
 };
 
 // One reusable slot in the MoE expert pool: a packed weight whose DMA buffer is reused (repack-in-place)
@@ -86,6 +128,15 @@ struct ggml_backend_ork_context {
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
+    size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
+    uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
+    // .orkpack persist (ORK_PERSIST=<path>): 0 off, 1 read (mmap'd), 2 write (building a .tmp)
+    int      persist_mode = 0;
+    void *   persist_map = nullptr; size_t persist_map_sz = 0;
+    std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
+    FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
+    std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
+    long persist_hits = 0, persist_misses = 0;   // weights loaded from .orkpack vs packed (diagnostic)
     // MoE expert weights are too numerous to keep ALL packed NPU-resident (the IOMMU exhausts ~2k).
     // Fixed pool PER SHAPE: a bounded set of slots allocated once, reused round-robin via repack-in-place
     // (NO alloc/free → no IOMMU fragmentation). Dense/attn weights stay in wcache (resident forever).
@@ -105,6 +156,93 @@ struct ggml_backend_ork_context {
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
+
+// Evict least-recently-used weights (reclaiming IOVA via ork_mm_free) until `need` more bytes fit under
+// the budget. Only per-tile-owned weights (int8 / per-channel int4) actually return IOVA; the current
+// op's weight is never in the cache yet, so it is never evicted.
+static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
+    const size_t budget = ork_wcache_budget();
+    while (ctx->wcache_bytes + need > budget && !ctx->wcache.empty()) {
+        auto lru = ctx->wcache.begin();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.last_use < lru->second.last_use) lru = it;
+        ork_mm_free(ctx->npu, lru->second.w);
+        ctx->wcache_bytes -= lru->second.bytes;
+        ctx->wcache.erase(lru);
+    }
+}
+
+// Open ORK_PERSIST: if the file exists and validates, mmap it for READ (load weights by name); otherwise
+// open a <path>.tmp for WRITE (this run packs the model and dumps it, then finalize renames it in).
+static void ork_persist_init(ggml_backend_ork_context * ctx) {
+    const char * p = getenv("ORK_PERSIST");
+    if (!p || !*p) return;
+    int fd = open(p, O_RDONLY);
+    if (fd >= 0) {
+        off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > (off_t) sizeof(orkpack_footer)) {
+            void * m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m != MAP_FAILED) {
+                orkpack_footer f; memcpy(&f, (char *) m + sz - sizeof f, sizeof f);
+                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION && f.index_off < (uint64_t) sz) {
+                    const char * idx = (const char *) m + f.index_off;
+                    for (uint32_t i = 0; i < f.n_entries; i++) {
+                        uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
+                        std::string name(idx, nl); idx += nl;
+                        orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+                        ctx->persist_idx.emplace(std::move(name), e);
+                    }
+                    ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
+                    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
+                    return;
+                }
+                munmap(m, sz);
+            }
+        }
+        close(fd);
+    }
+    ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
+    ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
+    if (ctx->persist_out) { ctx->persist_mode = 2;
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] building %s (one-time conversion this run)\n", ctx->persist_tmp.c_str()); }
+}
+
+// Append a freshly-packed int8 weight's tiled bytes + bscale to the write file and record its index entry.
+static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
+    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    size_t tb = ork_w_dump(ow.w, nullptr, 0);
+    std::vector<char> tmp(tb);
+    ork_w_dump(ow.w, tmp.data(), tb);
+    orkpack_entry e; e.K = K; e.N = N; e.dtype = 1; e.bscale_n = (uint32_t) ow.bscale.size();
+    e.blob_off = ctx->persist_off; e.blob_size = tb;
+    fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+    e.bscale_off = ctx->persist_off;
+    fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
+    ctx->persist_off += ow.bscale.size() * sizeof(float);
+    ctx->persist_built.emplace_back(std::string(name), e);
+}
+
+// Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
+static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
+    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    if (ctx->persist_built.empty()) {
+        fclose(ctx->persist_out); ctx->persist_out = nullptr; unlink(ctx->persist_tmp.c_str()); return;
+    }
+    uint64_t index_off = ctx->persist_off;
+    for (auto & kv : ctx->persist_built) {
+        uint32_t nl = (uint32_t) kv.first.size();
+        fwrite(&nl, 4, 1, ctx->persist_out);
+        fwrite(kv.first.data(), 1, nl, ctx->persist_out);
+        fwrite(&kv.second, sizeof(orkpack_entry), 1, ctx->persist_out);
+    }
+    orkpack_footer f; memset(&f, 0, sizeof f);
+    f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
+    memcpy(f.magic, ORKPACK_MAGIC, 8);
+    fwrite(&f, sizeof f, 1, ctx->persist_out);
+    fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
+    rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] finalized %s (%u weights)\n", ctx->persist_final.c_str(), f.n_entries);
+}
 
 void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
@@ -164,9 +302,30 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const char  * x = (const char *) src0->data + i02*nb02 + i03*nb03;
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
 
-            // weight: check cache / pack
+            // weight: check cache / .orkpack / pack
             auto it = ctx->wcache.find(x);
+            if (it == ctx->wcache.end() && ctx->persist_mode == 1) {
+                // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
+                // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
+                auto pit = ctx->persist_idx.find(src0->name);
+                if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N && pit->second.dtype == 1) {
+                    const orkpack_entry & e = pit->second;
+                    ork_wcache_evict(ctx, (size_t) K * N);
+                    ork_weight ow;
+                    ow.w = ork_mm_load_i8(ctx->npu, K, N, (const char *) ctx->persist_map + e.blob_off, e.blob_size);
+                    if (ow.w) {
+                        const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                        ow.bscale.assign(bs, bs + e.bscale_n);
+                        it = ctx->wcache.emplace(x, std::move(ow)).first;
+                        it->second.bytes = ork_w_bytes(it->second.w);
+                        ctx->wcache_bytes += it->second.bytes;
+                        ctx->persist_hits++;
+                        ork_evict_src(x, (size_t) N * nb01);
+                    }
+                }
+            }
             if (it == ctx->wcache.end()) {
+                if (ctx->persist_mode) ctx->persist_misses++;
                 float * f32 = ctx->f32.data();
                 int8_t * bi = ctx->bi.data();
                 if (type == GGML_TYPE_F32) {
@@ -184,11 +343,17 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                         bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
                     }
                 }
+                ork_wcache_evict(ctx, (size_t) K * N);   // stream: free IOVA room before packing (int8 ~K*N bytes)
                 ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
                 if (!ow.w) return false;
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
-                if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] packed weight, wcache size=%zu, K=%d, N=%d, x=%p\n", ctx->wcache.size(), K, N, x);
+                it->second.bytes = ork_w_bytes(it->second.w);
+                ctx->wcache_bytes += it->second.bytes;
+                ork_persist_write(ctx, src0->name, K, N, it->second);   // .orkpack: dump for next time
+                ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
+                if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n", ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, x);
             }
+            it->second.last_use = ++ctx->wcache_tick;   // LRU touch (hit or fresh pack)
             const ork_weight & ow = it->second;
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 1 && !ctx->no_reuse);
@@ -700,6 +865,9 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         }
     }
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
+    ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
+    if (ctx->persist_mode) fprintf(stderr, "[ORK PERSIST] this run: loaded %ld from disk, packed %ld\n", ctx->persist_hits, ctx->persist_misses);
+    if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     if (ctx->npu) ork_npu_free(ctx->npu);
@@ -1537,6 +1705,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
     g_ork_ctx = ctx;
+    ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
