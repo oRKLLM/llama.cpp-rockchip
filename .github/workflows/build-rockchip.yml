@@ -160,6 +160,7 @@ jobs:
           cp build/bin/llama-cli release-bin/
           cp build/bin/llama-server release-bin/
           cp build/bin/llama-bench release-bin/
+          cp build/bin/llama-completion release-bin/   # non-interactive completion CLI: oRKLLM's .orkpack conversion scheduler spawns it (clean exit finalizes the .orkpack)
           cp -P build/bin/lib*.so* release-bin/
 
           printf '{"tag":"%s","llamaCommit":"%s","orkDriverCommit":"%s"}\n' \
@@ -178,6 +179,7 @@ jobs:
           echo "" >> release_body.md
           echo "Included binaries (ARM64 / Linux):" >> release_body.md
           echo "- \`llama-cli\`" >> release_body.md
+          echo "- \`llama-completion\`" >> release_body.md
           echo "- \`llama-server\`" >> release_body.md
           echo "- \`libllama.so\` and \`libggml*.so\` shared libraries" >> release_body.md
           echo "" >> release_body.md
