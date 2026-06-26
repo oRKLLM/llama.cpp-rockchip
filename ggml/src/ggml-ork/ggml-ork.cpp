@@ -221,23 +221,73 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] building %s (one-time conversion this run)\n", ctx->persist_tmp.c_str()); }
 }
 
-// Decide the on-disk tier for one tensor when WRITING a mixed .orkpack (Phase 2.2). Default (no env) is
-// int8 for every tensor → byte-identical to a v1 pack, NO regression. Opt-in to int4-W4A8 (per-channel,
-// coherent — the ork_mm_pack_i4a8 form that inflates to int8 and runs unchanged) via either:
-//   ORK_ORKPACK_I4_ABOVE_MB=<mb>  int4 any tensor whose int8 blob (~K*N bytes) exceeds <mb> MiB
-//   ORK_ORKPACK_I4_FFN=1          int4 the FFN/expert tensors (the bulk of the weights), int8 the rest
+// Effective bits-per-weight for a source ggml_type (mirrors tools/gguf_tier_map.c's table). <0 = unknown.
+// This is the "allocation oracle" inline: a tensor's SOURCE quant precision is the importance signal we
+// preserve — a k-quant/UD GGUF already spent more bits on the tensors that matter (output, bumped attn_v /
+// ffn_down) and fewer on the bulk, so mirroring it onto our two storage tiers reproduces that allocation.
+static double ork_src_type_bits(enum ggml_type t) {
+    switch (t) {
+    case GGML_TYPE_F32:     return 32.0;
+    case GGML_TYPE_F16:     return 16.0;
+    case GGML_TYPE_BF16:    return 16.0;
+    case GGML_TYPE_Q4_0:    return 4.5;
+    case GGML_TYPE_Q4_1:    return 5.0;
+    case GGML_TYPE_Q5_0:    return 5.5;
+    case GGML_TYPE_Q5_1:    return 6.0;
+    case GGML_TYPE_Q8_0:    return 8.5;
+    case GGML_TYPE_Q8_1:    return 9.0;
+    case GGML_TYPE_Q2_K:    return 2.5625;
+    case GGML_TYPE_Q3_K:    return 3.4375;
+    case GGML_TYPE_Q4_K:    return 4.5;
+    case GGML_TYPE_Q5_K:    return 5.5;
+    case GGML_TYPE_Q6_K:    return 6.5625;
+    case GGML_TYPE_Q8_K:    return 8.0;
+    case GGML_TYPE_IQ1_S:   return 1.5625;
+    case GGML_TYPE_IQ1_M:   return 1.75;
+    case GGML_TYPE_IQ2_XXS: return 2.0625;
+    case GGML_TYPE_IQ2_XS:  return 2.3125;
+    case GGML_TYPE_IQ2_S:   return 2.5;
+    case GGML_TYPE_IQ3_XXS: return 3.0625;
+    case GGML_TYPE_IQ3_S:   return 3.4375;
+    case GGML_TYPE_IQ4_NL:  return 4.5;
+    case GGML_TYPE_IQ4_XS:  return 4.25;
+    default:                return -1.0;   // unknown → conservative high-bit (int8)
+    }
+}
+
+// Decide the on-disk tier for one tensor when WRITING a mixed .orkpack (Phase 2.2 / 4.3). Two layers:
+//
+//   (A) SOURCE-TYPE policy (Phase 4.3, default ON): map the tensor's source ggml_type → effective bits;
+//       bits >= 5 → int8 (F32/F16/BF16/Q8_*/Q6_K/Q5_K/Q5_*/Q4_1), bits < 5 → int4 (Q4_*/Q3_K/Q2_K/IQ*).
+//       This makes the mixed .orkpack MIRROR the source GGUF's own allocation (a Q4_K_M's Q4_K bulk →
+//       int4, its bumped Q6_K / Q8_0 output+embeddings → int8) — identical rule to tools/gguf_tier_map.c.
+//       For an all-high-bit source (Q8_0, F16, unknown/<0) every tensor stays int8 → NO regression vs v1.
+//       Disable with ORK_ORKPACK_TIER_FROM_SRC=0 (then only the explicit env overrides below apply).
+//
+//   (B) explicit env OVERRIDES (always win over the source-type verdict):
+//       ORK_ORKPACK_I4_ABOVE_MB=<mb>  force int4 on any tensor whose int8 blob (~K*N bytes) exceeds <mb>
+//       ORK_ORKPACK_I4_FFN=1          force int4 on the FFN/expert tensors, int8 the rest
+//
 // int4 needs K%32==0 && N%32==0; tensors that don't satisfy it stay int8 regardless. Returns 4 or 8.
-static int ork_orkpack_tier(const char * name, int K, int N) {
-    static int init = 0, i4_ffn = 0; static long i4_above_bytes = -1;
+static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_type) {
+    static int init = 0, i4_ffn = 0, from_src = 1; static long i4_above_bytes = -1;
     if (!init) {
         init = 1;
         const char * a = getenv("ORK_ORKPACK_I4_ABOVE_MB");
         if (a && *a) i4_above_bytes = atoll(a) * 1024 * 1024;
         i4_ffn = getenv("ORK_ORKPACK_I4_FFN") ? 1 : 0;
+        const char * fs = getenv("ORK_ORKPACK_TIER_FROM_SRC");   // default ON; "0" disables
+        if (fs && fs[0] == '0' && fs[1] == '\0') from_src = 0;
     }
-    if (i4_above_bytes < 0 && !i4_ffn) return 8;            // no int4 policy set → all int8
-    if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint
+    if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
+
     bool want_i4 = false;
+    // (A) source-type-driven default
+    if (from_src) {
+        double bits = ork_src_type_bits(src_type);
+        if (bits >= 0.0 && bits < 5.0) want_i4 = true;     // low-bit source → int4 tier; unknown/high-bit → int8
+    }
+    // (B) explicit env overrides (force int4)
     if (i4_above_bytes >= 0 && (long) K * N >= i4_above_bytes) want_i4 = true;
     if (i4_ffn && name && (strstr(name, "ffn_") || strstr(name, "exps") ||
                            strstr(name, "expert") || strstr(name, "shexp"))) want_i4 = true;
@@ -249,11 +299,14 @@ static int ork_orkpack_tier(const char * name, int K, int N) {
 // temporary int4-W4A8 weight from the f32 plane (n-major [N][K], as ggml's to_float produced) and dump its
 // self-describing 'O4N1' blob (carries K,N,quant_kind,bscale internally → no separate bscale trailer).
 static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N,
-                              const ork_weight & ow, const float * f32_plane) {
+                              const ork_weight & ow, const float * f32_plane, enum ggml_type src_type) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
 
-    int tier = f32_plane ? ork_orkpack_tier(name, K, N) : 8;   // no f32 plane available → int8 only
+    int tier = f32_plane ? ork_orkpack_tier(name, K, N, src_type) : 8;   // no f32 plane available → int8 only
+    if (getenv("ORK_VERBOSE"))
+        fprintf(stderr, "[ORK PERSIST] tier %s K=%d N=%d src=%s -> int%d\n",
+                name, K, N, ggml_type_name(src_type), tier);
     if (tier == 4) {
         std::vector<float> bscale_tmp(N);   // pack_i4a8 always writes bscale_out (no NULL check); the dump
         ork_w * w4 = ork_mm_pack_i4a8(ctx->npu, K, N, f32_plane, bscale_tmp.data());   // carries bscale internally too
@@ -386,7 +439,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     it = ctx->wcache.emplace(x, std::move(ow)).first;
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
-    ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data());   // .orkpack: dump for next time (f32 plane enables int4 tier)
+    ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n",
         ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, (const void *) x);
