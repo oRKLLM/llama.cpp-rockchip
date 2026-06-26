@@ -390,6 +390,13 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
     return want_i4 ? 4 : 8;
 }
 
+// Synthetic per-expert persist key: a routed MoE expert is one slice `e` of a 3D `_exps` tensor, so it
+// has no ggml name of its own. We persist/load each slice under "<exps-tensor-name>#<e>" (e.g.
+// "blk.13.ffn_gate_exps.weight#7"). Format is unambiguous: '#' never appears in a ggml tensor name.
+static inline std::string ork_expert_key(const char * exps_name, int e) {
+    return std::string(exps_name) + "#" + std::to_string(e);
+}
+
 // Append a freshly-packed weight to the write file and record its index entry, choosing the int8 or int4
 // tier per ork_orkpack_tier(). int8: dump the already-packed tiled bytes (ow.w) + bscale[N]. int4: pack a
 // temporary int4-W4A8 weight from the f32 plane (n-major [N][K], as ggml's to_float produced) and dump its
@@ -435,6 +442,49 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
     ctx->persist_built.emplace_back(std::string(name), e);
+}
+
+// Persist ALL n_expert slices of a routed MoE `_exps` tensor (GGML_OP_MUL_MAT_ID src0) in convert/write
+// mode. A complete .orkpack must capture every expert, not just the ones the convert prompt routed to, so
+// this iterates the whole 3D tensor independent of routing. Each slice is dequantized to its f32 plane
+// [N][K] (as ggml's to_float produces), packed once to int8, then handed to ork_persist_write under the
+// synthetic key "<name>#<e>" — reusing the exact int8/int4 tier choice + dump path the dense weights use
+// (int4 re-packs from the f32 plane internally; the int8 temp weight is only needed for the int8-tier dump).
+// Guarded to write mode and deduped via persist_dumped (per synthetic key), so a convert-decode re-pack
+// never double-writes. Resident NPU bytes stay ~0: the temp int8 weight is freed before the next slice.
+static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
+                                      int K, int N, enum ggml_type type, ggml_to_float_t to_float) {
+    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    const int n_expert = (int) src0->ne[2];
+    std::vector<float> f32((size_t) N * K);
+    for (int e = 0; e < n_expert; e++) {
+        const std::string key = ork_expert_key(src0->name, e);
+        if (ctx->persist_dumped.count(key)) continue;   // already dumped this slice
+        const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
+        const size_t nb01 = src0->nb[1];
+        if (type == GGML_TYPE_F32) {
+            for (int64_t n = 0; n < N; n++) memcpy(f32.data() + n*K, x + n*nb01, (size_t) K*sizeof(float));
+        } else {
+            for (int64_t n = 0; n < N; n++) to_float(x + n*nb01, f32.data() + n*K, K);
+        }
+        // pack a temporary int8 weight from the f32 plane (per-channel absmax, mirrors the dense path) so
+        // ork_persist_write's int8 tier can dump ow.w; the int4 tier ignores ow.w and re-packs from f32.
+        ork_weight ow; ow.bscale.resize(N);
+        std::vector<int8_t> bi((size_t) K * N);
+        for (int n = 0; n < N; n++) {
+            float mx = 1e-9f;
+            for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+            float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
+            for (int k = 0; k < K; k++) {
+                int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
+                bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+            }
+        }
+        ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+        if (!ow.w) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert pack FAIL %s\n", key.c_str()); continue; }
+        ork_persist_write(ctx, key.c_str(), K, N, ow, f32.data(), type);
+        ork_mm_free(ctx->npu, ow.w);   // resident ~0: free before the next slice
+    }
 }
 
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
@@ -1676,34 +1726,106 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     const double t0 = ctx->profile ? ork_now_us() : 0;
     ctx->last_src1 = nullptr;                         // we use ctx->ai/ci — kill the dense reuse cache
 
+    // .orkpack convert (write mode): persist ALL n_expert slices of this `_exps` tensor (not just the
+    // routed ones — a complete pack needs every expert). Deduped per synthetic key so re-visits in a
+    // multi-token / multi-step convert don't re-dump. Inference (mode 1/0) skips this entirely.
+    if (ctx->persist_mode == 2) {
+        ork_persist_write_experts(ctx, src0, K, N, type, to_float);
+        // Convert is a one-time pack pass: the actual MoE forward doesn't need the NPU here (the
+        // per-expert submit floor makes MoE-on-NPU very slow and it can soft-reset the device on this
+        // shape). Compute the result on CPU directly — dequant each routed expert's [N][K] plane and
+        // do an f32 GEMV per (token,slot) — so convert is fast and never touches the flaky MoE submit.
+        std::vector<float> ew((size_t) N * K);
+        char * dbase_w = (char *) dst->data;
+        for (int t = 0; t < n_tokens; t++) {
+            const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
+            for (int j = 0; j < n_used; j++) {
+                const int e = idp[j];
+                const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
+                if (type == GGML_TYPE_F32) {
+                    for (int64_t n = 0; n < N; n++) memcpy(ew.data() + n*K, x + n*src0->nb[1], (size_t) K*sizeof(float));
+                } else {
+                    for (int64_t n = 0; n < N; n++) to_float(x + n*src0->nb[1], ew.data() + n*K, K);
+                }
+                const float * y = (const float *)((const char *) src1->data + (size_t) (n_b1==1?0:j)*src1->nb[1] + (size_t) t*src1->nb[2]);
+                float * dr = (float *)(dbase_w + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
+                for (int n = 0; n < N; n++) {
+                    const float * wr = ew.data() + (size_t) n * K;
+                    float acc = 0.f; for (int k = 0; k < K; k++) acc += wr[k] * y[k];
+                    dr[n] = acc;
+                }
+            }
+        }
+        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+        return true;
+    }
+
     // Resident-expert budget PER SHAPE (count). Slots are allocated once then reused round-robin via
     // repack-in-place (NO alloc/free) — keeps the packed set bounded WITHOUT fragmenting the NPU IOMMU
     // (which is what killed the free+realloc LRU). Tunable via ORK_MOE_CACHE.
     static const size_t moe_cap = getenv("ORK_MOE_CACHE") ? (size_t) atoi(getenv("ORK_MOE_CACHE")) : 384;
     const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
-    auto pack_expert = [&](const char * x) -> ork_moe_slot * {
+    auto pack_expert = [&](int e) -> ork_moe_slot * {
+        const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         auto loc = ctx->moe_loc.find(x);
         if (loc != ctx->moe_loc.end() && loc->second->key == x) return loc->second;   // resident hit
-        // FUSED Q4_K->int8: dequant each expert channel into ork-driver's reused K-scratch + NEON
-        // quant+tile in one pass — the full f32[N][K] is never materialized, killing its DRAM round-trip.
-        // pack/repack_i8_dequant call back into ork_moe_deq_row (ggml to_float) per channel, fill bscale[].
-        std::vector<float> bsc(N);
-        ork_moe_deq_ctx dq = { x, (size_t) src0->nb[1], to_float, type == GGML_TYPE_F32 };
+
+        // .orkpack read (persist_mode==1): if this expert slice was persisted (under the synthetic key),
+        // load the pre-tiled bytes straight into a pool slot (int8 → ork_mm_load_i8; int4-W4A8 →
+        // ork_mm_load_i4a8 + its internal inflate) — mirrors ork_resolve_weight_i8's tier dispatch and
+        // skips the dequant+repack entirely. Both tiers run via ork_mm_run_chain_i8 with the same
+        // as*bscale[n]*Ci scatter, so the slot is interchangeable with a freshly-packed one.
+        const orkpack_entry * pe = nullptr;
+        if (ctx->persist_mode == 1) {
+            auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
+            if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
+                (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4))
+                pe = &pit->second;
+        }
+
         const double d1 = ctx->profile ? ork_now_us() : 0;
         std::deque<ork_moe_slot> & pool = ctx->moe_pools[shape];
         ork_moe_slot * s;
-        if (pool.size() < moe_cap) {                       // grow pool: one-time alloc for this slot
-            pool.emplace_back();
-            s = &pool.back();
-            s->w = ork_mm_pack_i8_dequant(ctx->npu, K, N, ork_moe_deq_row, &dq, bsc.data());
-            if (!s->w) { pool.pop_back(); return (ork_moe_slot *) nullptr; }
-        } else {                                           // reuse a slot in place (no alloc/free)
-            s = &pool[ctx->moe_rr[shape]++ % moe_cap];
-            if (s->key) ctx->moe_loc.erase(s->key);        // evict previous occupant
-            if (ork_mm_repack_i8_dequant(ctx->npu, s->w, K, N, ork_moe_deq_row, &dq, bsc.data()) != 0) return (ork_moe_slot *) nullptr;
+        const bool grow = pool.size() < moe_cap;
+        if (grow) { pool.emplace_back(); s = &pool.back(); }       // one-time alloc for this slot
+        else      { s = &pool[ctx->moe_rr[shape]++ % moe_cap];     // reuse a slot in place (no alloc/free)
+                    if (s->key) ctx->moe_loc.erase(s->key); }      // evict previous occupant
+
+        if (pe) {
+            // load from disk. A pooled slot reuses its DMA buffer via repack-in-place, but a loaded
+            // weight is a fresh allocation, so free the slot's old weight first (the loaded weight then
+            // becomes the slot's resident weight — no repack-in-place for disk-backed experts).
+            const char * blob = (const char *) ctx->persist_map + pe->blob_off;
+            ork_w * w = (pe->dtype == ORKPACK_DT_I4)
+                      ? ork_mm_load_i4a8(ctx->npu, K, N, blob, pe->blob_size)
+                      : ork_mm_load_i8  (ctx->npu, K, N, blob, pe->blob_size);
+            if (!w) { if (grow) pool.pop_back(); if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert load FAIL %s#%d\n", src0->name, e); return (ork_moe_slot *) nullptr; }
+            if (s->w) ork_mm_free(ctx->npu, s->w);
+            s->w = w;
+            std::vector<float> bsc(N);
+            if (pe->dtype == ORKPACK_DT_I4) { const float * bs = ork_w_bscale(w); if (bs) memcpy(bsc.data(), bs, N*sizeof(float)); }
+            else                            { const float * bs = (const float *) ((const char *) ctx->persist_map + pe->bscale_off);
+                                              memcpy(bsc.data(), bs, N*sizeof(float)); }
+            s->bscale = std::move(bsc);
+            ctx->persist_hits++;
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert %s %s#%d K=%d N=%d\n",
+                pe->dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, e, K, N);
+        } else {
+            // pack-miss: FUSED Q4_K->int8 — dequant each expert channel into ork-driver's reused K-scratch
+            // + NEON quant+tile in one pass (full f32[N][K] never materialized). pack/repack_i8_dequant
+            // call back into ork_moe_deq_row (ggml to_float) per channel and fill bscale[].
+            if (ctx->persist_mode == 1) ctx->persist_misses++;
+            std::vector<float> bsc(N);
+            ork_moe_deq_ctx dq = { x, (size_t) src0->nb[1], to_float, type == GGML_TYPE_F32 };
+            if (grow) {
+                s->w = ork_mm_pack_i8_dequant(ctx->npu, K, N, ork_moe_deq_row, &dq, bsc.data());
+                if (!s->w) { pool.pop_back(); return (ork_moe_slot *) nullptr; }
+            } else {
+                if (ork_mm_repack_i8_dequant(ctx->npu, s->w, K, N, ork_moe_deq_row, &dq, bsc.data()) != 0) return (ork_moe_slot *) nullptr;
+            }
+            s->bscale = std::move(bsc);
         }
-        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;   // fused dequant+quant+tile (moe_deq now folded in)
-        s->bscale = std::move(bsc);
+        if (ctx->profile) ctx->moe_quant += ork_now_us() - d1;   // fused dequant+quant+tile (or disk load)
         s->key = x;
         ctx->moe_loc[x] = s;
         return s;
@@ -1760,7 +1882,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const int e = active[x].first; std::vector<std::pair<int,int>> & ent = *active[x].second;
         const int cnt = (int) ent.size();
         const double pk0 = ctx->profile ? ork_now_us() : 0;
-        ork_moe_slot * s = pack_expert((const char *) src0->data + (size_t) e * src0->nb[2]);
+        ork_moe_slot * s = pack_expert(e);
         if (ctx->profile) ctx->moe_pack += ork_now_us() - pk0;
         if (!s) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id PACK FAIL expert=%d K=%d N=%d\n", e, K, N); return false; }
         slots[x] = s; offs[x] = off;
@@ -1784,6 +1906,16 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     const double ch0 = ctx->profile ? ork_now_us() : 0;
     int crc = ork_mm_run_chain_i8(ctx->npu, S, tasks.data());
+    if (crc) {
+        // The chain has a full-K envelope (each link is one full-K submit: needs Sk==1 or a Bf full-K
+        // buffer, and K%512==0 && K<=4096). ffn_down experts (K=1792, Sk=2, no chain-eligible Bf) fall
+        // outside it and the chain refuses (rc=-2/-3, "fall back to per-task run_i8 which K-splits
+        // correctly"). Run each expert as its own submit — slower (no chained submit-floor amortization)
+        // but correct; ork_mm_run_i8 K-splits via the Bb tiles, so it works for any K, live or from disk.
+        // If the per-task path also fails, propagate the failure below.
+        crc = 0;
+        for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C);
+    }
     if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id run_chain_i8 FAIL rc=%d S=%d rows=%zu K=%d N=%d\n", crc, S, total_rows, K, N); return false; }
 
