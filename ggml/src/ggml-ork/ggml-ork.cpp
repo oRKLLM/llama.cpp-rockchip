@@ -309,6 +309,91 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] finalized %s (%u weights)\n", ctx->persist_final.c_str(), f.n_entries);
 }
 
+// Resolve the int8 weight plane `x` (= src0->data) to a packed, cached ork_weight, identically for the
+// non-chain AND chain int8 matmul paths so every matmul entry persists the SAME way. Three tiers:
+//   1. wcache hit  — already resident, just return it.
+//   2. .orkpack read (persist_mode==1) — load the pre-tiled bytes (int8 or int4-W4A8) straight into DMA.
+//   3. pack-miss — dequant src0->f32, per-channel int8-quantize, pack, and (write mode) dump to .orkpack.
+// Returns ctx->wcache.end() only on a pack/load failure; otherwise an iterator to the resident weight.
+// Caller does the LRU touch (it->second.last_use) and the matmul. Keying / dedup is by src0->data
+// (wcache) and src0->name (persist index / persist_dumped) — same keys both paths use, so no double-write.
+static std::unordered_map<const void *, ork_weight>::iterator
+ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
+                      int K, int N, size_t nb01, enum ggml_type type, ggml_to_float_t to_float,
+                      bool allow_evict) {
+    // allow_evict: the non-chain path uses one weight at a time, so it may stream-evict the LRU to
+    // free IOVA. The chain path needs ALL `count` weights co-resident at submit, so it passes false
+    // (matching the original chain pack, which never evicted) — otherwise packing weight i frees the
+    // already-packed weight i-1 that the chain still references → use-after-free at submit.
+    const char * x = (const char *) src0->data;
+    auto it = ctx->wcache.find(x);
+    if (it != ctx->wcache.end()) return it;
+
+    if (ctx->persist_mode == 1) {
+        // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
+        // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
+        auto pit = ctx->persist_idx.find(src0->name);
+        if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
+            (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4)) {
+            const orkpack_entry & e = pit->second;
+            if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);
+            ork_weight ow;
+            const char * blob = (const char *) ctx->persist_map + e.blob_off;
+            if (e.dtype == ORKPACK_DT_I4) {
+                ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
+                if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
+            } else {
+                ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size);
+                if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                            ow.bscale.assign(bs, bs + e.bscale_n); }
+            }
+            if (ow.w) {
+                it = ctx->wcache.emplace(x, std::move(ow)).first;
+                it->second.bytes = ork_w_bytes(it->second.w);
+                ctx->wcache_bytes += it->second.bytes;
+                ctx->persist_hits++;
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
+                    e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
+                ork_evict_src(x, (size_t) N * nb01);
+                return it;
+            }
+        }
+    }
+
+    // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
+    if (ctx->persist_mode) ctx->persist_misses++;
+    ctx->f32.resize((size_t) N * K);
+    ctx->bi .resize((size_t) K * N);
+    float  * f32 = ctx->f32.data();
+    int8_t * bi  = ctx->bi.data();
+    if (type == GGML_TYPE_F32) {
+        for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
+    } else {
+        for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
+    }
+    ork_weight ow; ow.bscale.resize(N);
+    for (int n = 0; n < N; n++) {
+        float mx = 1e-9f;
+        for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+        float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
+        for (int k = 0; k < K; k++) {
+            int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
+            bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+        }
+    }
+    if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);   // stream: free IOVA room before packing (int8 ~K*N bytes)
+    ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
+    if (!ow.w) return ctx->wcache.end();
+    it = ctx->wcache.emplace(x, std::move(ow)).first;
+    it->second.bytes = ork_w_bytes(it->second.w);
+    ctx->wcache_bytes += it->second.bytes;
+    ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data());   // .orkpack: dump for next time (f32 plane enables int4 tier)
+    ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n",
+        ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, (const void *) x);
+    return it;
+}
+
 void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
 }
@@ -368,72 +453,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
 
             // weight: check cache / .orkpack / pack
-            auto it = ctx->wcache.find(x);
-            if (it == ctx->wcache.end() && ctx->persist_mode == 1) {
-                // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
-                // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
-                auto pit = ctx->persist_idx.find(src0->name);
-                if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
-                    (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4)) {
-                    const orkpack_entry & e = pit->second;
-                    ork_wcache_evict(ctx, (size_t) K * N);
-                    ork_weight ow;
-                    const char * blob = (const char *) ctx->persist_map + e.blob_off;
-                    if (e.dtype == ORKPACK_DT_I4) {
-                        // int4-W4A8: inflate the compact 'O4N1' nibble store to int8 + re-tile on load; bscale[N]
-                        // is carried inside the blob (ork_w_bscale). Runs/frees exactly like an int8 weight.
-                        ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
-                        if (ow.w) {
-                            const float * bs = ork_w_bscale(ow.w);
-                            if (bs) ow.bscale.assign(bs, bs + N);
-                        }
-                    } else {
-                        ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size);
-                        if (ow.w) {
-                            const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
-                            ow.bscale.assign(bs, bs + e.bscale_n);
-                        }
-                    }
-                    if (ow.w) {
-                        it = ctx->wcache.emplace(x, std::move(ow)).first;
-                        it->second.bytes = ork_w_bytes(it->second.w);
-                        ctx->wcache_bytes += it->second.bytes;
-                        ctx->persist_hits++;
-                        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
-                            e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
-                        ork_evict_src(x, (size_t) N * nb01);
-                    }
-                }
-            }
-            if (it == ctx->wcache.end()) {
-                if (ctx->persist_mode) ctx->persist_misses++;
-                float * f32 = ctx->f32.data();
-                int8_t * bi = ctx->bi.data();
-                if (type == GGML_TYPE_F32) {
-                    for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
-                } else {
-                    for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
-                }
-                ork_weight ow; ow.bscale.resize(N);
-                for (int n = 0; n < N; n++) {
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-                    float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
-                    for (int k = 0; k < K; k++) {
-                        int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
-                        bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
-                    }
-                }
-                ork_wcache_evict(ctx, (size_t) K * N);   // stream: free IOVA room before packing (int8 ~K*N bytes)
-                ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
-                if (!ow.w) return false;
-                it = ctx->wcache.emplace(x, std::move(ow)).first;
-                it->second.bytes = ork_w_bytes(it->second.w);
-                ctx->wcache_bytes += it->second.bytes;
-                ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data());   // .orkpack: dump for next time (f32 plane enables int4 tier)
-                ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
-                if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n", ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, x);
-            }
+            auto it = ork_resolve_weight_i8(ctx, src0, K, N, nb01, type, to_float, /*allow_evict=*/true);
+            if (it == ctx->wcache.end()) return false;
             it->second.last_use = ++ctx->wcache_tick;   // LRU touch (hit or fresh pack)
             const ork_weight & ow = it->second;
 
@@ -1319,32 +1340,11 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         const char  * x = (const char *) src0->data;
         const float * y = (const float *) src1->data;
 
-        // weight: check cache / pack
-        auto it = ctx->wcache.find(x);
-        if (it == ctx->wcache.end()) {
-            ctx->f32.resize((size_t) N * K);
-            ctx->bi .resize((size_t) K * N);
-            float * f32 = ctx->f32.data();
-            int8_t * bi = ctx->bi.data();
-            if (type == GGML_TYPE_F32) {
-                for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*src0->nb[1], (size_t) K*sizeof(float));
-            } else {
-                for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*src0->nb[1], f32 + n*K, K);
-            }
-            ork_weight ow; ow.bscale.resize(N);
-            for (int n = 0; n < N; n++) {
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-                float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
-                for (int k = 0; k < K; k++) {
-                    int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
-                    bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
-                }
-            }
-            ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
-            if (!ow.w) return false;
-            it = ctx->wcache.emplace(x, std::move(ow)).first;
-        }
+        // weight: wcache / .orkpack load / pack — identical resolution + persist as the non-chain path,
+        // so chain-routed FFN/attn weights are captured into (and reloaded from) the .orkpack too.
+        auto it = ork_resolve_weight_i8(ctx, src0, K, N, src0->nb[1], type, to_float, /*allow_evict=*/false);
+        if (it == ctx->wcache.end()) return false;
+        it->second.last_use = ++ctx->wcache_tick;
         const ork_weight & ow = it->second;
 
         // activation: check cache or quantize
