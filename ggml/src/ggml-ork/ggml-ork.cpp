@@ -60,13 +60,23 @@ extern "C" {
 #include <fcntl.h>
 #include <unistd.h>
 
-// ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled int8 weights ----
-// File: [ blobs: per weight, tiled int8 bytes (ork_w_dump) then N bscale floats ][ index ][ footer@EOF ].
-// First run with ORK_PERSIST=<path> writes it (one slow pass); later runs mmap it and ork_mm_load_i8 the
-// bytes straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load, so a
+// ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled (mixed int8 / int4) weights ----
+// File: [ blobs: per weight, packed bytes then (int8 only) N bscale floats ][ index ][ footer@EOF ].
+// First run with ORK_PERSIST=<path> writes it (one slow pass); later runs mmap it and load the bytes
+// straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load, so a
 // stale/mismatched file can never feed wrong weights (a mismatch just falls back to packing).
+//
+// Per-tensor tier is carried in `dtype` (the field is back-compatible — v1 files only ever wrote dtype==1):
+//   dtype == ORKPACK_DT_I8 (1): blob = ork_w_dump bytes (tiled int8), followed by bscale_n bscale floats.
+//   dtype == ORKPACK_DT_I4 (4): blob = ork_w_dump_i4a8 bytes (self-describing 'O4N1': K,N,quant_kind +
+//                               bscale[N] + nibble store). bscale lives INSIDE the blob → bscale_n==0,
+//                               bscale_off unused. Loaded via ork_mm_load_i4a8, runs via ork_mm_run_i8.
+// The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
+// mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 1u
+#define ORKPACK_VERSION 2u
+#define ORKPACK_DT_I8   1u
+#define ORKPACK_DT_I4   4u
 struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
 struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; char magic[8]; };
 
@@ -188,7 +198,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             void * m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
             if (m != MAP_FAILED) {
                 orkpack_footer f; memcpy(&f, (char *) m + sz - sizeof f, sizeof f);
-                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION && f.index_off < (uint64_t) sz) {
+                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && (f.version == 1u || f.version == 2u) && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
@@ -211,14 +221,63 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] building %s (one-time conversion this run)\n", ctx->persist_tmp.c_str()); }
 }
 
-// Append a freshly-packed int8 weight's tiled bytes + bscale to the write file and record its index entry.
-static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
+// Decide the on-disk tier for one tensor when WRITING a mixed .orkpack (Phase 2.2). Default (no env) is
+// int8 for every tensor → byte-identical to a v1 pack, NO regression. Opt-in to int4-W4A8 (per-channel,
+// coherent — the ork_mm_pack_i4a8 form that inflates to int8 and runs unchanged) via either:
+//   ORK_ORKPACK_I4_ABOVE_MB=<mb>  int4 any tensor whose int8 blob (~K*N bytes) exceeds <mb> MiB
+//   ORK_ORKPACK_I4_FFN=1          int4 the FFN/expert tensors (the bulk of the weights), int8 the rest
+// int4 needs K%32==0 && N%32==0; tensors that don't satisfy it stay int8 regardless. Returns 4 or 8.
+static int ork_orkpack_tier(const char * name, int K, int N) {
+    static int init = 0, i4_ffn = 0; static long i4_above_bytes = -1;
+    if (!init) {
+        init = 1;
+        const char * a = getenv("ORK_ORKPACK_I4_ABOVE_MB");
+        if (a && *a) i4_above_bytes = atoll(a) * 1024 * 1024;
+        i4_ffn = getenv("ORK_ORKPACK_I4_FFN") ? 1 : 0;
+    }
+    if (i4_above_bytes < 0 && !i4_ffn) return 8;            // no int4 policy set → all int8
+    if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint
+    bool want_i4 = false;
+    if (i4_above_bytes >= 0 && (long) K * N >= i4_above_bytes) want_i4 = true;
+    if (i4_ffn && name && (strstr(name, "ffn_") || strstr(name, "exps") ||
+                           strstr(name, "expert") || strstr(name, "shexp"))) want_i4 = true;
+    return want_i4 ? 4 : 8;
+}
+
+// Append a freshly-packed weight to the write file and record its index entry, choosing the int8 or int4
+// tier per ork_orkpack_tier(). int8: dump the already-packed tiled bytes (ow.w) + bscale[N]. int4: pack a
+// temporary int4-W4A8 weight from the f32 plane (n-major [N][K], as ggml's to_float produced) and dump its
+// self-describing 'O4N1' blob (carries K,N,quant_kind,bscale internally → no separate bscale trailer).
+static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N,
+                              const ork_weight & ow, const float * f32_plane) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
+
+    int tier = f32_plane ? ork_orkpack_tier(name, K, N) : 8;   // no f32 plane available → int8 only
+    if (tier == 4) {
+        std::vector<float> bscale_tmp(N);   // pack_i4a8 always writes bscale_out (no NULL check); the dump
+        ork_w * w4 = ork_mm_pack_i4a8(ctx->npu, K, N, f32_plane, bscale_tmp.data());   // carries bscale internally too
+        if (w4) {
+            size_t tb = ork_w_dump_i4a8(w4, nullptr, 0);
+            if (tb) {
+                std::vector<char> tmp(tb);
+                ork_w_dump_i4a8(w4, tmp.data(), tb);
+                orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;
+                fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+                ctx->persist_built.emplace_back(std::string(name), e);
+                ork_mm_free(ctx->npu, w4);
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4 %s K=%d N=%d (%zu B)\n", name, K, N, tb);
+                return;
+            }
+            ork_mm_free(ctx->npu, w4);
+        }
+        // int4 pack/dump failed → fall through to int8 (never persist a broken entry)
+    }
     size_t tb = ork_w_dump(ow.w, nullptr, 0);
     std::vector<char> tmp(tb);
     ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e; e.K = K; e.N = N; e.dtype = 1; e.bscale_n = (uint32_t) ow.bscale.size();
+    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
     e.bscale_off = ctx->persist_off;
@@ -313,18 +372,34 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
                 // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
                 auto pit = ctx->persist_idx.find(src0->name);
-                if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N && pit->second.dtype == 1) {
+                if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
+                    (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4)) {
                     const orkpack_entry & e = pit->second;
                     ork_wcache_evict(ctx, (size_t) K * N);
                     ork_weight ow;
-                    ow.w = ork_mm_load_i8(ctx->npu, K, N, (const char *) ctx->persist_map + e.blob_off, e.blob_size);
+                    const char * blob = (const char *) ctx->persist_map + e.blob_off;
+                    if (e.dtype == ORKPACK_DT_I4) {
+                        // int4-W4A8: inflate the compact 'O4N1' nibble store to int8 + re-tile on load; bscale[N]
+                        // is carried inside the blob (ork_w_bscale). Runs/frees exactly like an int8 weight.
+                        ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
+                        if (ow.w) {
+                            const float * bs = ork_w_bscale(ow.w);
+                            if (bs) ow.bscale.assign(bs, bs + N);
+                        }
+                    } else {
+                        ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size);
+                        if (ow.w) {
+                            const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                            ow.bscale.assign(bs, bs + e.bscale_n);
+                        }
+                    }
                     if (ow.w) {
-                        const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
-                        ow.bscale.assign(bs, bs + e.bscale_n);
                         it = ctx->wcache.emplace(x, std::move(ow)).first;
                         it->second.bytes = ork_w_bytes(it->second.w);
                         ctx->wcache_bytes += it->second.bytes;
                         ctx->persist_hits++;
+                        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
+                            e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
                         ork_evict_src(x, (size_t) N * nb01);
                     }
                 }
@@ -354,7 +429,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
                 it->second.bytes = ork_w_bytes(it->second.w);
                 ctx->wcache_bytes += it->second.bytes;
-                ork_persist_write(ctx, src0->name, K, N, it->second);   // .orkpack: dump for next time
+                ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data());   // .orkpack: dump for next time (f32 plane enables int4 tier)
                 ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n", ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, x);
             }
