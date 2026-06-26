@@ -119,7 +119,8 @@ struct ggml_backend_ork_context {
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
-    bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
+    bool hybrid = false;       // ORK_HYBRID: per-weight W8A8/W4A4 by SIZE (see ork_pick_qbits)
+    size_t hybrid_w4_above = 0;// ORK_HYBRID_W4_ABOVE_MB (bytes): weights whose int8 footprint K*N >= this run W4A4
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
@@ -895,6 +896,19 @@ static bool ork_is_expert(const char * name) {
     return false;
 }
 
+// Hybrid precision policy (ORK_HYBRID): choose W8A8 vs W4A4 per weight by SIZE. A weight whose int8-
+// resident footprint (K*N bytes) is >= ctx->hybrid_w4_above runs W4A4 — that's the FFN / expert bulk,
+// where int4 halves both resident bytes AND streaming bandwidth (the binding constraints for large
+// models against the ~4 GiB NPU IOVA window + KV-cache headroom). Smaller, numerically-sensitive
+// weights (attention, gates, norms-adjacent projections) stay W8A8, where the byte cost is trivial and
+// accuracy matters more. This generalizes the old FFN=4/attn=8 name heuristic: on a standard transformer
+// it lands on the same split, but it is architecture-agnostic and tunable via ORK_HYBRID_W4_ABOVE_MB
+// (default 8 MB; set 0 to force all-W8A8 under hybrid). With ORK_HYBRID off, ctx->qbits is used verbatim.
+static int ork_pick_qbits(const ggml_backend_ork_context * ctx, int64_t K, int64_t N) {
+    if (!ctx->hybrid) return ctx->qbits;
+    return (ctx->hybrid_w4_above && (size_t) (K * N) >= ctx->hybrid_w4_above) ? 4 : 8;
+}
+
 enum ork_chain_type {
     ORK_CHAIN_NONE,
     ORK_CHAIN_I8,
@@ -909,15 +923,7 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     int64_t K = src0->ne[0];
     int64_t N = src0->ne[1];
 
-    const char * name = src0->name;
-    bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
-    bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
-    
-    int target_qbits = ctx->qbits;
-    if (ctx->hybrid) {
-        if (is_ffn) target_qbits = 4;
-        else if (is_attn) target_qbits = 8;
-    }
+    int target_qbits = ork_pick_qbits(ctx, K, N);
     if (target_qbits == 8) {
         if (K <= 10752 && N <= 4096 && (K % 32 == 0) && (N % 32 == 0)) {
             return ORK_CHAIN_I8;
@@ -1642,15 +1648,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
                         i += ng - 1;
                     } else {
-                        const char * name = node->src[0]->name;
-                        bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
-                        bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
-                        
-                        int target_qbits = ctx->qbits;
-                        if (ctx->hybrid) {
-                            if (is_ffn) target_qbits = 4;
-                            else if (is_attn) target_qbits = 8;
-                        }
+                        int target_qbits = ork_pick_qbits(ctx, node->src[0]->ne[0], node->src[0]->ne[1]);
 
                         if (target_qbits == 4
                                ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
@@ -1717,6 +1715,10 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
+    {   // size-aware hybrid threshold (see ork_pick_qbits): weights with int8 footprint >= this go W4A4
+        const char * t = getenv("ORK_HYBRID_W4_ABOVE_MB");
+        ctx->hybrid_w4_above = (size_t)(t ? atoll(t) : 8) * 1024 * 1024;
+    }
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
