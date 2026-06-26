@@ -43,6 +43,7 @@
 #include "ggml-impl.h"
 #include "ggml-ork.h"
 #include "ggml-backend-impl.h"
+#include "ggml-cpu.h"     // ggml_get_type_traits_cpu: reuse the NEON-optimized expert vec_dot for cold experts
 #include "gguf.h"
 
 #include <vector>
@@ -55,6 +56,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <thread>
+#include <atomic>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -189,6 +192,7 @@ struct ggml_backend_ork_context {
     // MoE chained-handler phase breakdown (ORK_PROFILE): where the 0.97 t/s goes.
     double moe_prequant = 0, moe_pack = 0, moe_gather = 0, moe_chain = 0, moe_scatter = 0; long moe_calls = 0;
     double moe_deq = 0, moe_quant = 0;   // pack/repack sub-split: Q4_K->f32 dequant vs f32->int8 quant+tile
+    double moe_cold = 0; long moe_cold_calls = 0;   // cold-expert CPU GEMV (threaded ggml vec_dot) wall time
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -1170,6 +1174,9 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
             fprintf(stderr, "[ork MoE-chain] pack split: Q4_K->f32 dequant %.0fms (%.0f%%) | f32->int8 quant+tile %.0fms (%.0f%%)\n",
                 ctx->moe_deq/1e3, 100*ctx->moe_deq/ctx->moe_pack, ctx->moe_quant/1e3, 100*ctx->moe_quant/ctx->moe_pack);
         }
+        if (ctx->moe_cold_calls)
+            fprintf(stderr, "[ork MoE-cold] %ld cold-expert GEMV calls (threaded ggml vec_dot) | %.0fms total | %.1f us/expert\n",
+                ctx->moe_cold_calls, ctx->moe_cold/1e3, ctx->moe_cold/ctx->moe_cold_calls);
         // run_multicore phase split: where the per-matmul "run" time actually goes (kernel vs machinery)
         double rt_s = 0, rt_sub = 0, rt_cp = 0; long rt_n = 0;
         ork_npu_run_timing(&rt_s, &rt_sub, &rt_cp, &rt_n);
@@ -1818,21 +1825,47 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     const void * tbase = src0->data;                          // unique per (layer, projection)
     auto & hotmap = ctx->moe_hot[tbase];
 
-    // CPU GEMV for a cold expert e over its bucketed (token,slot) entries. Dequant the expert plane row
-    // by row (reused K-scratch) and accumulate against the f32 input — identical to the persist-convert
-    // CPU path, so cold experts are bit-compatible with the dense CPU MoE reference.
-    auto cpu_expert = [&](int e, std::vector<std::pair<int,int>> & ent) {
+    // COLD-EXPERT CPU GEMV — reuse ggml's NEON-optimized per-row vec_dot kernel (the same one its native
+    // CPU MUL_MAT_ID uses) instead of a scalar dequant+triple-loop. For a quantized expert type T, ggml's
+    // ggml_get_type_traits_cpu(T)->vec_dot dots a RAW quantized weight row (no full f32 dequant) against an
+    // activation pre-quantized to vec_dot_type (e.g. Q8_K for Q4_K), using SDOT/asimddp. We (a) quantize
+    // each distinct token's activation once to vec_dot_type, then (b) fan the (expert × output-row) dot
+    // products across a thread pool. This is bit-compatible with ggml's own CPU expert GEMV — so cold
+    // experts match the CPU MoE reference exactly (no longer the f32-dequant path, but ggml's quant path).
+    const struct ggml_type_traits_cpu * tcpu = ggml_get_type_traits_cpu(type);
+    const enum ggml_type vdt = (type == GGML_TYPE_F32) ? GGML_TYPE_F32 : tcpu->vec_dot_type;
+    const ggml_vec_dot_t vec_dot = tcpu->vec_dot;
+    const size_t row_bytes = src0->nb[1];                         // bytes per weight output-row (type T)
+    const size_t vdt_row   = ggml_row_size(vdt, K);               // bytes of one K-length activation in vec_dot_type
+    const auto * vdt_tt = ggml_get_type_traits_cpu(vdt);
+    // Quantize every distinct token's f32 activation to vec_dot_type ONCE (broadcast => one per token).
+    std::unordered_map<int, size_t> tok_q;                        // token -> offset (in vdt-rows) into qact
+    std::vector<char> qact;
+    auto quant_tok = [&](int t, int jslot) -> const void * {
+        const int key = bcast ? t : (t * 100000 + jslot);
+        auto qit = tok_q.find(key);
+        if (qit != tok_q.end()) return qact.data() + qit->second;
+        const size_t off = qact.size(); qact.resize(off + vdt_row);
+        const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jslot)*src1->nb[1] + (size_t) t*src1->nb[2]);
+        if (vdt == GGML_TYPE_F32) memcpy(qact.data()+off, y, (size_t)K*sizeof(float));
+        else vdt_tt->from_float(y, qact.data()+off, K);
+        tok_q[key] = off;
+        return qact.data() + off;
+    };
+
+    // Collect cold (expert, entries) pairs; run them all in one threaded fan-out after the split.
+    std::vector<std::pair<int, std::vector<std::pair<int,int>> *>> cold;
+    auto cpu_expert = [&](int e, std::vector<std::pair<int,int>> & ent) { cold.push_back({e, &ent}); };
+    // Run one cold expert: for each routed (token,slot), dot all N weight rows against the quantized act.
+    auto run_cold_expert = [&](int e, std::vector<std::pair<int,int>> & ent) {
         const char * xw = (const char *) src0->data + (size_t) e * src0->nb[2];
-        std::vector<float> ew((size_t) N * K);
-        if (type == GGML_TYPE_F32) for (int64_t n=0;n<N;n++) memcpy(ew.data()+n*K, xw+n*src0->nb[1], (size_t)K*sizeof(float));
-        else                       for (int64_t n=0;n<N;n++) to_float(xw+n*src0->nb[1], ew.data()+n*K, K);
         for (auto & pr : ent) {
             const int t = pr.first, j = pr.second;
-            const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:j)*src1->nb[1] + (size_t) t*src1->nb[2]);
+            const void * qa = quant_tok(t, j);                    // pre-quantized activation (read-only)
             float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
-            for (int n=0;n<N;n++){ const float * wr=ew.data()+(size_t)n*K; float acc=0.f; for(int k=0;k<K;k++) acc+=wr[k]*y[k]; dr[n]=acc; }
+            for (int n = 0; n < N; n++)
+                vec_dot(K, dr + n, 0, xw + (size_t) n * row_bytes, 0, qa, 0, 1);
         }
-        ctx->moe_cold_cpu++;
     };
 
     // Make expert e resident in this tensor's hot pool, packing it live on first touch (or loading from
@@ -1900,7 +1933,30 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // admit to NPU if resident, or if the pool has headroom / LRU room (cap enforced inside get_hot)
         ggml_backend_ork_context::ork_hot_slot * s = (resident || hotmap.size() < hot_K) ? get_hot(e) : nullptr;
         if (s) { hot_e.push_back(e); hot_s.push_back(s); }
-        else   { cpu_expert(e, kv.second); }   // cold -> CPU
+        else   { cpu_expert(e, kv.second); }   // cold -> CPU (deferred; run threaded below)
+    }
+
+    // Fan the cold experts across a thread pool (each expert is independent). Pre-quantize all needed
+    // token activations single-threaded first (qact vector grows; not thread-safe), then dot in parallel.
+    if (!cold.empty()) {
+        const double cd0 = ctx->profile ? ork_now_us() : 0;
+        for (auto & ce : cold) for (auto & pr : *ce.second) quant_tok(pr.first, pr.second);   // populate qact
+        const int n_cold = (int) cold.size();
+        unsigned hw = std::thread::hardware_concurrency();
+        int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
+        if (nthr < 1) nthr = 1; if (nthr > n_cold) nthr = n_cold;
+        if (nthr <= 1) {
+            for (auto & ce : cold) run_cold_expert(ce.first, *ce.second);
+        } else {
+            std::atomic<int> next(0);
+            auto worker = [&]() { int i; while ((i = next.fetch_add(1)) < n_cold) run_cold_expert(cold[i].first, *cold[i].second); };
+            std::vector<std::thread> th; th.reserve(nthr-1);
+            for (int w = 0; w < nthr-1; w++) th.emplace_back(worker);
+            worker();
+            for (auto & t : th) t.join();
+        }
+        ctx->moe_cold_cpu += n_cold;
+        if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
     }
 
     const int S = (int) hot_e.size();
