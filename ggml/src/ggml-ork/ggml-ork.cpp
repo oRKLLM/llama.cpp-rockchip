@@ -30,13 +30,23 @@
 //   ORK_NO_AFFINITY=1    Don't pin NPU-driver threads to big cores (default: pin).
 //   ORK_PROFILE=1        Per-section timing, printed on backend free.
 //   ORK_VERBOSE=1        Verbose per-op trace to stderr (debug).
+//   ORK_ORKPACK_TIERMAP=<file>  (write/convert) name<TAB>tier map from gguf_tier_map --emit-map:
+//                        a tensor's int4/int8 tier comes from this map BY NAME (overrides the
+//                        source-type verdict). Lets an fp16 source GGUF inherit a Q4_K_M's
+//                        int4/int8 ALLOCATION while quantizing VALUES from the clean fp16.
+//   ORK_IMATRIX=<file>   (write/convert) GGUF imatrix (llama.cpp in_sum2/counts form). For each
+//                        int4-tier tensor, load its per-INPUT-channel importance (in_sum2/counts,
+//                        length == packer K) and pack via ork_mm_pack_i4a8_im (imatrix-weighted
+//                        clip-grid scale). NF4 + imatrix compose.
 // ===================================================================================
 
 #include "ggml-impl.h"
 #include "ggml-ork.h"
 #include "ggml-backend-impl.h"
+#include "gguf.h"
 
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -256,6 +266,87 @@ static double ork_src_type_bits(enum ggml_type t) {
     }
 }
 
+// ---- ORK_ORKPACK_TIERMAP: external name<TAB>tier allocation map (Phase 4 STEP B) ------------
+// Lets a clean fp16 source GGUF inherit a *different* GGUF's int4/int8 allocation by name (e.g. a
+// Q4_K_M's "which tensors are int4"), so we quantize VALUES from fp16 but keep Q4_K_M's ALLOCATION.
+// Format: one line per tensor, `name<TAB>tier`, tier in {int4,int8,4,8}. Lines starting with '#' and
+// blanks are ignored. Returns: 4 / 8 if the name is in the map, -1 if no map or name absent.
+static int ork_tiermap_lookup(const char * name) {
+    static int loaded = 0;
+    static std::map<std::string,int> map;   // empty when no ORK_ORKPACK_TIERMAP
+    if (!loaded) {
+        loaded = 1;
+        const char * p = getenv("ORK_ORKPACK_TIERMAP");
+        if (p && *p) {
+            FILE * f = fopen(p, "r");
+            if (!f) { fprintf(stderr, "[ORK TIERMAP] cannot open %s — ignoring\n", p); }
+            else {
+                char line[1024];
+                while (fgets(line, sizeof line, f)) {
+                    if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+                    char * tab = strchr(line, '\t');
+                    if (!tab) continue;
+                    *tab = '\0';
+                    const char * tv = tab + 1;
+                    int tier = (strstr(tv, "int4") || tv[0] == '4') ? 4 :
+                               (strstr(tv, "int8") || tv[0] == '8') ? 8 : 0;
+                    if (tier) map[std::string(line)] = tier;
+                }
+                fclose(f);
+                fprintf(stderr, "[ORK TIERMAP] loaded %zu entries from %s\n", map.size(), p);
+            }
+        }
+    }
+    if (!name) return -1;
+    auto it = map.find(std::string(name));
+    return it == map.end() ? -1 : it->second;
+}
+
+// ---- ORK_IMATRIX: GGUF importance matrix (llama.cpp in_sum2/counts form) ----------------------
+// Returns a pointer to the per-INPUT-channel importance vector for `name` (length == K, the matmul
+// contraction dim) or nullptr if no imatrix / tensor absent / length mismatch. Importance[k] =
+// in_sum2[k] / counts (the mean squared activation of input channel k). Orientation: the imatrix
+// stores `<name>.in_sum2` with ne[0] == the weight's input dim == the K passed to the packer — so the
+// vector aligns directly with ork_mm_pack_i4a8_im's per-input-channel importance contract.
+static const float * ork_imatrix_lookup(const char * name, int K) {
+    static int loaded = 0;
+    static struct gguf_context * gg = nullptr;
+    static struct ggml_context * meta = nullptr;
+    static std::map<std::string, std::vector<float>> cache;   // name -> importance[K]
+    if (!loaded) {
+        loaded = 1;
+        const char * p = getenv("ORK_IMATRIX");
+        if (p && *p) {
+            struct gguf_init_params ip = { /*no_alloc=*/false, /*ctx=*/&meta };
+            gg = gguf_init_from_file(p, ip);
+            if (!gg) fprintf(stderr, "[ORK IMATRIX] cannot open/parse %s — ignoring\n", p);
+            else     fprintf(stderr, "[ORK IMATRIX] loaded %s (%lld tensors)\n", p,
+                             (long long) gguf_get_n_tensors(gg));
+        }
+    }
+    if (!gg || !name) return nullptr;
+    auto it = cache.find(std::string(name));
+    if (it != cache.end()) return it->second.empty() ? nullptr : it->second.data();
+
+    std::vector<float> & out = cache[std::string(name)];   // inserts empty (negative cache by default)
+    std::string s2 = std::string(name) + ".in_sum2";
+    std::string sc = std::string(name) + ".counts";
+    struct ggml_tensor * t2 = ggml_get_tensor(meta, s2.c_str());
+    struct ggml_tensor * tc = ggml_get_tensor(meta, sc.c_str());
+    if (!t2 || t2->type != GGML_TYPE_F32) return nullptr;
+    if ((int) t2->ne[0] != K) {
+        fprintf(stderr, "[ORK IMATRIX] %s in_sum2 len %lld != K %d — orientation mismatch, skipping\n",
+                name, (long long) t2->ne[0], K);
+        return nullptr;     // never pass a wrong-length vector to the packer
+    }
+    const float * in_sum2 = (const float *) t2->data;
+    float cnt = (tc && tc->type == GGML_TYPE_F32 && tc->data) ? *(const float *) tc->data : 1.0f;
+    if (cnt <= 0.0f) cnt = 1.0f;
+    out.resize(K);
+    for (int k = 0; k < K; k++) out[k] = in_sum2[k] / cnt;   // mean squared activation per input channel
+    return out.data();
+}
+
 // Decide the on-disk tier for one tensor when WRITING a mixed .orkpack (Phase 2.2 / 4.3). Two layers:
 //
 //   (A) SOURCE-TYPE policy (Phase 4.3, default ON): map the tensor's source ggml_type → effective bits;
@@ -281,6 +372,11 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
         if (fs && fs[0] == '0' && fs[1] == '\0') from_src = 0;
     }
     if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
+
+    // (A0) external tier map (ORK_ORKPACK_TIERMAP) — wins over source-type so an fp16 source can
+    // inherit a Q4_K_M's allocation by name. A mapped int4 still respects the shape constraint above.
+    int tm = ork_tiermap_lookup(name);
+    if (tm == 4 || tm == 8) return tm;
 
     bool want_i4 = false;
     // (A) source-type-driven default
@@ -310,7 +406,9 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
                 name, K, N, ggml_type_name(src_type), tier);
     if (tier == 4) {
         std::vector<float> bscale_tmp(N);   // pack_i4a8 always writes bscale_out (no NULL check); the dump
-        ork_w * w4 = ork_mm_pack_i4a8(ctx->npu, K, N, f32_plane, bscale_tmp.data());   // carries bscale internally too
+        const float * im = ork_imatrix_lookup(name, K);   // per-input-channel importance, length K (or NULL)
+        if (im && getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] imatrix %s (K=%d)\n", name, K);
+        ork_w * w4 = ork_mm_pack_i4a8_im(ctx->npu, K, N, f32_plane, im, bscale_tmp.data());   // im=NULL → plain absmax (identical to pack_i4a8)
         if (w4) {
             size_t tb = ork_w_dump_i4a8(w4, nullptr, 0);
             if (tb) {
