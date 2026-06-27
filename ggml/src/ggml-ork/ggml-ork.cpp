@@ -73,6 +73,7 @@ extern "C" {
 
 #include <sys/mman.h>
 #include <cstdint>
+#include <climits>   // INT_MAX (PATH B down_minM default-off)
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1962,7 +1963,18 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // the old all-K NPU path with ORK_MOE_NPU_ALLK=1 (then the run_chain/run_i8 fallback handles non-conf K).
     const bool conforming_k = (K % 512 == 0 && K <= 4096);
     static const bool allk = getenv("ORK_MOE_NPU_ALLK") != nullptr;
-    const bool npu_ok = conforming_k || allk;
+    // PATH B (M>1): a NON-conforming-K expert (e.g. LFM ffn_down K=1792) runs CORRECTLY on the NPU via the
+    // per-task run_i8 K-split path when it carries M_e>1 routed rows — the rc=-1 / soft-wedge was M_e==1
+    // specific (verified packed AND loaded by tools/moe_m1_probe: down beats CPU at M_e>=8, ~6.7x@8). The
+    // submit + weight read amortize across M_e rows, so the M>1 down-proj GEMM itself wins on the NPU.
+    // BUT end-to-end (LFM2.5 prefill pp64/128, board 10.3.0.236) this LOSES: admitting down-proj DOUBLES the
+    // resident expert footprint, and the ~1.2 GiB usable IOVA already caps the gate/up hot set to a ~16%
+    // hit-rate — so adding down EFAULTs (over-admission) and the 84% cold-CPU experts dominate regardless.
+    // PATH B verdict: the M>1 GEMM wins in isolation, but the IOVA hit-rate wall (NOT the GEMM) decides
+    // end-to-end, and prefill WIDENS the expert footprint vs decode. So default OFF (INT_MAX): admit
+    // non-conforming K to the NPU only when M_e >= ORK_MOE_NPU_DOWN_MINM (set e.g. =8 to opt into the
+    // validated down-on-NPU path on wider-IOVA HW / fewer-expert models). Conforming K (gate/up) unchanged.
+    static const int down_minM = getenv("ORK_MOE_NPU_DOWN_MINM") ? atoi(getenv("ORK_MOE_NPU_DOWN_MINM")) : INT_MAX;
 
     // Split active experts: those already resident, or that fit/evict into the per-tensor cap -> NPU.
     // The rest this step -> CPU. Prefer keeping already-resident experts (the hot set) on the NPU.
@@ -1971,6 +1983,10 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const int e = kv.first;
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         bool resident = hotmap.count(x) && hotmap[x].w;
+        // PATH B: conforming K always NPU-eligible; non-conforming K only when this expert has enough
+        // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
+        const int M_e = (int) kv.second.size();
+        const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
         // admit to NPU if the shape conforms AND (resident, or the pool has headroom / LRU room)
         ggml_backend_ork_context::ork_hot_slot * s =
             (npu_ok && (resident || hotmap.size() < hot_K)) ? get_hot(e) : nullptr;
