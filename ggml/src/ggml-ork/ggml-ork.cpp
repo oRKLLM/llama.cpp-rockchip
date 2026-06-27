@@ -22,6 +22,16 @@
 //                        the same flag). Legacy alias: ORK_NO_EXPERT_REPACK.
 //   ORK_MOE_CACHE=<n>    Resident expert-pool slots PER SHAPE (default 384); reused round-robin via
 //                        ork_mm_repack_i8 (no IOMMU churn). Only relevant when ORK_MOE_NPU is on.
+//   ORK_MOE_ALL_ACTIVE   STAGE 1 (default ON when ORK_MOE_NPU). At batch M>=ORK_MOE_BATCH_MINM admit
+//                        ALL active experts to the NPU (the M-sweep probe's optimum), bounded only by
+//                        the IOVA budget (ORK_MOE_HOT_GIB), not the hot_K count cap. =0 reverts to the
+//                        pure hot_K LRU policy. STAGE-1 IN-MODEL VERDICT (LFM2.5-8B-A1B prefill, board
+//                        10.3.0.236): the probe's M>=8 win does NOT survive — pp128 12.8 vs native-fused
+//                        36.3 t/s (0 EFAULT, coherent). ggml's CPU MoE is a FUSED batched kernel; our
+//                        per-expert split loses ~30% before any NPU (all-cold 25.4), and the serial NPU
+//                        submit makes it worse. Default OFF via ORK_MOE_NPU; see STAGE1_MOE_BATCHED_WIP.
+//   ORK_MOE_BATCH_MINM=<n>  Per-expert routed-row threshold (M_e) for the all-active regime (default 8,
+//                        matching the probe crossover). Below it (decode) the hot_K LRU cap applies.
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
 //   ORK_FUSE=1           EXPERIMENTAL. QKV / gate-up fusion (int8). Measured neutral; off.
@@ -1886,6 +1896,18 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // so the IOMMU never EFAULTs (the live-path soft-reset) regardless of how many experts the router hits.
     static const size_t hot_K = getenv("ORK_MOE_HOT") ? (size_t) atoi(getenv("ORK_MOE_HOT")) : 8;
     static const size_t hot_budget = (size_t)((getenv("ORK_MOE_HOT_GIB") ? atof(getenv("ORK_MOE_HOT_GIB")) : 2.5) * 1024.0*1024.0*1024.0);
+    // ===== STAGE 1: M-gated ALL-ACTIVE-to-NPU (batched prefill / verify) =====
+    // The standalone M-sweep probe (ork-driver tools/moe_batched_probe, commit 3a44272) found the
+    // optimal split for M>=8 is ALL active experts to the NPU: each per-expert GEMM amortizes the M=1
+    // submit floor over its M_e routed rows while the CPU fused job grows linearly with the batch. So at
+    // batch M (a per-expert row count M_e >= batch_minM, default 8) we admit the expert to the NPU
+    // REGARDLESS of the hot_K count cap — bounded only by the IOVA budget (hot_budget). This is the
+    // "load-cold-once-per-batch, amortized over M" config (a). Below batch_minM (M=1 decode) we keep the
+    // hot_K LRU cap (the M=1 regime where per-expert serial submits lose to CPU's fused MoE). When the
+    // budget can't hold every active expert, the overflow falls back to CPU (config (b): static-resident
+    // hot set on NPU || cold on CPU) — so the SAME code measures both configs, gated by hot_budget.
+    static const int    batch_minM = getenv("ORK_MOE_BATCH_MINM") ? atoi(getenv("ORK_MOE_BATCH_MINM")) : 8;
+    static const bool   all_active = !(getenv("ORK_MOE_ALL_ACTIVE") && atoi(getenv("ORK_MOE_ALL_ACTIVE")) == 0);
     const void * tbase = src0->data;                          // unique per (layer, projection)
     auto & hotmap = ctx->moe_hot[tbase];
 
@@ -1947,7 +1969,10 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // get_hot keeps the greedy precision-agnostic budget fill (admit int8 first, then inflate lower tiers
     // until ORK_MOE_HOT_GIB is full) so a scarce-int8 model still fills the reclaimed window.
     static const int int8_only = env_enabled("ORK_MOE_INT8_ONLY_RESIDENT");
-    auto get_hot = [&](int e) -> ggml_backend_ork_context::ork_hot_slot * {
+    // eff_cap = the per-tensor resident count cap for THIS call: hot_K at decode (M<batch_minM), or a
+    // large value in batched all-active mode (M>=batch_minM) so the IOVA budget (hot_budget) is the only
+    // admission limiter — every active expert that fits the window goes resident on the NPU.
+    auto get_hot = [&](int e, size_t eff_cap) -> ggml_backend_ork_context::ork_hot_slot * {
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         auto it = hotmap.find(x);
         if (it != hotmap.end() && it->second.w) { it->second.last_use = ++ctx->moe_hot_tick; ctx->moe_hot_hits++; return &it->second; }
@@ -1964,11 +1989,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // (route to CPU) — without freeing a resident hot expert or EFAULTing the MEM_CREATE ioctl. (When
         // at per-tensor cap an eviction below frees exactly K*N, so a same-shape swap always fits.)
         const size_t need = (size_t) K * N;
-        const bool will_evict = hotmap.size() >= hot_K;
+        const bool will_evict = hotmap.size() >= eff_cap;
         const size_t after_evict = ctx->moe_hot_bytes - (will_evict ? need : 0);
         if (after_evict + need > hot_budget) return (ggml_backend_ork_context::ork_hot_slot *) nullptr;
         // admitted: evict LRU within THIS tensor's pool until under the per-tensor count cap
-        while (hotmap.size() >= hot_K) {
+        while (hotmap.size() >= eff_cap) {
             auto lru = hotmap.end();
             for (auto p = hotmap.begin(); p != hotmap.end(); ++p)
                 if (lru == hotmap.end() || p->second.last_use < lru->second.last_use) lru = p;
@@ -2032,6 +2057,14 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     // Split active experts: those already resident, or that fit/evict into the per-tensor cap -> NPU.
     // The rest this step -> CPU. Prefer keeping already-resident experts (the hot set) on the NPU.
+    // STAGE 1: this tensor's max per-expert row count decides the regime. If ANY active expert carries
+    // >= batch_minM routed rows we're in the batched (prefill / verify) regime — admit ALL active experts
+    // that fit the IOVA budget (eff_cap large), the probe's all-active-to-NPU optimum. Otherwise (decode,
+    // M_e<batch_minM) keep the hot_K LRU cap. Default ON when MoE-on-NPU is enabled (ORK_MOE_ALL_ACTIVE=0
+    // reverts to the pure hot_K policy for A/B).
+    size_t max_Me = 0; for (auto & kv : buckets) if (kv.second.size() > max_Me) max_Me = kv.second.size();
+    const bool batched = all_active && ((int) max_Me >= batch_minM);
+    const size_t eff_cap = batched ? (size_t) -1 /*budget-limited only*/ : hot_K;
     std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
     for (auto & kv : buckets) {
         const int e = kv.first;
@@ -2041,11 +2074,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
         const int M_e = (int) kv.second.size();
         const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
-        // admit to NPU if the shape conforms AND (resident, or the pool has headroom / LRU room)
+        // admit to NPU if the shape conforms AND (resident, or the pool has headroom under eff_cap)
         ggml_backend_ork_context::ork_hot_slot * s =
-            (npu_ok && (resident || hotmap.size() < hot_K)) ? get_hot(e) : nullptr;
+            (npu_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
         if (s) { hot_e.push_back(e); hot_s.push_back(s); }
-        else   { cpu_expert(e, kv.second); }   // non-conforming or cap-full -> CPU (deferred; run threaded below)
+        else   { cpu_expert(e, kv.second); }   // non-conforming or budget/cap-full -> CPU (deferred; run threaded below)
     }
 
     // Pre-quantize all needed token activations single-threaded (qact grows; not thread-safe), then build
