@@ -803,8 +803,6 @@ class Gemma4AssistantModel(Gemma4Model):
         super().set_gguf_parameters()
         self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
         self.gguf_writer.add_nextn_predict_layers(self.block_count)
-
-
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True

@@ -35,6 +35,12 @@
 #include <string>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1615,7 +1621,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+
+#ifdef __linux__
+        // After successfully loading all tensor data, evict the memory-mapped GGUF file
+        // pages from the OS page cache to reclaim resident RAM. Because layers are typically
+        // offloaded/packed to the NPU/GPU, the raw GGUF weights in physical memory are a 
+        // redundant duplicate. Any CPU-bound layers will page-fault back on demand.
+        for (auto & mapping : pimpl->mappings) {
+            void * addr = mapping->addr();
+            size_t size = mapping->size();
+            if (addr && size) {
+                madvise(addr, size, MADV_DONTNEED);
+            }
+        }
+#endif
     }
+
+#ifdef __linux__
+    // Evict file descriptor pages from page cache too
+    for (auto & file : ml.files) {
+        int fd = file->file_id();
+        if (fd >= 0) {
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+    }
+#endif
 
     return true;
 }
@@ -2069,18 +2099,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
-                        filter_attn = [&](uint32_t il) {
+                        filter_attn = [&](int32_t il) {
                             return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                        filter_recr = [&](uint32_t il) {
+                        filter_recr = [&](int32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        filter_attn = [&](int32_t il) {
+                            return (uint32_t)il < hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&](int32_t il) {
+                            return (uint32_t)il < hparams.n_layer() && hparams.is_recr(il);
                         };
                     }
 

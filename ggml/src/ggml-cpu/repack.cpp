@@ -1,3 +1,4 @@
+#include <cstdlib>
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -4788,7 +4789,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //    return true;
             //}
             // may be possible if Q8_0 packed...
-        } else if (op->op == GGML_OP_MUL_MAT_ID
+        } else if (op->op == GGML_OP_MUL_MAT_ID && !getenv("ORK_MOE_NPU") && !getenv("ORK_NO_EXPERT_REPACK")
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
