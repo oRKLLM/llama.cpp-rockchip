@@ -212,6 +212,19 @@ struct ggml_backend_ork_context {
     double moe_cold = 0; long moe_cold_calls = 0;   // cold-expert CPU GEMV (threaded ggml vec_dot) wall time
     long moe_pack_calls = 0;   // [VERIFY] number of first-touch live packs/loads (get_hot misses)
     long moe_chain_S_sum = 0, moe_fallback_calls = 0; double moe_fallback_t = 0;   // [VERIFY] S total + per-task fallback
+    // ---- EXPERIMENT: phase-aware backbone eviction (#1, ORK_MOE_PHASE_EVICT) ----
+    // At DECODE (M==1) the dense backbone is bandwidth-bound and the NPU barely earns its IOVA, while the
+    // ~2.8 GiB it pins starves the MoE hot-expert cache. supports_op DECLINES dense MUL_MAT at M==1 (CPU
+    // takes it, cheap at M=1), and at the prefill->decode boundary we BULK-FREE the backbone wcache so the
+    // freed IOVA goes to experts; the next prefill repopulates it. A clean bulk free (not incremental LRU)
+    // avoids rk_iommu fragmentation. last_graph_decode tracks the previous graph's phase for the boundary.
+    int  phase_evict = 0;        // ORK_MOE_PHASE_EVICT (cached at init)
+    int  last_graph_decode = -1; // -1 unknown; 0 prefill (max M>1); 1 decode (max M==1)
+    long backbone_evicts = 0; size_t backbone_evict_bytes = 0;  // diagnostics
+    // ---- EXPERIMENT: routing-frequency profiler (ORK_MOE_PROFILE_FREQ=<file>) ----
+    // Accumulate per-(_exps tensor, expert) selection counts so the mixed-orkpack tier map can rank
+    // experts by routing frequency (hottest -> int8/NPU-resident, cold tail -> int4/CPU). Dumped on free.
+    std::map<std::string, std::vector<long>> moe_freq;   // exps-tensor-name -> per-expert hit count
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -1223,6 +1236,22 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
             (double) ctx->moe_hot_peak / (1024.0*1024.0*1024.0),
             ctx->moe_hot_hits, ctx->moe_cold_cpu, tot ? 100.0*ctx->moe_hot_hits/tot : 0.0);
     }
+    if (ctx->phase_evict)
+        fprintf(stderr, "[ORK PHASE EVICT] backbone bulk-frees=%ld total-freed=%.3f GiB\n",
+            ctx->backbone_evicts, ctx->backbone_evict_bytes / (1024.0*1024.0*1024.0));
+    if (const char * fp = getenv("ORK_MOE_PROFILE_FREQ")) {
+        if (!ctx->moe_freq.empty()) {
+            FILE * f = fopen(fp, "w");
+            if (f) {
+                fprintf(f, "# tensor\texpert\tcount  (routing-frequency profile for tier-map build)\n");
+                for (auto & kv : ctx->moe_freq)
+                    for (size_t e = 0; e < kv.second.size(); e++)
+                        fprintf(f, "%s\t%zu\t%ld\n", kv.first.c_str(), e, kv.second[e]);
+                fclose(f);
+                fprintf(stderr, "[ORK MOE FREQ] wrote routing-frequency profile (%zu tensors) -> %s\n", ctx->moe_freq.size(), fp);
+            }
+        }
+    }
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
@@ -1840,6 +1869,15 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
         for (int j = 0; j < n_used; j++) buckets[idp[j]].push_back(std::make_pair(t, j));
     }
+    // EXPERIMENT: routing-frequency profile (ORK_MOE_PROFILE_FREQ) — count expert selections per _exps
+    // tensor so the mixed-orkpack tier map can be built hottest-first. Cheap; gated to the profile run.
+    static const bool freq_prof = getenv("ORK_MOE_PROFILE_FREQ") != nullptr;
+    if (freq_prof) {
+        const int n_expert = (int) src0->ne[2];
+        auto & fv = ctx->moe_freq[src0->name];
+        if ((int) fv.size() < n_expert) fv.resize(n_expert, 0);
+        for (auto & kv : buckets) if (kv.first >= 0 && kv.first < n_expert) fv[kv.first] += (long) kv.second.size();
+    }
     // ===== M1b/M3 STATIC HOT-EXPERT PARTITION =====
     // Per LAYER-TENSOR cap K (ORK_MOE_HOT, default 8). The hottest K experts of THIS `_exps` tensor stay
     // resident on the NPU (LRU within the cap, IOVA freed on evict); every other (cold) expert this step
@@ -1901,10 +1939,26 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // Make expert e resident in this tensor's hot pool, packing it live on first touch (or loading from
     // the .orkpack if present). Evicts the LRU resident expert (freeing IOVA) when the pool is at cap.
     // Returns the slot, or nullptr if it could not be made resident (caller falls back to CPU).
+    // EXPERIMENT #2 (ORK_MOE_INT8_ONLY_RESIDENT): precision-threshold admission. Only experts STORED as
+    // int8 (ORKPACK_DT_I8) are eligible for the NPU IOVA hot cache; any sub-int8 tier (int4/NF4/etc.) must
+    // inflate to int8 to run on the NPU anyway — it would cost the inflate AND occupy the full int8
+    // footprint once resident, earning nothing from the scarce IOVA. So sub-int8 experts ALWAYS route to
+    // the CPU GEMV (NF4/int4 LUT-dequant vec_dot) and never compete for the window. Default OFF: when off
+    // get_hot keeps the greedy precision-agnostic budget fill (admit int8 first, then inflate lower tiers
+    // until ORK_MOE_HOT_GIB is full) so a scarce-int8 model still fills the reclaimed window.
+    static const int int8_only = env_enabled("ORK_MOE_INT8_ONLY_RESIDENT");
     auto get_hot = [&](int e) -> ggml_backend_ork_context::ork_hot_slot * {
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         auto it = hotmap.find(x);
         if (it != hotmap.end() && it->second.w) { it->second.last_use = ++ctx->moe_hot_tick; ctx->moe_hot_hits++; return &it->second; }
+        // #2 precision gate (BEFORE any eviction/budget commit): if int8-only mode and this expert is
+        // stored sub-int8 in the orkpack, refuse residency (caller -> CPU). No-op in live-pack mode (no
+        // orkpack: everything packs to int8) and in greedy mode (int8_only off).
+        if (int8_only && ctx->persist_mode == 1) {
+            auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
+            if (pit != ctx->persist_idx.end() && pit->second.dtype != ORKPACK_DT_I8)
+                return (ggml_backend_ork_context::ork_hot_slot *) nullptr;
+        }
         // Global IOVA budget gate FIRST: the backbone wcache + hot experts share the 4 GiB window. If this
         // expert won't fit under the weight-budget AND evicting our own LRU wouldn't free enough, refuse
         // (route to CPU) — without freeing a resident hot expert or EFAULTing the MEM_CREATE ioctl. (When
@@ -2098,6 +2152,31 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
+    // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): detect the prefill->decode phase boundary and BULK-FREE the
+    // resident dense-backbone wcache, reclaiming its IOVA (~2.8 GiB) for the MoE hot-expert cache. We
+    // classify this graph by its max matmul M: M>1 = prefill, M==1 = decode. A clean bulk free at the
+    // boundary (vs incremental LRU) avoids rk_iommu fragmentation; the next prefill repopulates wcache.
+    if (ctx->phase_evict) {
+        int64_t max_m = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if (nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID)
+                if (nd->ne[1] > max_m) max_m = nd->ne[1];
+        }
+        if (max_m > 0) {
+            const int is_decode = (max_m == 1) ? 1 : 0;
+            if (is_decode && ctx->last_graph_decode == 0 && !ctx->wcache.empty()) {
+                size_t freed = ctx->wcache_bytes; size_t n = ctx->wcache.size();
+                for (auto & kv : ctx->wcache) ork_mm_free(ctx->npu, kv.second.w);
+                ctx->wcache.clear(); ctx->wcache_bytes = 0;
+                ctx->backbone_evicts++; ctx->backbone_evict_bytes += freed;
+                if (getenv("ORK_VERBOSE")) fprintf(stderr,
+                    "[ORK PHASE] prefill->decode: bulk-freed backbone wcache (%zu weights, %.3f GiB) for experts\n",
+                    n, freed / (1024.0*1024.0*1024.0));
+            }
+            ctx->last_graph_decode = is_decode;
+        }
+    }
     // QKV/gate-up fusion: implemented + correct, but measured SLOWER on RK3588 (decode 9.4->6.4
     // tok/s) — one wide multi-core matmul + strided scatter costs more than the 2 saved submits, i.e.
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
@@ -2234,6 +2313,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
+    ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
@@ -2366,6 +2446,15 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                                src0->type == GGML_TYPE_IQ4_XS) && !hadamard;
             int threshold = is_expert ? 1 : (is_grouped ? min_m : (min_m > 32 ? 32 : min_m));
             if (target_qbits == 8) threshold = 1; // i8 chaining makes M=1 decode fast on NPU
+            // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
+            // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
+            // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
+            // MUL_MAT_ID (a separate case, still accepted). MUL_MAT here is the dense/attn backbone (the
+            // _exps tensors never reach this case), so declining at M==1 is exactly the backbone-at-decode.
+            {
+                static const int pe = env_enabled("ORK_MOE_PHASE_EVICT");
+                if (pe && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
+            }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
             return pass_m_threshold &&
