@@ -11,11 +11,15 @@
 // All experimental paths are OFF by default; the default build is the validated stable baseline
 // (dense MUL_MAT offload to NPU; everything else on CPU). Set a flag on the runtime command line.
 //
-//   ORK_MOE_NPU=1        EXPERIMENTAL. Offload MoE experts (MUL_MAT_ID) to the NPU via the
-//                        group-by-expert int8 handler. Measured a NET LOSS on RK3588 (decode ~60x,
-//                        prefill ~80x slower — the per-expert submit floor dominates), so default OFF
-//                        = experts on CPU. Requires the matching repack-buffer exclusion in
-//                        ggml-cpu/repack.cpp (gated on the same flag). Legacy alias: ORK_NO_EXPERT_REPACK.
+//   ORK_MOE_NPU=1        EXPERIMENTAL, default OFF, NOT recommended on RK3588. Offload MoE experts
+//                        (MUL_MAT_ID) to the NPU via the hot-expert partition (conforming-K experts go
+//                        NPU-resident on the async stream; the rest run the threaded CPU GEMV). M2
+//                        verdict on RK3588: decode ~6.56 vs CPU ~19.09 t/s (~2.9x SLOWER) — walled by
+//                        ~1.2 GiB usable IOVA (32-bit IOMMU; ~17% hit-rate) and the LPDDR4X-bound cold
+//                        GEMV. Revisit on wider-IOVA / DDR5 devices or the M>1 batched-verify path.
+//                        Value-checked (truthy 1/true/yes/on; UNSET or 0/false/off => experts on CPU).
+//                        Requires the repack-buffer exclusion in ggml-cpu/repack.cpp (presence-gated on
+//                        the same flag). Legacy alias: ORK_NO_EXPERT_REPACK.
 //   ORK_MOE_CACHE=<n>    Resident expert-pool slots PER SHAPE (default 384); reused round-robin via
 //                        ork_mm_repack_i8 (no IOMMU churn). Only relevant when ORK_MOE_NPU is on.
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
@@ -72,6 +76,18 @@ extern "C" {
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <strings.h>   // strcasecmp (env_enabled)
+
+// Truthy-VALUE env gate (not mere presence). Returns true only when the named var is set to one of
+// 1/true/yes/on (case-insensitive); UNSET or 0/false/off/empty -> false. Use this for any flag whose
+// "off" must be expressible as VALUE=0 (the obvious way to disable a feature on a command line), not
+// only by unsetting it — a bare getenv()!=nullptr presence-check treats `FOO=0` as ENABLED, a footgun.
+static bool env_enabled(const char * name) {
+    const char * v = getenv(name);
+    if (!v || !*v) return false;
+    return v[0]=='1' ||
+           !strcasecmp(v, "true") || !strcasecmp(v, "yes") || !strcasecmp(v, "on");
+}
 
 // ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled (mixed int8 / int4) weights ----
 // File: [ blobs: per weight, packed bytes then (int8 only) N bscale floats ][ index ][ footer@EOF ].
@@ -193,6 +209,8 @@ struct ggml_backend_ork_context {
     double moe_prequant = 0, moe_pack = 0, moe_gather = 0, moe_chain = 0, moe_scatter = 0; long moe_calls = 0;
     double moe_deq = 0, moe_quant = 0;   // pack/repack sub-split: Q4_K->f32 dequant vs f32->int8 quant+tile
     double moe_cold = 0; long moe_cold_calls = 0;   // cold-expert CPU GEMV (threaded ggml vec_dot) wall time
+    long moe_pack_calls = 0;   // [VERIFY] number of first-touch live packs/loads (get_hot misses)
+    long moe_chain_S_sum = 0, moe_fallback_calls = 0; double moe_fallback_t = 0;   // [VERIFY] S total + per-task fallback
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -1173,6 +1191,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
                 ctx->moe_scatter/1e3, 100*ctx->moe_scatter/mt);
             fprintf(stderr, "[ork MoE-chain] pack split: Q4_K->f32 dequant %.0fms (%.0f%%) | f32->int8 quant+tile %.0fms (%.0f%%)\n",
                 ctx->moe_deq/1e3, 100*ctx->moe_deq/ctx->moe_pack, ctx->moe_quant/1e3, 100*ctx->moe_quant/ctx->moe_pack);
+            fprintf(stderr, "[ork MoE-VERIFY] first-touch live-packs=%ld (%.0fms, %.1f ms/pack) | chain-submit calls=%ld (%.0fms, %.3f ms/submit-call)\n",
+                ctx->moe_pack_calls, ctx->moe_pack/1e3, ctx->moe_pack_calls? ctx->moe_pack/ctx->moe_pack_calls/1e3 : 0.0,
+                ctx->moe_calls, ctx->moe_chain/1e3, ctx->moe_calls? ctx->moe_chain/ctx->moe_calls/1e3 : 0.0);
+            fprintf(stderr, "[ork MoE-VERIFY2] avg S(tasks/call)=%.2f | per-task-fallback: calls=%ld (%.0fms, of total chain %.0fms) | chain-only=%.0fms over %ld calls = %.3f ms/chaincall\n",
+                ctx->moe_calls? (double)ctx->moe_chain_S_sum/ctx->moe_calls : 0.0,
+                ctx->moe_fallback_calls, ctx->moe_fallback_t/1e3, ctx->moe_chain/1e3,
+                (ctx->moe_chain-ctx->moe_fallback_t)/1e3, ctx->moe_calls, ctx->moe_calls? (ctx->moe_chain-ctx->moe_fallback_t)/ctx->moe_calls/1e3:0.0);
         }
         if (ctx->moe_cold_calls)
             fprintf(stderr, "[ork MoE-cold] %ld cold-expert GEMV calls (threaded ggml vec_dot) | %.0fms total | %.1f us/expert\n",
@@ -1841,31 +1866,35 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // Quantize every distinct token's f32 activation to vec_dot_type ONCE (broadcast => one per token).
     std::unordered_map<int, size_t> tok_q;                        // token -> offset (in vdt-rows) into qact
     std::vector<char> qact;
-    auto quant_tok = [&](int t, int jslot) -> const void * {
+    // Returns the BYTE OFFSET of the quantized activation within qact (not a pointer — qact is resized as
+    // more tokens are quantized, which can relocate the buffer; resolve qact.data()+off only after the
+    // single-threaded quantize phase is complete).
+    auto quant_tok = [&](int t, int jslot) -> size_t {
         const int key = bcast ? t : (t * 100000 + jslot);
         auto qit = tok_q.find(key);
-        if (qit != tok_q.end()) return qact.data() + qit->second;
+        if (qit != tok_q.end()) return qit->second;
         const size_t off = qact.size(); qact.resize(off + vdt_row);
         const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jslot)*src1->nb[1] + (size_t) t*src1->nb[2]);
         if (vdt == GGML_TYPE_F32) memcpy(qact.data()+off, y, (size_t)K*sizeof(float));
         else vdt_tt->from_float(y, qact.data()+off, K);
         tok_q[key] = off;
-        return qact.data() + off;
+        return off;
     };
 
     // Collect cold (expert, entries) pairs; run them all in one threaded fan-out after the split.
     std::vector<std::pair<int, std::vector<std::pair<int,int>> *>> cold;
     auto cpu_expert = [&](int e, std::vector<std::pair<int,int>> & ent) { cold.push_back({e, &ent}); };
-    // Run one cold expert: for each routed (token,slot), dot all N weight rows against the quantized act.
-    auto run_cold_expert = [&](int e, std::vector<std::pair<int,int>> & ent) {
-        const char * xw = (const char *) src0->data + (size_t) e * src0->nb[2];
-        for (auto & pr : ent) {
-            const int t = pr.first, j = pr.second;
-            const void * qa = quant_tok(t, j);                    // pre-quantized activation (read-only)
-            float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
-            for (int n = 0; n < N; n++)
-                vec_dot(K, dr + n, 0, xw + (size_t) n * row_bytes, 0, qa, 0, 1);
-        }
+    // One cold work-item: dot output rows [n0,n1) of expert e's weight against the quantized activation
+    // for (token t, slot j). We split the N output rows into blocks so the thread pool fans across ROWS,
+    // not just across experts — critical at decode, where there may be only a few cold experts but each
+    // has N=1792..2048 independent output rows. (vec_dot writes dr[n] from the raw quant weight row.)
+    struct cold_item { int e, t, j, n0, n1; size_t qoff; };
+    auto run_cold_item = [&](const cold_item & ci) {
+        const char * xw = (const char *) src0->data + (size_t) ci.e * src0->nb[2];
+        const void * qa = qact.data() + ci.qoff;
+        float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
+        for (int n = ci.n0; n < ci.n1; n++)
+            vec_dot(K, dr + n, 0, xw + (size_t) n * row_bytes, 0, qa, 0, 1);
     };
 
     // Make expert e resident in this tensor's hot pool, packing it live on first touch (or loading from
@@ -1901,6 +1930,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 (pit->second.dtype==ORKPACK_DT_I8 || pit->second.dtype==ORKPACK_DT_I4)) pe = &pit->second;
         }
         std::vector<float> bsc(N);
+        const double pk0 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] time first-touch pack/load
         if (pe) {
             const char * blob = (const char *) ctx->persist_map + pe->blob_off;
             slot.w = (pe->dtype==ORKPACK_DT_I4) ? ork_mm_load_i4a8(ctx->npu,K,N,blob,pe->blob_size)
@@ -1915,6 +1945,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             slot.w = ork_mm_pack_i8_dequant(ctx->npu, K, N, ork_moe_deq_row, &dq, bsc.data());
             if (!slot.w) return (ggml_backend_ork_context::ork_hot_slot *) nullptr;
         }
+        if (ctx->profile) { ctx->moe_pack += ork_now_us() - pk0; ctx->moe_pack_calls++; }   // [VERIFY]
         slot.bscale = std::move(bsc); slot.key = x; slot.last_use = ++ctx->moe_hot_tick;
         ctx->moe_hot_bytes += (size_t) K * N;
         if (ctx->moe_hot_bytes > ctx->moe_hot_peak) ctx->moe_hot_peak = ctx->moe_hot_bytes;
@@ -1923,6 +1954,16 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         return &res.first->second;
     };
 
+    // M2 change #2 (conformance gate): only this projection's K conforms to the cross-core stream / full-K
+    // envelope (K%512==0 && K<=4096) get NPU-resident hot experts; non-conforming shapes (e.g. LFM
+    // ffn_down K=1792) route ENTIRELY to the CPU GEMV. The per-task run_i8 K-split fallback on a *loaded*
+    // (orkpack) non-conforming weight returns rc=-1 on this SoC and can soft-wedge the NPU, so we never
+    // submit those — the conforming gate/up (K=2048) carry the NPU win, down stays on CPU. Opt back in to
+    // the old all-K NPU path with ORK_MOE_NPU_ALLK=1 (then the run_chain/run_i8 fallback handles non-conf K).
+    const bool conforming_k = (K % 512 == 0 && K <= 4096);
+    static const bool allk = getenv("ORK_MOE_NPU_ALLK") != nullptr;
+    const bool npu_ok = conforming_k || allk;
+
     // Split active experts: those already resident, or that fit/evict into the per-tensor cap -> NPU.
     // The rest this step -> CPU. Prefer keeping already-resident experts (the hot set) on the NPU.
     std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
@@ -1930,26 +1971,40 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const int e = kv.first;
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         bool resident = hotmap.count(x) && hotmap[x].w;
-        // admit to NPU if resident, or if the pool has headroom / LRU room (cap enforced inside get_hot)
-        ggml_backend_ork_context::ork_hot_slot * s = (resident || hotmap.size() < hot_K) ? get_hot(e) : nullptr;
+        // admit to NPU if the shape conforms AND (resident, or the pool has headroom / LRU room)
+        ggml_backend_ork_context::ork_hot_slot * s =
+            (npu_ok && (resident || hotmap.size() < hot_K)) ? get_hot(e) : nullptr;
         if (s) { hot_e.push_back(e); hot_s.push_back(s); }
-        else   { cpu_expert(e, kv.second); }   // cold -> CPU (deferred; run threaded below)
+        else   { cpu_expert(e, kv.second); }   // non-conforming or cap-full -> CPU (deferred; run threaded below)
     }
 
-    // Fan the cold experts across a thread pool (each expert is independent). Pre-quantize all needed
-    // token activations single-threaded first (qact vector grows; not thread-safe), then dot in parallel.
+    // Pre-quantize all needed token activations single-threaded (qact grows; not thread-safe), then build
+    // a flat list of (expert, token, slot, row-block) work-items and fan THOSE across the pool. Splitting
+    // each expert's N output rows into ROW_BLK-sized blocks keeps every thread busy even when only one or
+    // two experts went cold this step (the decode case) — the old per-expert fan-out left N-row parallelism
+    // on the table and serialized a lone cold expert's 1792 vec_dot calls onto a single core.
     if (!cold.empty()) {
         const double cd0 = ctx->profile ? ork_now_us() : 0;
-        for (auto & ce : cold) for (auto & pr : *ce.second) quant_tok(pr.first, pr.second);   // populate qact
         const int n_cold = (int) cold.size();
+        std::vector<cold_item> items;
+        const int ROW_BLK = 256;
+        for (auto & ce : cold) {
+            const int e = ce.first;
+            for (auto & pr : *ce.second) {
+                const size_t qoff = quant_tok(pr.first, pr.second);   // populate qact (single-threaded)
+                for (int n0 = 0; n0 < N; n0 += ROW_BLK)
+                    items.push_back(cold_item{ e, pr.first, pr.second, n0, n0+ROW_BLK<N ? n0+ROW_BLK : N, qoff });
+            }
+        }
+        const int n_items = (int) items.size();
         unsigned hw = std::thread::hardware_concurrency();
         int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
-        if (nthr < 1) nthr = 1; if (nthr > n_cold) nthr = n_cold;
+        if (nthr < 1) nthr = 1; if (nthr > n_items) nthr = n_items;
         if (nthr <= 1) {
-            for (auto & ce : cold) run_cold_expert(ce.first, *ce.second);
+            for (auto & ci : items) run_cold_item(ci);
         } else {
             std::atomic<int> next(0);
-            auto worker = [&]() { int i; while ((i = next.fetch_add(1)) < n_cold) run_cold_expert(cold[i].first, *cold[i].second); };
+            auto worker = [&]() { int i; while ((i = next.fetch_add(1)) < n_items) run_cold_item(items[i]); };
             std::vector<std::thread> th; th.reserve(nthr-1);
             for (int w = 0; w < nthr-1; w++) th.emplace_back(worker);
             worker();
@@ -1959,6 +2014,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
     }
 
+    if (ctx->profile && ctx->moe_calls < 4) fprintf(stderr, "[ork MoE-DIM] K=%d N=%d S=%d type=%d (chain-envelope K%%512==0&&K<=4096: %s)\n", K, N, (int)hot_e.size(), (int)type, (K%512==0&&K<=4096)?"YES":"no");
     const int S = (int) hot_e.size();
     if (S == 0) { if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
 
@@ -1989,10 +2045,20 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         tasks[x].w = hot_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
         offs[x] = off; off += cnt;
     }
+    // M2 change #2: dispatch the S independent hot experts via the ASYNC ROUND-ROBIN STREAM
+    // (run_stream_i8, ~2.5x cross-core even when weights are resident) instead of the single-core
+    // PC-chain. run_stream_i8 rejects any task whose K is outside the full-K envelope (K%512==0 &&
+    // K<=4096) with rc=-3, so non-conforming shapes (e.g. LFM down-proj K=1792) fall through to the
+    // per-task run_i8 path below — same correctness, just no cross-core dispatch for those.
+    // ORK_MOE_STREAM=0 reverts to the chain path (A/B comparison).
+    static const bool use_stream = !(getenv("ORK_MOE_STREAM") && atoi(getenv("ORK_MOE_STREAM")) == 0);
     const double ch0 = ctx->profile ? ork_now_us() : 0;
-    int crc = ork_mm_run_chain_i8(ctx->npu, S, tasks.data());
-    if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
-    if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; }
+    int crc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
+                         : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
+    const double ch1 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] split stream/chain vs fallback
+    if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C);
+               if (ctx->profile) { ctx->moe_fallback_t += ork_now_us() - ch1; ctx->moe_fallback_calls++; } }
+    if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id partition run FAIL rc=%d S=%d K=%d N=%d\n", crc, S, K, N); return false; }
 
     const double sc0 = ctx->profile ? ork_now_us() : 0;
@@ -2296,11 +2362,30 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
         }
         case GGML_OP_MUL_MAT_ID: {
-            // MoE expert offload (group-by-expert, int8). EXPERIMENTAL — measured a net loss for both
-            // decode (~60x) and prefill (~80x) on RK3588 (per-expert submit floor dominates), so it is
-            // OFF by default. Enable with ORK_MOE_NPU=1 (legacy alias: ORK_NO_EXPERT_REPACK=1) — the same
-            // flag must un-gate the repack-buffer exclusion in ggml-cpu/repack.cpp for experts to route.
-            if (!getenv("ORK_MOE_NPU") && !getenv("ORK_NO_EXPERT_REPACK")) return false;
+            // MoE expert offload to the NPU (hot-expert partition: conforming-K experts go NPU-resident
+            // via the async round-robin stream, the rest stay on the threaded CPU GEMV). EXPERIMENTAL and
+            // OFF BY DEFAULT — NOT recommended on RK3588-class hardware. M2 verdict (Qwen3-MoE, board
+            // 10.3.0.236, -t 4): NPU decode ~6.56 t/s vs CPU ~19.09 t/s (~2.9x SLOWER). The walls are
+            // RK3588-specific: (1) ~1.2 GiB usable IOVA — the 32-bit NPU IOMMU caps mappable weights at
+            // ~4 GiB and the GGUF backbone already eats ~2.8 GiB, so the resident hot set tops out at a
+            // ~17% expert hit-rate; (2) every cold-expert miss is a per-token GEMV that is LPDDR4X-
+            // bandwidth-bound and loses to ggml's fused batched MUL_MAT_ID. REVISIT when any of these
+            // changes: a wider-IOVA device (more resident experts), DDR5 / higher memory bandwidth
+            // (cold path competitive), or the M>1 regime (batched-verify / prefill amortizes the submit).
+            // Enable with ORK_MOE_NPU=1 (truthy: 1/true/yes/on; UNSET or 0/false/off => experts on CPU;
+            // legacy alias: ORK_NO_EXPERT_REPACK). NOTE: the matching repack-buffer exclusion in
+            // ggml-cpu/repack.cpp is gated on bare getenv presence, so to actually route experts to the
+            // NPU set the var to a truthy value (don't disable here by setting 0 while leaving it present).
+            if (!env_enabled("ORK_MOE_NPU") && !env_enabled("ORK_NO_EXPERT_REPACK")) return false;
+            {   // one-time loud warning when the experimental MoE-on-NPU path is actually enabled
+                static bool warned = false;
+                if (!warned) { warned = true;
+                    fprintf(stderr, "[ork] WARNING: ORK_MOE_NPU MoE-on-NPU expert offload is EXPERIMENTAL "
+                        "and NOT recommended on RK3588-class hardware (4GiB IOVA + LPDDR4X) — it loses ~3x "
+                        "vs CPU at M=1 decode. Intended for wider-IOVA / DDR5 devices or the M>1 "
+                        "batched-verify path.\n");
+                }
+            }
             const struct ggml_tensor * a = op->src[0];   // experts [K, N, n_expert]
             const struct ggml_tensor * b = op->src[1];   // input
             const struct ggml_tensor * c = op->src[2];   // ids (i32)
