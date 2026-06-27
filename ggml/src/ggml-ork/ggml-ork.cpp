@@ -32,6 +32,23 @@
 //                        submit makes it worse. Default OFF via ORK_MOE_NPU; see STAGE1_MOE_BATCHED_WIP.
 //   ORK_MOE_BATCH_MINM=<n>  Per-expert routed-row threshold (M_e) for the all-active regime (default 8,
 //                        matching the probe crossover). Below it (decode) the hot_K LRU cap applies.
+//   ORK_MOE_PATHB=1      EXPERIMENTAL, default OFF. PATH (b): at the batched regime (max M_e>=BATCH_MINM,
+//                        conforming K) split this tensor's active experts into an NPU share (run_stream_i8
+//                        on a DEDICATED thread, overlapped) ‖ a CPU share computed through ggml's REAL
+//                        FUSED batched MUL_MAT_ID kernel (a compacted sub-graph on a cached CPU backend —
+//                        NOT the per-expert vec_dot loop). Fixes the two Stage-1 losses (lost fusion +
+//                        serial submit). Below BATCH_MINM (decode) falls through to the all-CPU path.
+//   ORK_MOE_PATHB_FRAC=<f>  Fraction of ACTIVE experts (by largest M_e first) routed to the NPU under
+//                        PATH (b) (default 0.5; 0=all CPU-fused, 1=all NPU). Sweep to find the crossover.
+//   ORK_MOE_CPU_THREADS=<n>  CPU-backend thread count for the PATH (b) fused sub-graph (default 4 = big cores).
+//   ORK_MOE_PATHB_REPACK=1  PATH (b): repack the CPU-share weights into the SAME tiled layout the native
+//                        fused MUL_MAT_ID uses (a cached repack-buffer copy per experts tensor), so the
+//                        CPU share dispatches the REPACKED kernel — a fair fight vs the repacked baseline.
+//                        Default OFF (then the CPU share uses the slower standard fused kernel).
+//   ORK_MOE_PATHB_PARK=1  PATH (b): keep the CPU sub-graph in the NATIVE-efficient layout (b'=src1, full
+//                        ids' with NPU slots redirected to a park expert) instead of compacting into
+//                        single-expert columns. Matches the native per-token batching (much faster CPU
+//                        share); cost = the park expert recomputes the NPU slots' rows (discarded).
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
 //   ORK_FUSE=1           EXPERIMENTAL. QKV / gate-up fusion (int8). Measured neutral; off.
@@ -58,6 +75,11 @@
 #include "ggml-ork.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"     // ggml_get_type_traits_cpu: reuse the NEON-optimized expert vec_dot for cold experts
+#include "ggml-alloc.h"   // PATH (b): ggml_backend_alloc_ctx_tensors_from_buft (repacked CPU-share sub-graph)
+// PATH (b): the CPU repack buffer-type getter is internal to ggml-cpu (repack.h) but exported in the
+// shared lib (C++ linkage); forward-declare it so the CPU-share sub-graph can repack its weights into
+// the SAME tiled layout ggml's native fused MUL_MAT_ID uses — a fair fight against the repacked baseline.
+ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include "gguf.h"
 
 #include <vector>
@@ -223,6 +245,19 @@ struct ggml_backend_ork_context {
     double moe_cold = 0; long moe_cold_calls = 0;   // cold-expert CPU GEMV (threaded ggml vec_dot) wall time
     long moe_pack_calls = 0;   // [VERIFY] number of first-touch live packs/loads (get_hot misses)
     long moe_chain_S_sum = 0, moe_fallback_calls = 0; double moe_fallback_t = 0;   // [VERIFY] S total + per-task fallback
+    // ---- PATH (b): fusion-preserving + concurrent MoE split (ORK_MOE_PATHB) ----
+    // A cached CPU backend used to compute the CPU-share of the MoE via ggml's REAL fused batched
+    // MUL_MAT_ID kernel (NOT the per-expert vec_dot loop) on a compacted sub-graph. Created lazily.
+    ggml_backend_t cpu_backend = nullptr;          // ggml_backend_cpu_init() (lazy)
+    int      pathb_cpu_threads = 0;                // ORK_MOE_CPU_THREADS (default 4)
+    // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
+    // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
+    // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
+    struct ork_repack_as { struct ggml_context * gctx = nullptr; ggml_backend_buffer_t buf = nullptr; struct ggml_tensor * t = nullptr; };
+    std::unordered_map<const void *, ork_repack_as> pathb_repack;
+    // PATH (b) profiling/diagnostics
+    double pathb_npu_t = 0, pathb_cpu_t = 0, pathb_combine_t = 0, pathb_wall_t = 0; long pathb_calls = 0;
+    long pathb_npu_experts = 0, pathb_cpu_experts = 0;
     // ---- EXPERIMENT: phase-aware backbone eviction (#1, ORK_MOE_PHASE_EVICT) ----
     // At DECODE (M==1) the dense backbone is bandwidth-bound and the NPU barely earns its IOVA, while the
     // ~2.8 GiB it pins starves the MoE hot-expert cache. supports_op DECLINES dense MUL_MAT at M==1 (CPU
@@ -1227,6 +1262,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         if (ctx->moe_cold_calls)
             fprintf(stderr, "[ork MoE-cold] %ld cold-expert GEMV calls (threaded ggml vec_dot) | %.0fms total | %.1f us/expert\n",
                 ctx->moe_cold_calls, ctx->moe_cold/1e3, ctx->moe_cold/ctx->moe_cold_calls);
+        if (ctx->pathb_calls) {
+            const double npu = ctx->pathb_npu_t, cpu = ctx->pathb_cpu_t, wall = ctx->pathb_wall_t;
+            fprintf(stderr, "[ork PATH-B] %ld calls | NPU-experts=%ld CPU-experts=%ld | npu=%.0fms cpu=%.0fms combine=%.0fms wall=%.0fms | overlap-eff=%.2fx (sum/wall) | combine=%.1f%% of wall\n",
+                ctx->pathb_calls, ctx->pathb_npu_experts, ctx->pathb_cpu_experts,
+                npu/1e3, cpu/1e3, ctx->pathb_combine_t/1e3, wall/1e3,
+                wall>0 ? (npu+cpu)/wall : 0.0, wall>0 ? 100*ctx->pathb_combine_t/wall : 0.0);
+        }
         // run_multicore phase split: where the per-matmul "run" time actually goes (kernel vs machinery)
         double rt_s = 0, rt_sub = 0, rt_cp = 0; long rt_n = 0;
         ork_npu_run_timing(&rt_s, &rt_sub, &rt_cp, &rt_n);
@@ -1267,6 +1309,8 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
+    if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
+    for (auto & kv : ctx->pathb_repack) { if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf); if (kv.second.gctx) ggml_free(kv.second.gctx); }
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     g_ork_ctx = nullptr;
@@ -2070,6 +2114,266 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // reverts to the pure hot_K policy for A/B).
     size_t max_Me = 0; for (auto & kv : buckets) if (kv.second.size() > max_Me) max_Me = kv.second.size();
     const bool batched = all_active && ((int) max_Me >= batch_minM);
+
+    // ============================ PATH (b) ============================================
+    // Fusion-preserving + concurrent split (ORK_MOE_PATHB=1, default OFF). At the batched (prefill/
+    // verify) regime we split this tensor's active experts into an NPU share (run on a DEDICATED thread
+    // via the resident-int8 stream, overlapped) and a CPU share computed through ggml's REAL FUSED
+    // batched MUL_MAT_ID kernel (a compacted sub-graph on a cached CPU backend — NOT the per-expert
+    // vec_dot loop). This fixes BOTH Stage-1 losses: lost CPU fusion + serial NPU submit. Below the
+    // threshold (decode), fall through to the existing all-CPU cold path.
+    //   ORK_MOE_PATHB_FRAC = fraction of ACTIVE experts to route to the NPU (0..1; 0=all CPU-fused,
+    //                        1=all NPU). The f*S experts with the MOST routed rows go to the NPU (best
+    //                        submit-floor amortization); the rest stay on the CPU-fused sub-graph.
+    static const bool pathb = env_enabled("ORK_MOE_PATHB");
+    if (pathb && batched && conforming_k) {
+        const double pb_t0 = ork_now_us();
+        // --- partition active experts: largest-M_e first to NPU up to frac ---
+        std::vector<std::pair<int,int>> act;   // (M_e, expert)
+        for (auto & kv : buckets) act.push_back({(int) kv.second.size(), kv.first});
+        std::sort(act.begin(), act.end(), [](auto&a, auto&b){ return a.first > b.first; });
+        static const double frac = getenv("ORK_MOE_PATHB_FRAC") ? atof(getenv("ORK_MOE_PATHB_FRAC")) : 0.5;
+        const int S_act = (int) act.size();
+        int n_npu = (int) lrint(frac * S_act);
+        if (n_npu < 0) n_npu = 0; if (n_npu > S_act) n_npu = S_act;
+        // NPU experts: try to make resident (budget-limited); any that fail to go resident fall to CPU.
+        std::vector<int> npu_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> npu_s;
+        std::vector<int> cpu_e;
+        for (int i = 0; i < S_act; i++) {
+            const int e = act[i].second;
+            ggml_backend_ork_context::ork_hot_slot * s =
+                (i < n_npu) ? get_hot(e, (size_t) -1) : nullptr;
+            if (s) { npu_e.push_back(e); npu_s.push_back(s); }
+            else   { cpu_e.push_back(e); }
+        }
+        const int Snpu = (int) npu_e.size();
+
+        // --- NPU side: gather routed rows into bigA, prepare run_stream_i8 tasks (run on a thread) ---
+        size_t npu_rows = 0; for (int e : npu_e) npu_rows += buckets[e].size();
+        std::vector<int8_t>  bigA((size_t) npu_rows * K);
+        std::vector<int32_t> bigC((size_t) npu_rows * N);
+        std::vector<float>   as_row(npu_rows ? npu_rows : 1);
+        std::vector<ork_mm_task_i8> tasks(Snpu);
+        std::vector<size_t> offs(Snpu);
+        { size_t off = 0;
+          for (int x = 0; x < Snpu; x++) {
+            const int e = npu_e[x]; auto & ent = buckets[e]; const int cnt = (int) ent.size();
+            int8_t * Ae = bigA.data() + off * K;
+            for (int i = 0; i < cnt; i++) {
+                const int t = ent[i].first, j = ent[i].second;
+                int8_t * ar = Ae + (size_t) i * K;
+                if (bcast) { memcpy(ar, A_all.data() + (size_t) t * K, (size_t) K); as_row[off+i] = as_all[t]; }
+                else {
+                    const float * y = (const float *)((const char *) src1->data + (size_t) j*src1->nb[1] + (size_t) t*src1->nb[2]);
+                    float mx=1e-9f; for (int k=0;k<K;k++){ float v=fabsf(y[k]); if(v>mx)mx=v; }
+                    as_row[off+i]=mx/127.0f; float ainv=127.0f/mx;
+                    for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
+                }
+            }
+            tasks[x].w = npu_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
+            offs[x] = off; off += cnt;
+          }
+        }
+        // launch the NPU stream on a dedicated thread so it OVERLAPS the CPU sub-graph compute below.
+        // run_stream_i8 is blocking (kernel wait); the join is a full memory barrier -> bigC is visible
+        // to the combine after t_npu.join() (host memory, no DMA-coherency dance — not a DMA buffer).
+        std::atomic<int> npu_rc(0);
+        double npu_dt = 0;
+        std::thread t_npu;
+        if (Snpu > 0) {
+            t_npu = std::thread([&](){
+                const double n0 = ork_now_us();
+                int rc = ork_mm_run_stream_i8(ctx->npu, Snpu, tasks.data());
+                if (rc) { rc = 0; for (int x = 0; x < Snpu && rc == 0; x++) rc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
+                npu_rc.store(rc);
+                npu_dt = ork_now_us() - n0;
+            });
+        }
+
+        // --- CPU side: ggml's REAL FUSED batched MUL_MAT_ID on a compacted sub-graph ---
+        // Build a sub-graph node MUL_MAT_ID(as'=src0, b'=[K,1,P], ids'=[1,P]) where P = total CPU-routed
+        // (token,slot) pairs. Column p maps 1:1 to a CPU pair; ids'[0,p]=expert(p). The fused kernel
+        // still groups the P columns by expert -> a real batched GEMM per CPU expert. We then scatter
+        // dst'[:,0,p] back to dst[:, slot(p), token(p)]. Zero wasted rows (no park-expert redirection).
+        // PARK layout (ORK_MOE_PATHB_PARK=1): instead of compacting CPU pairs into P single-expert columns,
+        // keep the NATIVE-efficient structure — b' = src1 (n_tokens cols, NO per-slot duplication), ids' =
+        // a copy of the real ids [n_used,n_tokens] where NPU-routed (slot,token) entries are redirected to a
+        // PARK expert (the most-loaded CPU expert) so the fused kernel batches exactly like native; we then
+        // scatter only the CPU-routed dst' slots into dst (the park rows for NPU slots are discarded). Waste
+        // = NPU-slot rows computed on the park expert, but the per-token batching matches native (fast).
+        static const bool park = env_enabled("ORK_MOE_PATHB_PARK");
+        double cpu_dt = 0;
+        std::unordered_set<int> cpu_set(cpu_e.begin(), cpu_e.end());
+        if (park && !cpu_e.empty()) {
+            const double c0 = ork_now_us();
+            if (!ctx->cpu_backend) { ctx->cpu_backend = ggml_backend_cpu_init();
+                ctx->pathb_cpu_threads = getenv("ORK_MOE_CPU_THREADS") ? atoi(getenv("ORK_MOE_CPU_THREADS")) : 4; }
+            ggml_backend_cpu_set_n_threads(ctx->cpu_backend, ctx->pathb_cpu_threads);
+            // park expert = most-loaded CPU expert (already gets the most rows -> least relative waste).
+            int park_e = cpu_e[0]; { size_t best = 0; for (int e : cpu_e) if (buckets[e].size() > best) { best = buckets[e].size(); park_e = e; } }
+            size_t mem = 32 * ggml_tensor_overhead() + 2 * ggml_graph_overhead() + 4096;
+            struct ggml_init_params ip = { mem, nullptr, true }; struct ggml_context * gctx = ggml_init(ip);
+            // b' = src1 (alias, full n_tokens). ids' = remapped [n_used, n_tokens]. dst' [N, n_used, n_tokens].
+            std::vector<int32_t> idP((size_t) n_used * n_tokens);
+            for (int t = 0; t < n_tokens; t++) {
+                const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
+                for (int jj = 0; jj < n_used; jj++) { int e = idp[jj]; idP[(size_t) t*n_used + jj] = cpu_set.count(e) ? e : park_e; }
+            }
+            std::vector<float> dstP((size_t) N * n_used * n_tokens);
+            struct ggml_tensor * as_t = nullptr;
+            { static const bool use_repack = env_enabled("ORK_MOE_PATHB_REPACK");
+              if (use_repack) { auto & rp = ctx->pathb_repack[src0->data];
+                if (!rp.t) { size_t mo = ggml_tensor_overhead()+256; struct ggml_init_params rip={mo,nullptr,true};
+                    rp.gctx=ggml_init(rip); struct ggml_tensor*rt=ggml_new_tensor_3d(rp.gctx,type,K,N,src0->ne[2]); ggml_set_name(rt,src0->name);
+                    rp.buf=ggml_backend_alloc_ctx_tensors_from_buft(rp.gctx,ggml_backend_cpu_repack_buffer_type());
+                    if(rp.buf){ggml_backend_tensor_set(rt,src0->data,0,ggml_nbytes(rt));rp.t=rt;}else{ggml_free(rp.gctx);rp.gctx=nullptr;} }
+                as_t = rp.t; }
+              if (!as_t) { as_t = ggml_new_tensor_3d(gctx, type, K, N, src0->ne[2]);
+                as_t->data=src0->data; as_t->nb[0]=src0->nb[0];as_t->nb[1]=src0->nb[1];as_t->nb[2]=src0->nb[2];as_t->nb[3]=src0->nb[3];
+                as_t->buffer=src0->buffer; as_t->extra=src0->extra; }
+            }
+            struct ggml_tensor * b_t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, K, 1, n_tokens);
+            b_t->data = src1->data; b_t->nb[0]=src1->nb[0]; b_t->nb[1]=src1->nb[1]; b_t->nb[2]=src1->nb[2]; b_t->nb[3]=src1->nb[3];
+            struct ggml_tensor * id_t = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, n_used, n_tokens);
+            id_t->data = idP.data();
+            struct ggml_tensor * out = ggml_mul_mat_id(gctx, as_t, b_t, id_t);
+            out->data = dstP.data();
+            struct ggml_cgraph * gf = ggml_new_graph(gctx); ggml_build_forward_expand(gf, out);
+            ggml_backend_graph_compute(ctx->cpu_backend, gf);
+            ggml_free(gctx);
+            cpu_dt = ork_now_us() - c0;
+            // join NPU + combine, then return (park layout has its own combine path)
+            if (Snpu > 0) t_npu.join();
+            const double cb0 = ork_now_us();
+            if (npu_rc.load()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] PATH-B NPU rc=%d\n", npu_rc.load()); return false; }
+            for (int x = 0; x < Snpu; x++) { auto & ent = buckets[npu_e[x]]; const int cnt=(int)ent.size(); const size_t o=offs[x];
+                const float * bs = npu_s[x]->bscale.data();
+                for (int i = 0; i < cnt; i++) { const int t=ent[i].first,j=ent[i].second; const int32_t*cr=bigC.data()+(o+i)*N;
+                    float*dr=(float*)(dbase+(size_t)j*dst->nb[1]+(size_t)t*dst->nb[2]); const float as=as_row[o+i];
+                    for(int n=0;n<N;n++) dr[n]=as*bs[n]*(float)cr[n]; } }
+            // CPU partial: scatter ONLY the CPU-routed slots from dst'[N,n_used,n_tokens] (park rows ignored).
+            for (int t = 0; t < n_tokens; t++) { const int32_t*idp=(const int32_t*)((const char*)ids->data+(size_t)t*ids->nb[1]);
+                for (int jj = 0; jj < n_used; jj++) { if (!cpu_set.count(idp[jj])) continue;
+                    const float*sp=dstP.data()+((size_t)t*n_used+jj)*N;
+                    float*dr=(float*)(dbase+(size_t)jj*dst->nb[1]+(size_t)t*dst->nb[2]);
+                    memcpy(dr, sp, (size_t)N*sizeof(float)); } }
+            const double cb1 = ork_now_us();
+            ctx->pathb_calls++; ctx->pathb_npu_t+=npu_dt; ctx->pathb_cpu_t+=cpu_dt;
+            ctx->pathb_combine_t+=cb1-cb0; ctx->pathb_wall_t+=cb1-pb_t0;
+            ctx->pathb_npu_experts+=Snpu; ctx->pathb_cpu_experts+=(long)cpu_e.size();
+            ctx->moe_hot_hits+=Snpu; ctx->moe_cold_cpu+=(long)cpu_e.size();
+            if (ctx->profile && ctx->moe_calls < 4)
+                fprintf(stderr,"[ORK PATH-B/PARK] K=%d N=%d Snpu=%d cpuE=%d park=%d npu=%.0fus cpu=%.0fus comb=%.0fus wall=%.0fus eff=%.2fx\n",
+                    K,N,Snpu,(int)cpu_e.size(),park_e,npu_dt,cpu_dt,cb1-cb0,cb1-pb_t0,(npu_dt+cpu_dt)>0?(npu_dt+cpu_dt)/(cb1-pb_t0):0.0);
+            if (ctx->profile){ctx->t_run+=ork_now_us()-t0;ctx->n_mm++;ctx->moe_calls++;}
+            return true;
+        }
+
+        struct pair_loc { int t, j; };
+        std::vector<pair_loc> cpu_pairs;
+        if (!cpu_e.empty()) {
+            for (int e : cpu_e) { auto & ent = buckets[e]; for (auto & pr : ent) cpu_pairs.push_back({pr.first, pr.second}); }
+        }
+        const int P = (int) cpu_pairs.size();
+        std::vector<float> dstp;        // dst' [N, P] f32
+        if (P > 0) {
+            const double c0 = ork_now_us();
+            if (!ctx->cpu_backend) {
+                ctx->cpu_backend = ggml_backend_cpu_init();
+                ctx->pathb_cpu_threads = getenv("ORK_MOE_CPU_THREADS") ? atoi(getenv("ORK_MOE_CPU_THREADS")) : 4;
+            }
+            ggml_backend_cpu_set_n_threads(ctx->cpu_backend, ctx->pathb_cpu_threads);
+            // scratch ggml context: metadata only (no_alloc); we wire ->data to our own buffers.
+            size_t mem = 32 * ggml_tensor_overhead() + 2 * ggml_graph_overhead() + 4096;
+            struct ggml_init_params ip = { mem, nullptr, true };
+            struct ggml_context * gctx = ggml_init(ip);
+            // b' [K,1,P] f32 activations (gather token columns); ids' [1,P] i32; dst' [N,1,P] f32.
+            std::vector<float>   bP((size_t) K * P);
+            std::vector<int32_t> idP(P);
+            dstp.assign((size_t) N * P, 0.f);
+            for (int p = 0; p < P; p++) {
+                const int t = cpu_pairs[p].t, j = cpu_pairs[p].j;
+                const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:j)*src1->nb[1] + (size_t) t*src1->nb[2]);
+                memcpy(bP.data() + (size_t) p * K, y, (size_t) K * sizeof(float));
+            }
+            { int p = 0; for (int e : cpu_e) { auto & ent = buckets[e]; for (size_t i = 0; i < ent.size(); i++) idP[p++] = e; } }
+            // as' choice: by default alias src0 directly (standard fused kernel). With ORK_MOE_PATHB_REPACK=1
+            // use a cached repack-buffer copy of the full experts tensor so the sub-graph dispatches the SAME
+            // REPACKED batched MUL_MAT_ID the native fused-CPU baseline uses — a fair CPU-side fight.
+            static const bool use_repack = env_enabled("ORK_MOE_PATHB_REPACK");
+            struct ggml_tensor * as_t = nullptr;
+            if (use_repack) {
+                auto & rp = ctx->pathb_repack[src0->data];
+                if (!rp.t) {
+                    size_t mo = ggml_tensor_overhead() + 256;
+                    struct ggml_init_params rip = { mo, nullptr, true };
+                    rp.gctx = ggml_init(rip);
+                    struct ggml_tensor * rt = ggml_new_tensor_3d(rp.gctx, type, K, N, src0->ne[2]);
+                    ggml_set_name(rt, src0->name);
+                    rp.buf = ggml_backend_alloc_ctx_tensors_from_buft(rp.gctx, ggml_backend_cpu_repack_buffer_type());
+                    if (rp.buf) {
+                        // repack: set_tensor on a repack-buffer tensor triggers the tiling repack from src0.
+                        ggml_backend_tensor_set(rt, src0->data, 0, ggml_nbytes(rt));
+                        rp.t = rt;
+                    } else { ggml_free(rp.gctx); rp.gctx = nullptr; }   // type not repackable -> fall back
+                }
+                as_t = rp.t;
+            }
+            if (!as_t) {   // standard path: alias src0 (carry buffer/extra so it dispatches like native).
+                as_t = ggml_new_tensor_3d(gctx, type, K, N, src0->ne[2]);
+                as_t->data = src0->data; as_t->nb[0]=src0->nb[0]; as_t->nb[1]=src0->nb[1]; as_t->nb[2]=src0->nb[2]; as_t->nb[3]=src0->nb[3];
+                as_t->buffer = src0->buffer; as_t->extra = src0->extra;
+            }
+            struct ggml_tensor * b_t  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, K, 1, P);
+            b_t->data = bP.data();
+            struct ggml_tensor * id_t = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, 1, P);
+            id_t->data = idP.data();
+            struct ggml_tensor * out  = ggml_mul_mat_id(gctx, as_t, b_t, id_t);
+            out->data = dstp.data();
+            struct ggml_cgraph * gf = ggml_new_graph(gctx);
+            ggml_build_forward_expand(gf, out);
+            ggml_backend_graph_compute(ctx->cpu_backend, gf);
+            ggml_free(gctx);
+            cpu_dt = ork_now_us() - c0;
+        }
+
+        // --- join NPU + combine (scatter-add both partials into dst) ---
+        if (Snpu > 0) t_npu.join();
+        const double cb0 = ork_now_us();
+        if (npu_rc.load()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] PATH-B NPU rc=%d\n", npu_rc.load()); return false; }
+        // NPU partial: bigC[int32] * as_row * bscale -> dst[:, slot, token]
+        for (int x = 0; x < Snpu; x++) {
+            auto & ent = buckets[npu_e[x]]; const int cnt = (int) ent.size(); const size_t o = offs[x];
+            const float * bs = npu_s[x]->bscale.data();
+            for (int i = 0; i < cnt; i++) {
+                const int t = ent[i].first, j = ent[i].second;
+                const int32_t * cr = bigC.data() + (o + i) * N;
+                float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
+                const float as = as_row[o + i];
+                for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
+            }
+        }
+        // CPU partial: dst'[:,p] -> dst[:, slot(p), token(p)]
+        for (int p = 0; p < P; p++) {
+            const int t = cpu_pairs[p].t, j = cpu_pairs[p].j;
+            const float * sp = dstp.data() + (size_t) p * N;
+            float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
+            memcpy(dr, sp, (size_t) N * sizeof(float));
+        }
+        const double cb1 = ork_now_us();
+        ctx->pathb_calls++; ctx->pathb_npu_t += npu_dt; ctx->pathb_cpu_t += cpu_dt;
+        ctx->pathb_combine_t += cb1 - cb0; ctx->pathb_wall_t += cb1 - pb_t0;
+        ctx->pathb_npu_experts += Snpu; ctx->pathb_cpu_experts += (long) cpu_e.size();
+        ctx->moe_hot_hits += Snpu; ctx->moe_cold_cpu += (long) cpu_e.size();
+        if (ctx->profile && ctx->moe_calls < 4)
+            fprintf(stderr, "[ORK PATH-B] K=%d N=%d S_act=%d Snpu=%d P=%d npu=%.0fus cpu=%.0fus comb=%.0fus wall=%.0fus eff=%.2fx\n",
+                    K, N, S_act, Snpu, P, npu_dt, cpu_dt, cb1-cb0, cb1-pb_t0,
+                    (npu_dt+cpu_dt)>0 ? (npu_dt+cpu_dt)/(cb1-pb_t0) : 0.0);
+        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; ctx->moe_calls++; }
+        return true;
+    }
+    // ========================== END PATH (b) ==========================================
+
     const size_t eff_cap = batched ? (size_t) -1 /*budget-limited only*/ : hot_K;
     std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
     for (auto & kv : buckets) {
