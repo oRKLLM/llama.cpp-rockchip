@@ -166,14 +166,36 @@ static size_t ork_wcache_budget() {
     return b;
 }
 
+// ---- STREAM-POOL tier (ORK_STREAM_POOL=1) -------------------------------------------------------
+// Retarget the weight-streaming LRU at a RAM-resident inflated-int8 cache (ork_stream_pool) instead of
+// pure IOVA residency. Two budgets form a hierarchy:
+//   RAM-int8 LRU  (ORK_STREAM_RAM_BUDGET_MB, big — much larger than the 4 GiB IOVA window): how much
+//                 inflated int8 we hold resident in CPU RAM. A hit here SKIPS the expensive re-inflate.
+//   IOVA hot tier (ork_wcache_budget(), <= 4 GiB, evict-RARE): the subset currently MEM_CREATE-mapped.
+// Measured uABI costs drive this: inflate(fill) 0.4-2.7ms + MEM_DESTROY(unmap) 0.5-2ms are expensive
+// (paid once on add / only on eviction); MEM_CREATE(map) is cheap (~48-169us, paid per (re)map on a hit).
+// So: keep hot entries MAPPED, evict the IOVA mapping rarely, and NEVER re-inflate on a RAM hit.
+static int ork_stream_pool_enabled() {
+    static int e = -1;
+    if (e < 0) { const char * s = getenv("ORK_STREAM_POOL"); e = (s && s[0] && s[0] != '0') ? 1 : 0; }
+    return e;
+}
+static size_t ork_stream_ram_budget() {
+    static size_t b = 0;
+    if (!b) { const char * e = getenv("ORK_STREAM_RAM_BUDGET_MB"); b = (size_t)(e ? atoll(e) : 10240) * 1024 * 1024; }
+    return b;
+}
+
 // a packed quantized weight + its scales, kept NPU-resident and reused.
 //   int8 (W8A8):  gsize==0, bscale [N]            (per output channel)
 //   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
 struct ork_weight {
     ork_w * w = nullptr;
+    ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
     int gsize = 0;
     size_t   bytes = 0;       // resident NPU bytes (for the streaming LRU budget)
+    size_t   ram_bytes = 0;   // STREAM-POOL: RAM bytes held by `se` (for the RAM-LRU budget)
     uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
 };
 
@@ -203,6 +225,10 @@ struct ggml_backend_ork_context {
     std::unordered_map<const void *, ork_weight> wcache;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
+    // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
+    ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
+    size_t   spool_ram_bytes = 0;          // RAM bytes held across all stream entries (RAM-LRU budget)
+    long     spool_remaps = 0, spool_ram_evicts = 0, spool_iova_unmaps = 0;  // diagnostics
     // .orkpack persist (ORK_PERSIST=<path>): 0 off, 1 read (mmap'd), 2 write (building a .tmp)
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
@@ -288,6 +314,63 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
         ctx->wcache.erase(lru);
+    }
+}
+
+// ---- STREAM-POOL two-tier eviction ------------------------------------------------------------
+// IOVA tier (evict-RARE): unmap the LRU *mapped* stream entries until `need` more IOVA bytes fit under
+// the IOVA budget. The entry STAYS in RAM (next map is cheap, no re-inflate). Never unmaps a still-needed
+// entry — the op's own entry is mapped AFTER this call, so it isn't a candidate here.
+static void ork_spool_iova_evict(ggml_backend_ork_context * ctx, size_t need) {
+    const size_t budget = ork_wcache_budget();
+    while (ctx->wcache_bytes + need > budget) {
+        ork_weight * lru = nullptr; auto lru_it = ctx->wcache.end();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.se && ork_stream_entry_mapped(it->second.se) &&
+                (!lru || it->second.last_use < lru->last_use)) { lru = &it->second; lru_it = it; }
+        if (!lru) break;   // nothing mapped to evict
+        ork_stream_pool_unmap(ctx->spool, lru->se);
+        ctx->wcache_bytes -= lru->bytes; lru->bytes = 0; lru->w = nullptr;
+        ctx->spool_iova_unmaps++; (void) lru_it;
+    }
+}
+// Forcibly unmap the single LRU mapped entry (other than `keep`). Returns its freed bytes, or 0 if none.
+// Used to recover from a PRIME/MEM_CREATE import failure: the rk_iommu IOVA window fragments, so the
+// byte-budget can be met yet a fresh import still EFAULTs — drop more resident maps and retry.
+static size_t ork_spool_unmap_one_lru(ggml_backend_ork_context * ctx, ork_stream_entry * keep) {
+    ork_weight * lru = nullptr;
+    for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+        if (it->second.se && it->second.se != keep && ork_stream_entry_mapped(it->second.se) &&
+            (!lru || it->second.last_use < lru->last_use)) lru = &it->second;
+    if (!lru) return 0;
+    size_t freed = lru->bytes;
+    ork_stream_pool_unmap(ctx->spool, lru->se);
+    ctx->wcache_bytes -= lru->bytes; lru->bytes = 0; lru->w = nullptr;
+    ctx->spool_iova_unmaps++;
+    return freed ? freed : 1;
+}
+// Map an entry, retrying after dropping more LRU maps on import failure (IOVA fragmentation). 0 ok / -1.
+static int ork_spool_map_retry(ggml_backend_ork_context * ctx, ork_stream_entry * e) {
+    if (ork_stream_pool_map(ctx->spool, e) == 0) return 0;
+    while (ork_spool_unmap_one_lru(ctx, e))
+        if (ork_stream_pool_map(ctx->spool, e) == 0) return 0;
+    return -1;
+}
+// RAM tier: remove (free RAM) the LRU stream entries — and their wcache slot — until `need` more RAM
+// bytes fit under the RAM budget. Removing also unmaps if mapped (reclaims IOVA). The current op's entry
+// is created AFTER this call, so it is never a candidate. A re-touch of an evicted weight re-inflates.
+static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
+    const size_t budget = ork_stream_ram_budget();
+    while (ctx->spool_ram_bytes + need > budget && !ctx->wcache.empty()) {
+        auto lru = ctx->wcache.end();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.se && (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
+        if (lru == ctx->wcache.end()) break;
+        if (ork_stream_entry_mapped(lru->second.se)) ctx->wcache_bytes -= lru->second.bytes;
+        ork_stream_pool_remove(ctx->spool, lru->second.se);
+        ctx->spool_ram_bytes -= lru->second.ram_bytes;
+        ctx->wcache.erase(lru);
+        ctx->spool_ram_evicts++;
     }
 }
 
@@ -612,6 +695,35 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
 // Returns ctx->wcache.end() only on a pack/load failure; otherwise an iterator to the resident weight.
 // Caller does the LRU touch (it->second.last_use) and the matmul. Keying / dedup is by src0->data
 // (wcache) and src0->name (persist index / persist_dumped) — same keys both paths use, so no double-write.
+// STREAM-POOL: convert a freshly-resolved wcache entry (whose ow.w is a just-packed/loaded IOVA-resident
+// int8 weight) into a RAM-resident stream entry: dump the tiled int8 bytes, add to the pool (the ONE-TIME
+// inflate/copy held in RAM), free the temporary IOVA weight, then cheap-map it back to IOVA. RAM-evicts
+// first (budget by RAM), then IOVA-evicts (budget by the 4 GiB window). Returns false on failure (caller
+// keeps the plain IOVA weight as fallback — still correct, just not RAM-tiered). it->second.w holds the
+// temp weight on entry; on success se is set, w is the live mapped handle (NULL — run goes via se).
+static bool ork_spool_install(ggml_backend_ork_context * ctx,
+                              std::unordered_map<const void *, ork_weight>::iterator it, int K, int N) {
+    ork_weight & ow = it->second;
+    if (!ctx->spool || !ow.w) return false;
+    size_t need = ork_w_dump(ow.w, nullptr, 0);    // tiled int8 blob size
+    if (!need) return false;
+    std::vector<uint8_t> blob(need);
+    if (ork_w_dump(ow.w, blob.data(), need) != need) return false;
+    // Build the RAM-resident entry FIRST (don't free the temp IOVA weight until add succeeds — on failure
+    // e.g. N%32!=0 the entry stays a valid plain IOVA weight, so the matmul is still correct).
+    ork_spool_ram_evict(ctx, need);
+    ork_stream_entry * se = ork_stream_pool_add_i8(ctx->spool, K, N, blob.data(), need);
+    if (!se) return false;    // fall back to ow.w (still resident & counted)
+    // free the temp IOVA weight (it was counted in wcache_bytes by the caller); the RAM entry replaces it
+    ctx->wcache_bytes -= ow.bytes;
+    ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; ow.bytes = 0;
+    ow.se = se; ow.ram_bytes = ork_stream_entry_bytes(se); ctx->spool_ram_bytes += ow.ram_bytes;
+    ork_spool_iova_evict(ctx, ow.ram_bytes);
+    if (ork_spool_map_retry(ctx, se) != 0) return false;   // mapped-fail: entry in RAM, remap retried on next touch
+    ow.bytes = ow.ram_bytes; ctx->wcache_bytes += ow.bytes;
+    return true;
+}
+
 static std::unordered_map<const void *, ork_weight>::iterator
 ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
                       int K, int N, size_t nb01, enum ggml_type type, ggml_to_float_t to_float,
@@ -622,7 +734,19 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     // already-packed weight i-1 that the chain still references → use-after-free at submit.
     const char * x = (const char *) src0->data;
     auto it = ctx->wcache.find(x);
-    if (it != ctx->wcache.end()) return it;
+    if (it != ctx->wcache.end()) {
+        if (ctx->spool && it->second.se && !ork_stream_entry_mapped(it->second.se)) {
+            // STREAM-POOL hit, but IOVA-unmapped (evicted from the hot tier): re-map (cheap, ~170us;
+            // NO re-inflate). Make IOVA room first by unmapping the LRU mapped entries.
+            if (allow_evict) ork_spool_iova_evict(ctx, it->second.ram_bytes);
+            if (ork_spool_map_retry(ctx, it->second.se) == 0) {
+                it->second.bytes = it->second.ram_bytes;
+                ctx->wcache_bytes += it->second.bytes;
+                ctx->spool_remaps++;
+            } else return ctx->wcache.end();
+        }
+        return it;
+    }
 
     if (ctx->persist_mode == 1) {
         // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
@@ -650,6 +774,11 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
                     e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
                 ork_evict_src(x, (size_t) N * nb01);
+                // STREAM-POOL: move the loaded int8 weight into the RAM tier (int4 stays IOVA-resident —
+                // the pool stores inflated int8; converting it here would lose the RAM-size win).
+                if (ctx->spool && e.dtype == ORKPACK_DT_I8 && !ork_spool_install(ctx, it, K, N)) {
+                    if (!it->second.w && !it->second.se) { ctx->wcache.erase(it); return ctx->wcache.end(); }
+                }
                 return it;
             }
         }
@@ -684,6 +813,10 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     ctx->wcache_bytes += it->second.bytes;
     ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
+    // STREAM-POOL: move the just-packed int8 weight into the RAM tier (cheap remaps on future hits).
+    if (ctx->spool && !ork_spool_install(ctx, it, K, N)) {
+        if (!it->second.w && !it->second.se) { ctx->wcache.erase(it); return ctx->wcache.end(); }
+    }
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n",
         ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, (const void *) x);
     return it;
@@ -734,6 +867,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
         int32_t * ci  = ctx->ci.data();
 
         std::vector<ork_mm_task_i8> tasks;
+        std::vector<ork_stream_entry *> task_se;   // STREAM-POOL: per-task RAM-resident entry (NULL = plain ow.w)
 
         const double t0 = ctx->profile ? ork_now_us() : 0;
 
@@ -791,6 +925,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 ai + t * M_padded * K,
                 ci + t * M_padded * N
             });
+            task_se.push_back(ow.se);
         }
 
         const double t1 = ctx->profile ? ork_now_us() : 0;
@@ -798,7 +933,14 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
         if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain: M=%d, tasks=%zu (S=%d, K=%d, N=%d)\n", M, tasks.size(), S, K, N);
         fflush(stderr);
         int ok = -1;
-        if (tasks.size() == 1) {
+        if (ctx->spool && task_se[0]) {
+            // STREAM-POOL: each weight is a RAM-resident entry mapped to IOVA; run per-task (correctness
+            // first — the chain co-residency contract is met by all entries staying mapped here).
+            ok = 0;
+            for (size_t t = 0; t < tasks.size(); t++)
+                if (ork_stream_pool_run(ctx->spool, task_se[t], tasks[t].M, tasks[t].A, tasks[t].C)) { ok = -1; break; }
+            if (ok != 0) return false;
+        } else if (tasks.size() == 1) {
             ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
         } else {
             ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
@@ -1304,8 +1446,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
             }
         }
     }
+    if (ctx->spool)
+        fprintf(stderr, "[ork STREAM-POOL] entries=%zu | RAM held=%.2f GiB | IOVA mapped=%.2f GiB | remaps(cheap)=%ld IOVA-unmaps=%ld RAM-evicts=%ld\n",
+            ctx->wcache.size(), ctx->spool_ram_bytes/(1024.0*1024.0*1024.0), ctx->wcache_bytes/(1024.0*1024.0*1024.0),
+            ctx->spool_remaps, ctx->spool_iova_unmaps, ctx->spool_ram_evicts);
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
-    for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
+    if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
+    for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
@@ -2525,7 +2672,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             case GGML_OP_MUL_MAT: {
                 std::vector<struct ggml_tensor *> chain_nodes;
                 ork_chain_type type = get_node_chain_type(ctx, node);
-                
+
+                // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
+                // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
+                // co-resident under allow_evict=false, which the RAM/IOVA tiering can't guarantee).
+                if (ctx->spool) type = ORK_CHAIN_NONE;
+
                 if (type != ORK_CHAIN_NONE && node->ne[2] == 1 && node->ne[3] == 1) {
                     chain_nodes.push_back(node);
                     while (i + chain_nodes.size() < cgraph->n_nodes && chain_nodes.size() < 32) {
@@ -2651,6 +2803,12 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
+    if (ork_stream_pool_enabled()) {
+        ctx->spool = ork_stream_pool_create(ctx->npu);   // NULL if dma-heap import unavailable -> plain wcache
+        if (ctx->spool) fprintf(stderr, "[ork] STREAM-POOL enabled: RAM budget %zu MB, IOVA budget %zu MB\n",
+                                ork_stream_ram_budget()>>20, ork_wcache_budget()>>20);
+        else fprintf(stderr, "[ork] STREAM-POOL requested but import unavailable — falling back to plain wcache\n");
+    }
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
