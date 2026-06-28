@@ -1937,6 +1937,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
+            #pragma omp parallel for if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
                     const float * yr = y + (size_t) m*K;

@@ -25,3 +25,11 @@ target_link_libraries     (ggml-ork PRIVATE Threads::Threads)
 set_source_files_properties(
     ${ORK_DIR}/src/npu.c ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
     PROPERTIES LANGUAGE C)
+
+# Activation int8-quant in ggml-ork.cpp is parallelized with #pragma omp parallel for (per-row,
+# independent). The pragmas are no-ops unless OpenMP is linked into THIS target (ggml-base linking it
+# does not propagate here). Link it so prefill activation-quant runs multi-threaded.
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_CXX)
+endif()
