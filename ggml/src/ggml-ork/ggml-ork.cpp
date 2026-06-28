@@ -706,21 +706,21 @@ static bool ork_spool_install(ggml_backend_ork_context * ctx,
     ork_weight & ow = it->second;
     if (!ctx->spool || !ow.w) return false;
     size_t need = ork_w_dump(ow.w, nullptr, 0);    // tiled int8 blob size
-    if (!need) return false;
+    if (!need) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[spoolinst] FAIL dump0 K=%d N=%d\n",K,N); return false; }
     std::vector<uint8_t> blob(need);
     if (ork_w_dump(ow.w, blob.data(), need) != need) return false;
     // Build the RAM-resident entry FIRST (don't free the temp IOVA weight until add succeeds — on failure
     // e.g. N%32!=0 the entry stays a valid plain IOVA weight, so the matmul is still correct).
     ork_spool_ram_evict(ctx, need);
     ork_stream_entry * se = ork_stream_pool_add_i8(ctx->spool, K, N, blob.data(), need);
-    if (!se) return false;    // fall back to ow.w (still resident & counted)
+    if (!se) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[spoolinst] FAIL add_i8 K=%d N=%d need=%zu\n",K,N,need); return false; }
     // free the temp IOVA weight (it was counted in wcache_bytes by the caller); the RAM entry replaces it
     ctx->wcache_bytes -= ow.bytes;
     ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; ow.bytes = 0;
     ow.se = se; ow.ram_bytes = ork_stream_entry_bytes(se); ctx->spool_ram_bytes += ow.ram_bytes;
     ork_spool_iova_evict(ctx, ow.ram_bytes);
-    if (ork_spool_map_retry(ctx, se) != 0) return false;   // mapped-fail: entry in RAM, remap retried on next touch
-    ow.bytes = ow.ram_bytes; ctx->wcache_bytes += ow.bytes;
+    if (ork_spool_map_retry(ctx, se) != 0) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[spoolinst] FAIL mapretry K=%d N=%d\n",K,N); return false; }   // mapped-fail: entry in RAM, remap retried on next touch
+    ow.bytes = ow.ram_bytes; ctx->wcache_bytes += ow.bytes; if(getenv("ORK_VERBOSE"))fprintf(stderr,"[spoolinst] OK K=%d N=%d ram=%zu\n",K,N,ow.ram_bytes);
     return true;
 }
 
@@ -2906,7 +2906,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const char * name = src0->name;
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
             fflush(stderr);
-            if (strstr(name, "output") || strstr(name, "lm_head") || N > 16384) {
+            if (strstr(name, "output") || strstr(name, "lm_head") || N > (getenv("ORK_MAXN")?atoi(getenv("ORK_MAXN")):16384)) {
                 return false;
             }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
