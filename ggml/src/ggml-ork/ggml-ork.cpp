@@ -2744,13 +2744,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
-            // Explicitly block output and lm_head (vocabulary projection) layers from offloading to NPU.
-            // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
-            // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
+            // N-cap: very wide matmuls (lm_head/output N~152k) blow up DMA/IOVA and can hang the driver, so
+            // keep them on CPU. Default cap 16384 EXCLUDES the FFN gate/up (N=intermediate, e.g. 18944); raise
+            // it (ORK_MAXN=20000) so the whole FFN resides on the NPU and gate/up offload too.
             const char * name = src0->name;
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
             fflush(stderr);
-            if (strstr(name, "output") || strstr(name, "lm_head") || N > 16384) {
+            static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 16384;
+            // LEVER D: dropped the strstr("output")/strstr("lm_head") guard — it over-matched attn_output.weight
+            // (a normal [3584,3584] matmul, N=3584), wrongly declining it to CPU. The real lm_head (output.weight,
+            // N=152064) stays excluded by N>max_n. Validated +12.6% prefill (pp256 35.79->40.2), bit-exact.
+            if (N > max_n) {
                 return false;
             }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
@@ -2796,7 +2800,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
-            return pass_m_threshold &&
+            bool ork_accept = pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
@@ -2804,6 +2808,11 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                    src1->ne[2] % src0->ne[2] == 0 &&
                    src1->ne[3] % src0->ne[3] == 0 &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
+            // LEVER D: confirm attn_output now reaches the NPU (it was wrongly declined by the old strstr guard).
+            if (getenv("ORK_VERBOSE") && name && strstr(name, "attn_output"))
+                fprintf(stderr, "[ORK LEVERD attn_output] M=%ld N=%ld pass_m=%d -> ACCEPT=%d\n",
+                        (long)M, (long)N, (int)pass_m_threshold, (int)ork_accept);
+            return ork_accept;
         }
         case GGML_OP_MUL_MAT_ID: {
             // MoE expert offload to the NPU (hot-expert partition: conforming-K experts go NPU-resident
