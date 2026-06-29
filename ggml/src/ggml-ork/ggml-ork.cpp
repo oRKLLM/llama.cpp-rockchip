@@ -204,6 +204,18 @@ struct ggml_backend_ork_context {
     std::unordered_map<const void *, ork_weight> wcache;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
+    // ---- MULTI-DOMAIN RESIDENCE (ORK_DOMAINS / ORK_DOMAIN_LAYERS) ----
+    // The rk_iommu 32-bit IOVA cap (~4 GiB) is PER iommu_domain_id, so a model bigger than 4 GiB stays
+    // FULLY resident (no streaming, no per-token map/unmap) by spreading its layers' weights across
+    // domains. n_domains>1 enables it: each weight's domain = min(layer_idx / domain_layers, n_domains-1)
+    // (non-blk tensors -> domain 0). ork_npu_set_pack_domain places the resident tiles there and the
+    // matmul submits against that domain. Per-domain resident totals are tracked for the load report.
+    // Run with ORK_WCACHE_BUDGET_MB >> model so the residence never evicts. Default n_domains=1 = off.
+    int    n_domains = 1;        // ORK_DOMAINS (default 1 = off)
+    int    domain_layers = 0;    // ORK_DOMAIN_LAYERS (layers per domain; 0 = auto from ORK_DOMAINS+max layer)
+    size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
+    long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
+    int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     // .orkpack persist (ORK_PERSIST=<path>): 0 off, 1 read (mmap'd), 2 write (building a .tmp)
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
@@ -284,6 +296,22 @@ struct ggml_backend_ork_context {
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
+
+// MULTI-DOMAIN RESIDENCE: pick the IOMMU domain a weight should reside in from its tensor name.
+// "blk.<i>.<...>" -> domain = min(i / domain_layers, n_domains-1); anything else -> domain 0.
+// domain_layers defaults (when ORK_DOMAIN_LAYERS unset) to ceil(28 / n_domains) (Qwen2.5-7B = 28 layers);
+// for a different layer count pass ORK_DOMAIN_LAYERS explicitly. Returns 0 when multi-domain is off.
+static int ork_weight_domain(ggml_backend_ork_context * ctx, const char * name) {
+    if (ctx->n_domains <= 1 || !name) return 0;
+    int layer = -1;
+    if (strncmp(name, "blk.", 4) == 0) layer = atoi(name + 4);
+    if (layer < 0) return 0;   // token_embd / output / norms -> domain 0
+    int dl = ctx->domain_layers;
+    if (dl <= 0) dl = (28 + ctx->n_domains - 1) / ctx->n_domains;
+    int d = layer / dl;
+    if (d >= ctx->n_domains) d = ctx->n_domains - 1;
+    return d;
+}
 
 // Evict least-recently-used weights (reclaiming IOVA via ork_mm_free) until `need` more bytes fit under
 // the budget. Only per-tile-owned weights (int8 / per-channel int4) actually return IOVA; the current
@@ -645,6 +673,9 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
+            const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
+            ork_npu_set_pack_domain(ctx->npu, _dom);
+            if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             if (e.dtype == ORKPACK_DT_I4) {
                 ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
                 if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
@@ -657,6 +688,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
                 it->second.bytes = ork_w_bytes(it->second.w);
                 ctx->wcache_bytes += it->second.bytes;
+                if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
                 ctx->persist_hits++;
                 if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
                     e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
@@ -688,11 +720,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         }
     }
     if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);   // stream: free IOVA room before packing (int8 ~K*N bytes)
+    const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
+    ork_npu_set_pack_domain(ctx->npu, _dom);
+    if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
     if (!ow.w) return ctx->wcache.end();
     it = ctx->wcache.emplace(x, std::move(ow)).first;
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
+    if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
     ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n",
@@ -1303,6 +1339,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if (ctx->phase_evict)
         fprintf(stderr, "[ORK PHASE EVICT] backbone bulk-frees=%ld total-freed=%.3f GiB\n",
             ctx->backbone_evicts, ctx->backbone_evict_bytes / (1024.0*1024.0*1024.0));
+    if (ctx->n_domains > 1) {
+        size_t tot = 0; for (int d = 0; d < ctx->n_domains; d++) tot += ctx->domain_bytes[d];
+        fprintf(stderr, "[ork RESIDENT] final: %.2f GiB resident across %d domains; per-token pack/load (churn) = %ld (target 0)\n",
+            tot / (1024.0*1024.0*1024.0), ctx->n_domains, ctx->mem_create_runtime);
+        for (int d = 0; d < ctx->n_domains; d++)
+            fprintf(stderr, "[ork RESIDENT]   domain %d: %.2f GiB\n", d, ctx->domain_bytes[d] / (1024.0*1024.0*1024.0));
+    }
     if (const char * fp = getenv("ORK_MOE_PROFILE_FREQ")) {
         if (!ctx->moe_freq.empty()) {
             FILE * f = fopen(fp, "w");
@@ -2600,6 +2643,24 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
+    // MULTI-DOMAIN RESIDENCE: the FIRST decode graph (max matmul M==1) means the full prefill has run and
+    // every weight is now resident; from here ANY further pack/load is per-token churn (the thing this
+    // eliminates). Clear load_phase + report the per-domain resident split, once.
+    if (ctx->n_domains > 1 && ctx->load_phase) {
+        int64_t max_m = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const struct ggml_tensor * nd = cgraph->nodes[i];
+            if ((nd->op == GGML_OP_MUL_MAT || nd->op == GGML_OP_MUL_MAT_ID) && nd->ne[1] > max_m) max_m = nd->ne[1];
+        }
+        if (max_m == 1) {
+            ctx->load_phase = 0;
+            size_t tot = 0; for (int d = 0; d < ctx->n_domains; d++) tot += ctx->domain_bytes[d];
+            fprintf(stderr, "[ork RESIDENT] full model resident: %.2f GiB across %d domains:\n",
+                    tot / (1024.0*1024.0*1024.0), ctx->n_domains);
+            for (int d = 0; d < ctx->n_domains; d++)
+                fprintf(stderr, "[ork RESIDENT]   domain %d: %.2f GiB\n", d, ctx->domain_bytes[d] / (1024.0*1024.0*1024.0));
+        }
+    }
     // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): detect the prefill->decode phase boundary and BULK-FREE the
     // resident dense-backbone wcache, reclaiming its IOVA (~2.8 GiB) for the MoE hot-expert cache. We
     // classify this graph by its max matmul M: M>1 = prefill, M==1 = decode. A clean bulk free at the
@@ -2759,6 +2820,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     ctx->overlap = env_enabled("ORK_OVERLAP");   // LEVER C: CPU‖NPU dequant/submit pipeline (default OFF)
+    // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
+    // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
+    // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
+    // residence never evicts. The ork-driver side (set_pack_domain / per-domain submit scratch) is in 0.6.x.
+    { const char * nd = getenv("ORK_DOMAINS"); ctx->n_domains = nd ? atoi(nd) : 1; if (ctx->n_domains < 1) ctx->n_domains = 1; if (ctx->n_domains > 16) ctx->n_domains = 16;
+      const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0;
+      if (ctx->n_domains > 1) fprintf(stderr, "[ork] MULTI-DOMAIN RESIDENCE: %d domains, %d layers/domain (0=auto), wcache budget %zu MB\n",
+            ctx->n_domains, ctx->domain_layers, ork_wcache_budget()>>20); }
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
