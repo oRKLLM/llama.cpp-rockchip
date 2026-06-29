@@ -265,6 +265,16 @@ struct ggml_backend_ork_context {
     // freed IOVA goes to experts; the next prefill repopulates it. A clean bulk free (not incremental LRU)
     // avoids rk_iommu fragmentation. last_graph_decode tracks the previous graph's phase for the boundary.
     int  phase_evict = 0;        // ORK_MOE_PHASE_EVICT (cached at init)
+    // ---- LEVER C: CPU‖NPU pipeline overlap (ORK_OVERLAP, default OFF) ----
+    // The dense chain (QKV / ffn gate+up) normally runs as ONE batched run_chain_i8 submit, then
+    // dequantizes every task. With overlap on, the chain is instead software-pipelined as a sequence
+    // of per-task async submits (ork_mm_run_i8_async): while task i's NPU submit is in flight on the
+    // ork worker thread, the calling thread dequantizes task i-1 (independent CPU work — different,
+    // already-completed output). EXACTLY ONE async job is in flight at any instant (the NPU is
+    // single-stream), so this never races the submit domain / per-core scratch and cannot double-submit.
+    // Numerics are bit-identical: same int8 inputs, and per-task ork_mm_run_i8 == the chain fallback.
+    int  overlap = 0;            // ORK_OVERLAP (cached at init)
+    long overlap_chains = 0;     // diagnostics: chains run via the pipelined path
     int  last_graph_decode = -1; // -1 unknown; 0 prefill (max M>1); 1 decode (max M==1)
     long backbone_evicts = 0; size_t backbone_evict_bytes = 0;  // diagnostics
     // ---- EXPERIMENT: routing-frequency profiler (ORK_MOE_PROFILE_FREQ=<file>) ----
@@ -1239,6 +1249,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         GGML_LOG_INFO("ork profile: %ld matmuls | quant %.0fms (%.0f%%) run %.0fms (%.0f%%) dequant %.0fms (%.0f%%) | %.1f us/matmul (run %.1f us)\n",
             ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/tot, ctx->t_run/1e3, 100*ctx->t_run/tot,
             ctx->t_deq/1e3, 100*ctx->t_deq/tot, tot/ctx->n_mm, ctx->t_run/ctx->n_mm);
+        if (ctx->overlap) GGML_LOG_INFO("ork profile: LEVER C overlap ON — %ld dense chains pipelined (per-task async submit ‖ prev dequant)\n", ctx->overlap_chains);
         if (ctx->n_dec) GGML_LOG_INFO("ork profile: decode  (M=1)  %ld matmuls, run %.1f us/matmul\n", ctx->n_dec, ctx->t_run_dec/ctx->n_dec);
         if (ctx->n_pf)  GGML_LOG_INFO("ork profile: prefill (M>1) %ld matmuls, avgM %.1f, run %.1f us/matmul (%.2f us/row)\n",
             ctx->n_pf, (double)ctx->m_pf/ctx->n_pf, ctx->t_run_pf/ctx->n_pf, ctx->t_run_pf/ctx->m_pf);
@@ -1731,9 +1742,103 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
 
     const double t1 = ctx->profile ? ork_now_us() : 0;
 
+    // Per-task dequant: C_int32 (tasks[i].C, = ci_base + i's slice) * bscale * act-scale -> dst f32.
+    // Identical math to the post-submit loop below; factored out so the overlap pipeline can run it on
+    // task i-1's (already-completed) output while task i's submit is in flight. Bit-exact either way.
+    auto dequant_task = [&](int i) {
+        struct ggml_tensor * dst = nodes[i];
+        const char * x = (const char *) dst->src[0]->data;
+        const struct ggml_tensor * src1 = dst->src[1];
+        float * d = (float *) dst->data;
+        int N = dst->src[0]->ne[1];
+        int Mt = dst->src[1]->ne[1];
+        auto it = ctx->wcache.find(x);
+        const float * bs = it->second.bscale.data();
+        const float * task_as = chain_act_cache.find(src1->data)->second.second;
+        const int32_t * ctr = tasks[i].C;
+        for (int m = 0; m < Mt; m++) {
+            const float rs = task_as[m];
+            const int32_t * cr = ctr + (size_t) m*N;
+            float * dr = d + (size_t) m*N;
+#if defined(__ARM_NEON)
+            float32x4_t v_rs = vdupq_n_f32(rs);
+            int n = 0;
+            for (; n <= N - 8; n += 8) {
+                int32x4_t v_cr0 = vld1q_s32(cr + n);
+                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
+                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
+                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
+                float32x4_t v_bs0 = vld1q_f32(bs + n);
+                float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
+                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
+                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
+                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
+                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
+                vst1q_f32(dr + n, v_dr0);
+                vst1q_f32(dr + n + 4, v_dr1);
+            }
+            for (; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+#else
+            for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+#endif
+        }
+    };
+
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
     fflush(stderr);
-    
+
+    // LEVER C overlap path: pipeline per-task async submits so each task's NPU submit is hidden behind
+    // the previous task's CPU dequant. Exactly one async job is ever in flight (single-stream NPU
+    // contract). On ANY async-launch failure we wait out the in-flight job and fall back to the proven
+    // batched submit below — never two submits at once, never a leaked handle.
+    if (ctx->overlap && tasks.size() >= 2) {
+        ctx->overlap_chains++;
+        bool failed = false;
+        ork_async * h = ork_mm_run_i8_async(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+        if (!h) {
+            failed = true;   // couldn't launch -> nothing in flight, fall through to batched path
+        } else {
+            for (size_t i = 1; i < tasks.size(); i++) {
+                if (ork_async_wait(h) != 0) { h = nullptr; failed = true; break; }  // task i-1 done
+                h = ork_mm_run_i8_async(ctx->npu, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
+                if (!h) { failed = true; break; }      // i-1 already waited; nothing in flight
+                dequant_task((int) i - 1);             // CPU dequant(i-1) ‖ NPU submit(i)
+            }
+            if (!failed) {
+                if (ork_async_wait(h) != 0) failed = true;   // last submit
+                else dequant_task((int) tasks.size() - 1);
+            }
+        }
+        if (!failed) {
+            // Profile + no_cache bookkeeping mirror the batched path's tail, then we're done.
+            if (ctx->profile) {
+                double t3 = ork_now_us();
+                ctx->t_quant += t1 - t0;
+                // submit/dequant are interleaved here; attribute the combined wall to t_run (NPU-bound).
+                ctx->t_run   += t3 - t1;
+                ctx->n_mm    += count;
+                for (int i = 0; i < count; i++) {
+                    int Mi = nodes[i]->src[1]->ne[1];
+                    double part_run = (t3 - t1) / count;
+                    if (Mi > 1) { ctx->t_run_pf += part_run; ctx->n_pf += 1; ctx->m_pf += Mi; }
+                    else        { ctx->t_run_dec += part_run; ctx->n_dec += 1; }
+                }
+            }
+            if (ctx->no_cache) {
+                for (int i = 0; i < count; i++) {
+                    const char * x = (const char *) nodes[i]->src[0]->data;
+                    auto it = ctx->wcache.find(x);
+                    if (it != ctx->wcache.end()) { ork_w_free(it->second.w); ctx->wcache.erase(it); }
+                }
+            }
+            return true;
+        }
+        // Overlap failed mid-pipeline: any in-flight job has been waited out (h==nullptr or never
+        // launched). Some tasks' dst may already hold correct dequantized data; the batched fallback
+        // below recomputes all of them, which is harmless (idempotent: same inputs -> same outputs).
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] overlap pipeline failed, falling back to batched\n");
+    }
+
     int ok = 0;
     if (tasks.size() == 1) {
         ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
@@ -2653,6 +2758,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     }
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
+    ctx->overlap = env_enabled("ORK_OVERLAP");   // LEVER C: CPU‖NPU dequant/submit pipeline (default OFF)
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
