@@ -86,6 +86,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <map>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>   // LEVER3: atexit
 #include <cmath>
 #include <ctime>
 #include <utility>
@@ -263,6 +264,7 @@ struct ggml_backend_ork_context {
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
+    double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
     // STREAMING sub-breakdown (ORK_PROFILE): where weight-resolution time goes for the 7B streamed prefill.
     // These split the t_quant bucket's weight-side from the activation-quant. Microseconds.
@@ -971,12 +973,59 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 // activation: per-row int8 quant with shape padding
                 int8_t * ar = ai + t * M_padded * K;
                 float * asr = as + t * M_padded;
+                const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time pure act-quant arithmetic
                 #pragma omp parallel for if (M_padded >= 16)
                 for (int m = 0; m < M_padded; m++) {
                     if (m < M) {
                         const float * yr = y + (size_t) m*K;
                         int8_t * amr = ar + (size_t) m*K;
                         float mx = 1e-9f;
+#if defined(__ARM_NEON)
+                        // pass 1: vectorized abs-max reduction across K.
+                        // float max is exact + order-independent, so the lane
+                        // ordering does not change the result vs the scalar loop.
+                        int k = 0;
+                        float32x4_t v_mx0 = vdupq_n_f32(mx);
+                        float32x4_t v_mx1 = vdupq_n_f32(mx);
+                        for (; k <= K - 8; k += 8) {
+                            v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+                            v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+                        }
+                        mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+                        for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                        asr[m] = mx / 127.0f;
+                        const float inv = 127.0f / mx;
+                        // pass 2: vectorized quantize. Replicates the scalar
+                        // round-half-away-from-zero EXACTLY: half = copysign(0.5,q)
+                        // (sign bit of q OR'd into +0.5), q+half in float, then
+                        // truncate toward zero (vcvtq_s32_f32), clamp to [-127,127].
+                        const float32x4_t v_inv  = vdupq_n_f32(inv);
+                        const float32x4_t v_half = vdupq_n_f32(0.5f);
+                        const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+                        const int32x4_t   v_hi   = vdupq_n_s32(127);
+                        const int32x4_t   v_lo   = vdupq_n_s32(-127);
+                        k = 0;
+                        for (; k <= K - 8; k += 8) {
+                            float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+                            float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+                            // copysignf(0.5f, q): OR the sign bit of q into 0.5
+                            float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+                            float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+                            // q + half, then truncate toward zero (matches (int) cast)
+                            int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+                            int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+                            // clamp to [-127,127] in int32, then narrow to int8
+                            v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+                            v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+                            int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+                            vst1_s8(amr + k, vmovn_s16(v_s16));
+                        }
+                        for (; k < K; k++) {
+                            float q = yr[k] * inv;
+                            int qi = (int) (q + copysignf(0.5f, q));
+                            amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                        }
+#else
                         for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
                         asr[m] = mx / 127.0f;
                         const float inv = 127.0f / mx;
@@ -985,11 +1034,13 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                             int qi = (int) (q + copysignf(0.5f, q));
                             amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                         }
+#endif
                     } else {
                         memset(ar + (size_t) m*K, 0, K);
                         asr[m] = 0.0f;
                     }
                 }
+                if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
                 ctx->last_src1 = y;
                 ctx->last_M = M;
                 ctx->last_K = K;
@@ -1452,9 +1503,14 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
 static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "ORK"; GGML_UNUSED(backend); }
 
-static void ggml_backend_ork_free(ggml_backend_t backend) {
-    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+// LEVER3: profile dump, callable from backend free OR atexit (llama-bench never frees the backend).
+static int g_ork_prof_dumped = 0;
+static void ork_profile_dump(ggml_backend_ork_context * ctx) {
+    if (!ctx || g_ork_prof_dumped) return;
+    if (ctx->profile) fprintf(stderr, "[ork DUMP] profile=%d n_mm=%ld t_quant=%.0fms t_run=%.0fms t_deq=%.0fms t_actq=%.0fms\n",
+                              ctx->profile, ctx->n_mm, ctx->t_quant/1e3, ctx->t_run/1e3, ctx->t_deq/1e3, ctx->t_actq/1e3);
     if (ctx->profile && ctx->n_mm) {
+        g_ork_prof_dumped = 1;
         double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
         GGML_LOG_INFO("ork profile: %ld matmuls | quant %.0fms (%.0f%%) run %.0fms (%.0f%%) dequant %.0fms (%.0f%%) | %.1f us/matmul (run %.1f us)\n",
             ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/tot, ctx->t_run/1e3, 100*ctx->t_run/tot,
@@ -1475,6 +1531,16 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
                 ctx->spool_remaps, ctx->spool_ram_evicts, ctx->spool_iova_unmaps);
             fprintf(stderr, "[ork STREAM] resolve-split: dequant(src->f32) %.0fms tile(f32->i8) %.0fms pack(i8->IOVA) %.0fms | load(.orkpack) %.0fms install(inflate+map) %.0fms remap(MEM_CREATE) %.0fms\n",
                 ctx->s_dequant/1e3, ctx->s_tile/1e3, ctx->s_pack/1e3, ctx->s_load/1e3, ctx->s_install/1e3, ctx->s_remap/1e3);
+            // LEVER3: split the t_quant bucket into pure activation-quant ARITHMETIC (NEON absmax+quantize loop),
+            // weight RESOLVE (s_resolve), and the remaining act-side MISC (t_quant - actq - resolve = vector
+            // setup/realloc/loop overhead not inside the timed loop). Answers: is the bucket arithmetic or misc?
+            {
+                double actq = ctx->t_actq, resolve_in_q = sr;   // both measured inside the t0..t1 window
+                double misc = ctx->t_quant - actq - resolve_in_q; if (misc < 0) misc = 0;
+                double W = ctx->t_quant + gtot;
+                fprintf(stderr, "[ork ACTQ] t_quant=%.0fms = arith(NEON absmax+quant) %.0fms (%.0f%% of wall) + resolve %.0fms (%.0f%%) + misc %.0fms (%.0f%%) | act-quant calls=%ld\n",
+                    ctx->t_quant/1e3, actq/1e3, 100*actq/W, resolve_in_q/1e3, 100*resolve_in_q/W, misc/1e3, 100*misc/W, ctx->n_actq);
+            }
         }
         if (ctx->moe_calls) {
             double mt = ctx->moe_prequant + ctx->moe_pack + ctx->moe_gather + ctx->moe_chain + ctx->moe_scatter;
@@ -1513,6 +1579,12 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
                 rt_tot/rt_n, rt_s/rt_n, rt_sub/rt_n, rt_cp/rt_n);
         }
     }
+}
+// LEVER3: atexit shim — fires the profile dump even when llama-bench never calls backend free.
+static void ork_profile_atexit(void) { ork_profile_dump(g_ork_ctx); }
+static void ggml_backend_ork_free(ggml_backend_t backend) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    ork_profile_dump(ctx);
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
     ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
     if (ctx->persist_mode) fprintf(stderr, "[ORK PERSIST] this run: loaded %ld from disk, packed %ld\n", ctx->persist_hits, ctx->persist_misses);
@@ -1937,6 +2009,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
+            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (SCALAR — lever2 NEON not applied here!)
             #pragma omp parallel for if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
@@ -1956,6 +2029,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
                     task_as[m] = 0.0f;
                 }
             }
+            if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
             chain_act_cache[src1->data] = {task_A, task_as};
             ai_offset += (size_t)M_padded * K;
             as_offset += (size_t)M_padded;
@@ -2917,6 +2991,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
+    if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
@@ -3037,7 +3112,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // keep them on CPU. Default cap 16384 EXCLUDES the FFN gate/up (N=intermediate, e.g. 18944) — for
             // the multi-domain FULL-RESIDENCE test raise it (ORK_MAXN=20000) so the whole FFN resides on NPU.
             static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 16384;
-            if (strstr(name, "output") || strstr(name, "lm_head") || N > max_n) {
+            // LEVER D: dropped strstr("output")/strstr("lm_head") over-match (it wrongly declined attn_output.weight,
+            // a normal [3584,3584] matmul N=3584). Real lm_head (output.weight N=152064) still excluded by N>max_n.
+            if (N > max_n) {
                 return false;
             }
             // Measured (RK3588, Qwen3-1.7B-w8a8): the ~365us/matmul NPU submit floor makes per-token
@@ -3083,14 +3160,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
-            return pass_m_threshold &&
+            bool ork_accept = pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
-                   K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
+                   K % 32 == 0 && N % 64 == 0 &&
                    K >= 32 &&
                    src1->ne[2] % src0->ne[2] == 0 &&
                    src1->ne[3] % src0->ne[3] == 0 &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
+            if (getenv("ORK_VERBOSE") && name && strstr(name, "attn_output"))
+                fprintf(stderr, "[ORK LEVERD attn_output] M=%ld contigSrc0=%d contigSrc1=%d pass_m=%d -> ACCEPT=%d\n", (long)M, (int)ggml_is_contiguous(src0), (int)ggml_is_contiguous(src1), (int)pass_m_threshold, (int)ork_accept);
+            return ork_accept;
         }
         case GGML_OP_MUL_MAT_ID: {
             // MoE expert offload to the NPU (hot-expert partition: conforming-K experts go NPU-resident
