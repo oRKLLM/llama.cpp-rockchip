@@ -765,6 +765,52 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                         const float * yr = y + (size_t) m*K;
                         int8_t * amr = ar + (size_t) m*K;
                         float mx = 1e-9f;
+#if defined(__ARM_NEON)
+                        // pass 1: vectorized abs-max reduction across K.
+                        // float max is exact + order-independent, so the lane
+                        // ordering does not change the result vs the scalar loop.
+                        int k = 0;
+                        float32x4_t v_mx0 = vdupq_n_f32(mx);
+                        float32x4_t v_mx1 = vdupq_n_f32(mx);
+                        for (; k <= K - 8; k += 8) {
+                            v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+                            v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+                        }
+                        mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+                        for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                        asr[m] = mx / 127.0f;
+                        const float inv = 127.0f / mx;
+                        // pass 2: vectorized quantize. Replicates the scalar
+                        // round-half-away-from-zero EXACTLY: half = copysign(0.5,q)
+                        // (sign bit of q OR'd into +0.5), q+half in float, then
+                        // truncate toward zero (vcvtq_s32_f32), clamp to [-127,127].
+                        const float32x4_t v_inv  = vdupq_n_f32(inv);
+                        const float32x4_t v_half = vdupq_n_f32(0.5f);
+                        const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+                        const int32x4_t   v_hi   = vdupq_n_s32(127);
+                        const int32x4_t   v_lo   = vdupq_n_s32(-127);
+                        k = 0;
+                        for (; k <= K - 8; k += 8) {
+                            float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+                            float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+                            // copysignf(0.5f, q): OR the sign bit of q into 0.5
+                            float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+                            float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+                            // q + half, then truncate toward zero (matches (int) cast)
+                            int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+                            int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+                            // clamp to [-127,127] in int32, then narrow to int8
+                            v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+                            v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+                            int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+                            vst1_s8(amr + k, vmovn_s16(v_s16));
+                        }
+                        for (; k < K; k++) {
+                            float q = yr[k] * inv;
+                            int qi = (int) (q + copysignf(0.5f, q));
+                            amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                        }
+#else
                         for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
                         asr[m] = mx / 127.0f;
                         const float inv = 127.0f / mx;
@@ -773,6 +819,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                             int qi = (int) (q + copysignf(0.5f, q));
                             amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                         }
+#endif
                     } else {
                         memset(ar + (size_t) m*K, 0, K);
                         asr[m] = 0.0f;
@@ -1701,6 +1748,52 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
                     const float * yr = y + (size_t) m*K;
                     int8_t * amr = task_A + (size_t) m*K;
                     float mx = 1e-9f;
+#if defined(__ARM_NEON)
+                    // pass 1: vectorized abs-max reduction across K.
+                    // float max is exact + order-independent, so the lane
+                    // ordering does not change the result vs the scalar loop.
+                    int k = 0;
+                    float32x4_t v_mx0 = vdupq_n_f32(mx);
+                    float32x4_t v_mx1 = vdupq_n_f32(mx);
+                    for (; k <= K - 8; k += 8) {
+                        v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+                        v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+                    }
+                    mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+                    for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                    task_as[m] = mx / 127.0f;
+                    const float inv = 127.0f / mx;
+                    // pass 2: vectorized quantize. Replicates the scalar
+                    // round-half-away-from-zero EXACTLY: half = copysign(0.5,q)
+                    // (sign bit of q OR'd into +0.5), q+half in float, then
+                    // truncate toward zero (vcvtq_s32_f32), clamp to [-127,127].
+                    const float32x4_t v_inv  = vdupq_n_f32(inv);
+                    const float32x4_t v_half = vdupq_n_f32(0.5f);
+                    const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+                    const int32x4_t   v_hi   = vdupq_n_s32(127);
+                    const int32x4_t   v_lo   = vdupq_n_s32(-127);
+                    k = 0;
+                    for (; k <= K - 8; k += 8) {
+                        float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+                        float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+                        // copysignf(0.5f, q): OR the sign bit of q into 0.5
+                        float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+                        float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+                        // q + half, then truncate toward zero (matches (int) cast)
+                        int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+                        int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+                        // clamp to [-127,127] in int32, then narrow to int8
+                        v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+                        v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+                        int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+                        vst1_s8(amr + k, vmovn_s16(v_s16));
+                    }
+                    for (; k < K; k++) {
+                        float q = yr[k] * inv;
+                        int qi = (int) (q + copysignf(0.5f, q));
+                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                    }
+#else
                     for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
                     task_as[m] = mx / 127.0f;
                     const float inv = 127.0f / mx;
@@ -1709,6 +1802,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
                         int qi = (int) (q + copysignf(0.5f, q));
                         amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                     }
+#endif
                 } else {
                     memset(task_A + (size_t) m*K, 0, K);
                     task_as[m] = 0.0f;
