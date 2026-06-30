@@ -243,6 +243,10 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_ORK)
+    llama_build_and_test(test-ork-cache.cpp)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

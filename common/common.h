@@ -431,8 +431,8 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_outputs_max         =     0; // max outputs supported by the context (0 = derive)
     int32_t n_sequences           =     1; // number of sequences to decode
-    int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -652,7 +652,9 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    float slot_prompt_similarity = 0.1f;
+    float   slot_prompt_similarity        = 0.1f;
+    float   slot_cache_key_similarity     = 0.5f;
+    int32_t slot_cache_key_min_prefix     = 32;
 
     // batched-bench params
     bool is_pp_shared   = false;

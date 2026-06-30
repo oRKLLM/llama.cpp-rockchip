@@ -47,6 +47,7 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -500,8 +501,8 @@ void llama_context::sched_reserve() {
                         "is assigned to device %s (usually due to missing support)\n",
                         __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_fa));
                 // FIXME: fa_device_mismatch logic is wrong for --no-kv-offload, but this is broken anyways
-                fa_device_mismatch = true;
-                break;
+                // fa_device_mismatch = true;
+                // break;
             }
         }
 
@@ -922,7 +923,6 @@ float * llama_context::get_embeddings_nextn() {
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
-
     try {
         if (embd_nextn.data == nullptr) {
             throw std::runtime_error("no nextn embeddings");
@@ -1183,6 +1183,9 @@ void llama_context::set_warmup(bool value) {
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+        return true;
+    }
+    if (sampler && sampling.samplers.count(seq_id) > 0 && sampling.samplers[seq_id] == sampler) {
         return true;
     }
 
@@ -2280,7 +2283,6 @@ void llama_context::output_reorder() {
                 }
             }
         }
-
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
@@ -3446,8 +3448,9 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
-        /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.n_rs_seq                    =*/ 0,
+
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -3519,8 +3522,16 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
+        const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
+                                 params.type_k == GGML_TYPE_TURBO3_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4_0);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
+            uint32_t head_k = model->hparams.n_embd_head_k(il);
+            // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
+            if (k_is_turbo && head_k % 128 != 0) {
+                head_k = ((head_k + 127) / 128) * 128;
+            }
+            if (head_k % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
                 return nullptr;
@@ -3530,13 +3541,30 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
+        const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
+                                 params.type_v == GGML_TYPE_TURBO3_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4_0);
+        const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
+            uint32_t head_v = model->hparams.n_embd_head_v(il);
+            // Turbo types zero-pad; MLA has no separate V cache (V = view of K)
+            if (v_is_turbo && !is_mla && head_v % 128 != 0) {
+                head_v = ((head_v + 127) / 128) * 128;
+            }
+            if (head_v % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
         }
+    }
+
+    // TurboQuant cache types require flash attention — auto-enable if disabled
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
+         params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
+        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
@@ -3705,6 +3733,25 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+int32_t llama_kv_self_used_cells(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return 0;
+    }
+    int32_t max_pos = -1;
+    uint32_t n_seq = ctx->n_seq_max();
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        int32_t pos = llama_memory_seq_pos_max(mem, i);
+        if (pos > max_pos) {
+            max_pos = pos;
+        }
+    }
+    return max_pos >= 0 ? max_pos + 1 : 0;
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

@@ -17,9 +17,9 @@
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
+  spirv-headers,
   openssl,
   shaderc,
-  spirv-headers,
   nodejs,
   importNpmLock,
   useBlas ?

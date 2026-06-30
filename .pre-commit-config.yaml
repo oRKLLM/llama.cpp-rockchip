@@ -14,3 +14,10 @@ repos:
   hooks:
   -   id: flake8
       additional_dependencies: [flake8-no-print]
+- repo: local
+  hooks:
+  - id: validate-workflows
+    name: Validate GitHub Workflows
+    entry: ./scripts/validate-workflows.sh
+    language: script
+    files: ^\.github/workflows/.*\.yml$

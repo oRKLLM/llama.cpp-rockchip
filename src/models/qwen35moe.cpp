@@ -716,6 +716,8 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_add(ctx0, cur, ffn_residual);
     cb(cur, "mtp_post_ffn", il);
 
+
+
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
             : model.output_norm;

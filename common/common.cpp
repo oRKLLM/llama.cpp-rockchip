@@ -44,6 +44,12 @@
 #include <string.h>
 #include <fcntl.h>
 #include <io.h>
+#ifndef fileno
+#define fileno _fileno
+#endif
+#ifndef isatty
+#define isatty _isatty
+#endif
 #else
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -1559,6 +1565,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;

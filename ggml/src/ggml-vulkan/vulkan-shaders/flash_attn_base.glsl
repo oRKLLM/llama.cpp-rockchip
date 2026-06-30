@@ -87,7 +87,6 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
-
 // FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
 // host can pass the type directly. Keep in sync with ggml.h.
 #define FA_TYPE_F32   0u
@@ -99,6 +98,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_BF16 30u
 #define FA_TYPE_Q1_0 41u
+#define FA_TYPE_TURBO3_0 43u
 
 #if defined(BFLOAT16)
 #define O_TYPE float
@@ -122,6 +122,9 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_BF16: return 1u;
         case FA_TYPE_Q1_0: return uint(QUANT_K_Q1_0); // cm2-only, harmless elsewhere
+        case 42u:          return uint(QUANT_K_TURBO2_0); // GGML_TYPE_TURBO2_0
+        case 43u:          return uint(QUANT_K_TURBO3_0); // GGML_TYPE_TURBO3_0
+        case 44u:          return uint(QUANT_K_TURBO4_0); // GGML_TYPE_TURBO4_0
         default:           return 1u;
     }
 }
