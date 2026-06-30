@@ -86,6 +86,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <map>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>   // LEVER3: atexit
 #include <cmath>
 #include <ctime>
 #include <utility>
@@ -166,14 +167,36 @@ static size_t ork_wcache_budget() {
     return b;
 }
 
+// ---- STREAM-POOL tier (ORK_STREAM_POOL=1) -------------------------------------------------------
+// Retarget the weight-streaming LRU at a RAM-resident inflated-int8 cache (ork_stream_pool) instead of
+// pure IOVA residency. Two budgets form a hierarchy:
+//   RAM-int8 LRU  (ORK_STREAM_RAM_BUDGET_MB, big — much larger than the 4 GiB IOVA window): how much
+//                 inflated int8 we hold resident in CPU RAM. A hit here SKIPS the expensive re-inflate.
+//   IOVA hot tier (ork_wcache_budget(), <= 4 GiB, evict-RARE): the subset currently MEM_CREATE-mapped.
+// Measured uABI costs drive this: inflate(fill) 0.4-2.7ms + MEM_DESTROY(unmap) 0.5-2ms are expensive
+// (paid once on add / only on eviction); MEM_CREATE(map) is cheap (~48-169us, paid per (re)map on a hit).
+// So: keep hot entries MAPPED, evict the IOVA mapping rarely, and NEVER re-inflate on a RAM hit.
+static int ork_stream_pool_enabled() {
+    static int e = -1;
+    if (e < 0) { const char * s = getenv("ORK_STREAM_POOL"); e = (s && s[0] && s[0] != '0') ? 1 : 0; }
+    return e;
+}
+static size_t ork_stream_ram_budget() {
+    static size_t b = 0;
+    if (!b) { const char * e = getenv("ORK_STREAM_RAM_BUDGET_MB"); b = (size_t)(e ? atoll(e) : 10240) * 1024 * 1024; }
+    return b;
+}
+
 // a packed quantized weight + its scales, kept NPU-resident and reused.
 //   int8 (W8A8):  gsize==0, bscale [N]            (per output channel)
 //   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
 struct ork_weight {
     ork_w * w = nullptr;
+    ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
     int gsize = 0;
     size_t   bytes = 0;       // resident NPU bytes (for the streaming LRU budget)
+    size_t   ram_bytes = 0;   // STREAM-POOL: RAM bytes held by `se` (for the RAM-LRU budget)
     uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
 };
 
@@ -191,8 +214,7 @@ struct ggml_backend_ork_context {
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
-    bool hybrid = false;       // ORK_HYBRID: per-weight W8A8/W4A4 by SIZE (see ork_pick_qbits)
-    size_t hybrid_w4_above = 0;// ORK_HYBRID_W4_ABOVE_MB (bytes): weights whose int8 footprint K*N >= this run W4A4
+    bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
     std::vector<int8_t>   ai;    // activations quantized int8 A[M*K]
@@ -204,18 +226,10 @@ struct ggml_backend_ork_context {
     std::unordered_map<const void *, ork_weight> wcache;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
-    // ---- MULTI-DOMAIN RESIDENCE (ORK_DOMAINS / ORK_DOMAIN_LAYERS) ----
-    // The rk_iommu 32-bit IOVA cap (~4 GiB) is PER iommu_domain_id, so a model bigger than 4 GiB stays
-    // FULLY resident (no streaming, no per-token map/unmap) by spreading its layers' weights across
-    // domains. n_domains>1 enables it: each weight's domain = min(layer_idx / domain_layers, n_domains-1)
-    // (non-blk tensors -> domain 0). ork_npu_set_pack_domain places the resident tiles there and the
-    // matmul submits against that domain. Per-domain resident totals are tracked for the load report.
-    // Run with ORK_WCACHE_BUDGET_MB >> model so the residence never evicts. Default n_domains=1 = off.
-    int    n_domains = 1;        // ORK_DOMAINS (default 1 = off)
-    int    domain_layers = 0;    // ORK_DOMAIN_LAYERS (layers per domain; 0 = auto from ORK_DOMAINS+max layer)
-    size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
-    long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
-    int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
+    // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
+    ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
+    size_t   spool_ram_bytes = 0;          // RAM bytes held across all stream entries (RAM-LRU budget)
+    long     spool_remaps = 0, spool_ram_evicts = 0, spool_iova_unmaps = 0;  // diagnostics
     // .orkpack persist (ORK_PERSIST=<path>): 0 off, 1 read (mmap'd), 2 write (building a .tmp)
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
@@ -250,7 +264,18 @@ struct ggml_backend_ork_context {
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
+    double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
+    // STREAMING sub-breakdown (ORK_PROFILE): where weight-resolution time goes for the 7B streamed prefill.
+    // These split the t_quant bucket's weight-side from the activation-quant. Microseconds.
+    double s_resolve = 0;   // total ork_resolve_weight_i8 wall (hits+packs+loads)
+    double s_dequant = 0;   // pack-miss: src0 (Q8_0/etc) -> f32 dequant
+    double s_tile    = 0;   // pack-miss: f32 -> per-channel int8 quant + transpose into bi[]
+    double s_pack    = 0;   // pack-miss: ork_mm_pack_i8 (tile into IOVA dma-buf)
+    double s_load    = 0;   // .orkpack hit: ork_mm_load_i8 (Bf full-K rebuild)
+    double s_install = 0;   // ork_spool_install: dump + inflate-into-RAM (add_i8) + free + map
+    double s_remap   = 0;   // cheap MEM_CREATE re-map of an IOVA-evicted RAM-resident entry
+    long   n_hit = 0, n_packmiss = 0, n_loadhit = 0, n_remap = 0;   // event counts
     // MoE chained-handler phase breakdown (ORK_PROFILE): where the 0.97 t/s goes.
     double moe_prequant = 0, moe_pack = 0, moe_gather = 0, moe_chain = 0, moe_scatter = 0; long moe_calls = 0;
     double moe_deq = 0, moe_quant = 0;   // pack/repack sub-split: Q4_K->f32 dequant vs f32->int8 quant+tile
@@ -277,25 +302,28 @@ struct ggml_backend_ork_context {
     // freed IOVA goes to experts; the next prefill repopulates it. A clean bulk free (not incremental LRU)
     // avoids rk_iommu fragmentation. last_graph_decode tracks the previous graph's phase for the boundary.
     int  phase_evict = 0;        // ORK_MOE_PHASE_EVICT (cached at init)
-    // ---- LEVER C: CPU‖NPU pipeline overlap (ORK_OVERLAP, default OFF) ----
-    // The dense chain (QKV / ffn gate+up) normally runs as ONE batched run_chain_i8 submit, then
-    // dequantizes every task. With overlap on, the chain is instead software-pipelined as a sequence
-    // of per-task async submits (ork_mm_run_i8_async): while task i's NPU submit is in flight on the
-    // ork worker thread, the calling thread dequantizes task i-1 (independent CPU work — different,
-    // already-completed output). EXACTLY ONE async job is in flight at any instant (the NPU is
-    // single-stream), so this never races the submit domain / per-core scratch and cannot double-submit.
-    // Numerics are bit-identical: same int8 inputs, and per-task ork_mm_run_i8 == the chain fallback.
-    int  overlap = 0;            // ORK_OVERLAP (cached at init)
-    long overlap_chains = 0;     // diagnostics: chains run via the pipelined path
     int  last_graph_decode = -1; // -1 unknown; 0 prefill (max M>1); 1 decode (max M==1)
     long backbone_evicts = 0; size_t backbone_evict_bytes = 0;  // diagnostics
     // ---- EXPERIMENT: routing-frequency profiler (ORK_MOE_PROFILE_FREQ=<file>) ----
     // Accumulate per-(_exps tensor, expert) selection counts so the mixed-orkpack tier map can rank
     // experts by routing frequency (hottest -> int8/NPU-resident, cold tail -> int4/CPU). Dumped on free.
     std::map<std::string, std::vector<long>> moe_freq;   // exps-tensor-name -> per-expert hit count
+    // ---- MULTI-DOMAIN RESIDENCE (ORK_DOMAINS / ORK_DOMAIN_LAYERS) ----
+    // The rk_iommu 32-bit IOVA cap (~4 GiB) is PER iommu_domain_id, so a model bigger than 4 GiB stays
+    // FULLY resident (no streaming, no per-token map/unmap) by spreading its layers' weights across
+    // domains. n_domains>1 enables it: each weight's domain = min(layer_idx / domain_layers, n_domains-1)
+    // (non-blk tensors -> domain 0). Set the pack domain on ork-driver before each pack/load so the
+    // resident tiles land there and the matmul submits against it. Per-domain resident totals are tracked
+    // for the load-time report. Default n_domains=1 -> unchanged single-domain behavior.
+    int    n_domains = 1;        // ORK_DOMAINS (default 1 = off)
+    int    domain_layers = 0;    // ORK_DOMAIN_LAYERS (layers per domain; 0 = auto from ORK_DOMAINS+max layer)
+    size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
+    long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
+    int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
+static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // MULTI-DOMAIN RESIDENCE: pick the IOMMU domain a weight should reside in from its tensor name.
 // "blk.<i>.<...>" -> domain = min(i / domain_layers, n_domains-1); anything else -> domain 0.
@@ -327,6 +355,63 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
         ctx->wcache.erase(lru);
+    }
+}
+
+// ---- STREAM-POOL two-tier eviction ------------------------------------------------------------
+// IOVA tier (evict-RARE): unmap the LRU *mapped* stream entries until `need` more IOVA bytes fit under
+// the IOVA budget. The entry STAYS in RAM (next map is cheap, no re-inflate). Never unmaps a still-needed
+// entry — the op's own entry is mapped AFTER this call, so it isn't a candidate here.
+static void ork_spool_iova_evict(ggml_backend_ork_context * ctx, size_t need) {
+    const size_t budget = ork_wcache_budget();
+    while (ctx->wcache_bytes + need > budget) {
+        ork_weight * lru = nullptr; auto lru_it = ctx->wcache.end();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.se && ork_stream_entry_mapped(it->second.se) &&
+                (!lru || it->second.last_use < lru->last_use)) { lru = &it->second; lru_it = it; }
+        if (!lru) break;   // nothing mapped to evict
+        ork_stream_pool_unmap(ctx->spool, lru->se);
+        ctx->wcache_bytes -= lru->bytes; lru->bytes = 0; lru->w = nullptr;
+        ctx->spool_iova_unmaps++; (void) lru_it;
+    }
+}
+// Forcibly unmap the single LRU mapped entry (other than `keep`). Returns its freed bytes, or 0 if none.
+// Used to recover from a PRIME/MEM_CREATE import failure: the rk_iommu IOVA window fragments, so the
+// byte-budget can be met yet a fresh import still EFAULTs — drop more resident maps and retry.
+static size_t ork_spool_unmap_one_lru(ggml_backend_ork_context * ctx, ork_stream_entry * keep) {
+    ork_weight * lru = nullptr;
+    for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+        if (it->second.se && it->second.se != keep && ork_stream_entry_mapped(it->second.se) &&
+            (!lru || it->second.last_use < lru->last_use)) lru = &it->second;
+    if (!lru) return 0;
+    size_t freed = lru->bytes;
+    ork_stream_pool_unmap(ctx->spool, lru->se);
+    ctx->wcache_bytes -= lru->bytes; lru->bytes = 0; lru->w = nullptr;
+    ctx->spool_iova_unmaps++;
+    return freed ? freed : 1;
+}
+// Map an entry, retrying after dropping more LRU maps on import failure (IOVA fragmentation). 0 ok / -1.
+static int ork_spool_map_retry(ggml_backend_ork_context * ctx, ork_stream_entry * e) {
+    if (ork_stream_pool_map(ctx->spool, e) == 0) return 0;
+    while (ork_spool_unmap_one_lru(ctx, e))
+        if (ork_stream_pool_map(ctx->spool, e) == 0) return 0;
+    return -1;
+}
+// RAM tier: remove (free RAM) the LRU stream entries — and their wcache slot — until `need` more RAM
+// bytes fit under the RAM budget. Removing also unmaps if mapped (reclaims IOVA). The current op's entry
+// is created AFTER this call, so it is never a candidate. A re-touch of an evicted weight re-inflates.
+static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
+    const size_t budget = ork_stream_ram_budget();
+    while (ctx->spool_ram_bytes + need > budget && !ctx->wcache.empty()) {
+        auto lru = ctx->wcache.end();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.se && (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
+        if (lru == ctx->wcache.end()) break;
+        if (ork_stream_entry_mapped(lru->second.se)) ctx->wcache_bytes -= lru->second.bytes;
+        ork_stream_pool_remove(ctx->spool, lru->second.se);
+        ctx->spool_ram_bytes -= lru->second.ram_bytes;
+        ctx->wcache.erase(lru);
+        ctx->spool_ram_evicts++;
     }
 }
 
@@ -651,6 +736,35 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
 // Returns ctx->wcache.end() only on a pack/load failure; otherwise an iterator to the resident weight.
 // Caller does the LRU touch (it->second.last_use) and the matmul. Keying / dedup is by src0->data
 // (wcache) and src0->name (persist index / persist_dumped) — same keys both paths use, so no double-write.
+// STREAM-POOL: convert a freshly-resolved wcache entry (whose ow.w is a just-packed/loaded IOVA-resident
+// int8 weight) into a RAM-resident stream entry: dump the tiled int8 bytes, add to the pool (the ONE-TIME
+// inflate/copy held in RAM), free the temporary IOVA weight, then cheap-map it back to IOVA. RAM-evicts
+// first (budget by RAM), then IOVA-evicts (budget by the 4 GiB window). Returns false on failure (caller
+// keeps the plain IOVA weight as fallback — still correct, just not RAM-tiered). it->second.w holds the
+// temp weight on entry; on success se is set, w is the live mapped handle (NULL — run goes via se).
+static bool ork_spool_install(ggml_backend_ork_context * ctx,
+                              std::unordered_map<const void *, ork_weight>::iterator it, int K, int N) {
+    ork_weight & ow = it->second;
+    if (!ctx->spool || !ow.w) return false;
+    size_t need = ork_w_dump(ow.w, nullptr, 0);    // tiled int8 blob size
+    if (!need) return false;
+    std::vector<uint8_t> blob(need);
+    if (ork_w_dump(ow.w, blob.data(), need) != need) return false;
+    // Build the RAM-resident entry FIRST (don't free the temp IOVA weight until add succeeds — on failure
+    // e.g. N%32!=0 the entry stays a valid plain IOVA weight, so the matmul is still correct).
+    ork_spool_ram_evict(ctx, need);
+    ork_stream_entry * se = ork_stream_pool_add_i8(ctx->spool, K, N, blob.data(), need);
+    if (!se) return false;    // fall back to ow.w (still resident & counted)
+    // free the temp IOVA weight (it was counted in wcache_bytes by the caller); the RAM entry replaces it
+    ctx->wcache_bytes -= ow.bytes;
+    ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; ow.bytes = 0;
+    ow.se = se; ow.ram_bytes = ork_stream_entry_bytes(se); ctx->spool_ram_bytes += ow.ram_bytes;
+    ork_spool_iova_evict(ctx, ow.ram_bytes);
+    if (ork_spool_map_retry(ctx, se) != 0) return false;   // mapped-fail: entry in RAM, remap retried on next touch
+    ow.bytes = ow.ram_bytes; ctx->wcache_bytes += ow.bytes;
+    return true;
+}
+
 static std::unordered_map<const void *, ork_weight>::iterator
 ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
                       int K, int N, size_t nb01, enum ggml_type type, ggml_to_float_t to_float,
@@ -659,9 +773,25 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     // free IOVA. The chain path needs ALL `count` weights co-resident at submit, so it passes false
     // (matching the original chain pack, which never evicted) — otherwise packing weight i frees the
     // already-packed weight i-1 that the chain still references → use-after-free at submit.
+    const double _r0 = ctx->profile ? ork_now_us_e() : 0;
     const char * x = (const char *) src0->data;
     auto it = ctx->wcache.find(x);
-    if (it != ctx->wcache.end()) return it;
+    if (it != ctx->wcache.end()) {
+        if (ctx->spool && it->second.se && !ork_stream_entry_mapped(it->second.se)) {
+            // STREAM-POOL hit, but IOVA-unmapped (evicted from the hot tier): re-map (cheap, ~170us;
+            // NO re-inflate). Make IOVA room first by unmapping the LRU mapped entries.
+            const double _m0 = ctx->profile ? ork_now_us_e() : 0;
+            if (allow_evict) ork_spool_iova_evict(ctx, it->second.ram_bytes);
+            if (ork_spool_map_retry(ctx, it->second.se) == 0) {
+                it->second.bytes = it->second.ram_bytes;
+                ctx->wcache_bytes += it->second.bytes;
+                ctx->spool_remaps++;
+                if (ctx->profile) { ctx->s_remap += ork_now_us_e() - _m0; ctx->n_remap++; }
+            } else return ctx->wcache.end();
+        }
+        if (ctx->profile) { ctx->s_resolve += ork_now_us_e() - _r0; ctx->n_hit++; }
+        return it;
+    }
 
     if (ctx->persist_mode == 1) {
         // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
@@ -670,7 +800,11 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
             (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4)) {
             const orkpack_entry & e = pit->second;
-            if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);
+            // STREAM-POOL bugfix (see pack-miss path): unmap LRU (cheap remap later) instead of erasing.
+            if (allow_evict) {
+                if (ctx->spool) ork_spool_iova_evict(ctx, (size_t) K * N);
+                else            ork_wcache_evict(ctx, (size_t) K * N);
+            }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
             const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
@@ -680,7 +814,9 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
                 if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
             } else {
+                const double _l0 = ctx->profile ? ork_now_us_e() : 0;
                 ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size);
+                if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
                 if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
                             ow.bscale.assign(bs, bs + e.bscale_n); }
             }
@@ -693,6 +829,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
                     e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
                 ork_evict_src(x, (size_t) N * nb01);
+                // STREAM-POOL: move the loaded int8 weight into the RAM tier (int4 stays IOVA-resident —
+                // the pool stores inflated int8; converting it here would lose the RAM-size win).
+                if (ctx->spool && e.dtype == ORKPACK_DT_I8) {
+                    const double _i0 = ctx->profile ? ork_now_us_e() : 0;
+                    bool ok_inst = ork_spool_install(ctx, it, K, N);
+                    if (ctx->profile) ctx->s_install += ork_now_us_e() - _i0;
+                    if (!ok_inst && !it->second.w && !it->second.se) { ctx->wcache.erase(it); return ctx->wcache.end(); }
+                }
+                if (ctx->profile) ctx->s_resolve += ork_now_us_e() - _r0;
                 return it;
             }
         }
@@ -700,15 +845,19 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
 
     // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
     if (ctx->persist_mode) ctx->persist_misses++;
+    if (ctx->profile) ctx->n_packmiss++;
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
     float  * f32 = ctx->f32.data();
     int8_t * bi  = ctx->bi.data();
+    const double _d0 = ctx->profile ? ork_now_us_e() : 0;
     if (type == GGML_TYPE_F32) {
         for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
     } else {
         for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
     }
+    if (ctx->profile) ctx->s_dequant += ork_now_us_e() - _d0;
+    const double _t0 = ctx->profile ? ork_now_us_e() : 0;
     ork_weight ow; ow.bscale.resize(N);
     for (int n = 0; n < N; n++) {
         float mx = 1e-9f;
@@ -719,11 +868,21 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
         }
     }
-    if (allow_evict) ork_wcache_evict(ctx, (size_t) K * N);   // stream: free IOVA room before packing (int8 ~K*N bytes)
+    if (ctx->profile) ctx->s_tile += ork_now_us_e() - _t0;
+    // STREAM-POOL bugfix: when the pool is active, free IOVA by UNMAPPING the LRU stream entry
+    // (ork_spool_iova_evict — keeps the RAM-resident inflate, next touch is a cheap remap), NOT by
+    // ERASING the wcache slot (ork_wcache_evict), which destroys the cached entry and forces a full
+    // re-inflate (re-pack) on the next touch. Plain wcache (no spool) still uses the erase-evict.
+    if (allow_evict) {
+        if (ctx->spool) ork_spool_iova_evict(ctx, (size_t) K * N);
+        else            ork_wcache_evict(ctx, (size_t) K * N);
+    }
+    const double _p0 = ctx->profile ? ork_now_us_e() : 0;
     const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
+    if (ctx->profile) ctx->s_pack += ork_now_us_e() - _p0;
     if (!ow.w) return ctx->wcache.end();
     it = ctx->wcache.emplace(x, std::move(ow)).first;
     it->second.bytes = ork_w_bytes(it->second.w);
@@ -731,8 +890,16 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
     ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
+    // STREAM-POOL: move the just-packed int8 weight into the RAM tier (cheap remaps on future hits).
+    if (ctx->spool) {
+        const double _i0 = ctx->profile ? ork_now_us_e() : 0;
+        bool ok_inst = ork_spool_install(ctx, it, K, N);
+        if (ctx->profile) ctx->s_install += ork_now_us_e() - _i0;
+        if (!ok_inst && !it->second.w && !it->second.se) { ctx->wcache.erase(it); return ctx->wcache.end(); }
+    }
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK DEBUG] packed weight, wcache=%zu resident=%.0fMB, K=%d, N=%d, x=%p\n",
         ctx->wcache.size(), ctx->wcache_bytes/1e6, K, N, (const void *) x);
+    if (ctx->profile) ctx->s_resolve += ork_now_us_e() - _r0;
     return it;
 }
 
@@ -781,6 +948,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
         int32_t * ci  = ctx->ci.data();
 
         std::vector<ork_mm_task_i8> tasks;
+        std::vector<ork_stream_entry *> task_se;   // STREAM-POOL: per-task RAM-resident entry (NULL = plain ow.w)
 
         const double t0 = ctx->profile ? ork_now_us() : 0;
 
@@ -805,12 +973,59 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 // activation: per-row int8 quant with shape padding
                 int8_t * ar = ai + t * M_padded * K;
                 float * asr = as + t * M_padded;
+                const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time pure act-quant arithmetic
                 #pragma omp parallel for if (M_padded >= 16)
                 for (int m = 0; m < M_padded; m++) {
                     if (m < M) {
                         const float * yr = y + (size_t) m*K;
                         int8_t * amr = ar + (size_t) m*K;
                         float mx = 1e-9f;
+#if defined(__ARM_NEON)
+                        // pass 1: vectorized abs-max reduction across K.
+                        // float max is exact + order-independent, so the lane
+                        // ordering does not change the result vs the scalar loop.
+                        int k = 0;
+                        float32x4_t v_mx0 = vdupq_n_f32(mx);
+                        float32x4_t v_mx1 = vdupq_n_f32(mx);
+                        for (; k <= K - 8; k += 8) {
+                            v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+                            v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+                        }
+                        mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+                        for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+                        asr[m] = mx / 127.0f;
+                        const float inv = 127.0f / mx;
+                        // pass 2: vectorized quantize. Replicates the scalar
+                        // round-half-away-from-zero EXACTLY: half = copysign(0.5,q)
+                        // (sign bit of q OR'd into +0.5), q+half in float, then
+                        // truncate toward zero (vcvtq_s32_f32), clamp to [-127,127].
+                        const float32x4_t v_inv  = vdupq_n_f32(inv);
+                        const float32x4_t v_half = vdupq_n_f32(0.5f);
+                        const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+                        const int32x4_t   v_hi   = vdupq_n_s32(127);
+                        const int32x4_t   v_lo   = vdupq_n_s32(-127);
+                        k = 0;
+                        for (; k <= K - 8; k += 8) {
+                            float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+                            float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+                            // copysignf(0.5f, q): OR the sign bit of q into 0.5
+                            float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+                            float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+                            // q + half, then truncate toward zero (matches (int) cast)
+                            int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+                            int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+                            // clamp to [-127,127] in int32, then narrow to int8
+                            v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+                            v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+                            int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+                            vst1_s8(amr + k, vmovn_s16(v_s16));
+                        }
+                        for (; k < K; k++) {
+                            float q = yr[k] * inv;
+                            int qi = (int) (q + copysignf(0.5f, q));
+                            amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+                        }
+#else
                         for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
                         asr[m] = mx / 127.0f;
                         const float inv = 127.0f / mx;
@@ -819,11 +1034,13 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                             int qi = (int) (q + copysignf(0.5f, q));
                             amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
                         }
+#endif
                     } else {
                         memset(ar + (size_t) m*K, 0, K);
                         asr[m] = 0.0f;
                     }
                 }
+                if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
                 ctx->last_src1 = y;
                 ctx->last_M = M;
                 ctx->last_K = K;
@@ -838,6 +1055,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 ai + t * M_padded * K,
                 ci + t * M_padded * N
             });
+            task_se.push_back(ow.se);
         }
 
         const double t1 = ctx->profile ? ork_now_us() : 0;
@@ -845,7 +1063,14 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
         if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain: M=%d, tasks=%zu (S=%d, K=%d, N=%d)\n", M, tasks.size(), S, K, N);
         fflush(stderr);
         int ok = -1;
-        if (tasks.size() == 1) {
+        if (ctx->spool && task_se[0]) {
+            // STREAM-POOL: each weight is a RAM-resident entry mapped to IOVA; run per-task (correctness
+            // first — the chain co-residency contract is met by all entries staying mapped here).
+            ok = 0;
+            for (size_t t = 0; t < tasks.size(); t++)
+                if (ork_stream_pool_run(ctx->spool, task_se[t], tasks[t].M, tasks[t].A, tasks[t].C)) { ok = -1; break; }
+            if (ok != 0) return false;
+        } else if (tasks.size() == 1) {
             ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
         } else {
             ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
@@ -1278,17 +1503,45 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
 static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "ORK"; GGML_UNUSED(backend); }
 
-static void ggml_backend_ork_free(ggml_backend_t backend) {
-    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+// LEVER3: profile dump, callable from backend free OR atexit (llama-bench never frees the backend).
+static int g_ork_prof_dumped = 0;
+static void ork_profile_dump(ggml_backend_ork_context * ctx) {
+    if (!ctx || g_ork_prof_dumped) return;
+    if (ctx->profile) fprintf(stderr, "[ork DUMP] profile=%d n_mm=%ld t_quant=%.0fms t_run=%.0fms t_deq=%.0fms t_actq=%.0fms\n",
+                              ctx->profile, ctx->n_mm, ctx->t_quant/1e3, ctx->t_run/1e3, ctx->t_deq/1e3, ctx->t_actq/1e3);
     if (ctx->profile && ctx->n_mm) {
+        g_ork_prof_dumped = 1;
         double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
         GGML_LOG_INFO("ork profile: %ld matmuls | quant %.0fms (%.0f%%) run %.0fms (%.0f%%) dequant %.0fms (%.0f%%) | %.1f us/matmul (run %.1f us)\n",
             ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/tot, ctx->t_run/1e3, 100*ctx->t_run/tot,
             ctx->t_deq/1e3, 100*ctx->t_deq/tot, tot/ctx->n_mm, ctx->t_run/ctx->n_mm);
-        if (ctx->overlap) GGML_LOG_INFO("ork profile: LEVER C overlap ON — %ld dense chains pipelined (per-task async submit ‖ prev dequant)\n", ctx->overlap_chains);
         if (ctx->n_dec) GGML_LOG_INFO("ork profile: decode  (M=1)  %ld matmuls, run %.1f us/matmul\n", ctx->n_dec, ctx->t_run_dec/ctx->n_dec);
         if (ctx->n_pf)  GGML_LOG_INFO("ork profile: prefill (M>1) %ld matmuls, avgM %.1f, run %.1f us/matmul (%.2f us/row)\n",
             ctx->n_pf, (double)ctx->m_pf/ctx->n_pf, ctx->t_run_pf/ctx->n_pf, ctx->t_run_pf/ctx->m_pf);
+        // STREAMING breakdown: weight-resolution cost (pulled OUT of the t_quant bucket, which still
+        // also holds activation-quant). All times ms; the question = which dominates the 7B streamed pass.
+        {
+            double sr = ctx->s_resolve, gtot = sr + ctx->t_run + ctx->t_deq;
+            fprintf(stderr, "[ork STREAM] matmuls=%ld | quant(act+misc) %.0fms (%.0f%%) resolve %.0fms (%.0f%%) run %.0fms (%.0f%%) deq %.0fms (%.0f%%) | wallsum %.0fms\n",
+                ctx->n_mm, ctx->t_quant/1e3, 100*ctx->t_quant/(ctx->t_quant+gtot),
+                sr/1e3, 100*sr/(ctx->t_quant+gtot), ctx->t_run/1e3, 100*ctx->t_run/(ctx->t_quant+gtot),
+                ctx->t_deq/1e3, 100*ctx->t_deq/(ctx->t_quant+gtot), (ctx->t_quant+gtot)/1e3);
+            fprintf(stderr, "[ork STREAM] events: hits=%ld packmiss=%ld loadhit=%ld remap=%ld | DMA-unmaps=%ld ramEvict=%ld iovaUnmap=%ld\n",
+                ctx->n_hit, ctx->n_packmiss, ctx->n_loadhit, ctx->n_remap,
+                ctx->spool_remaps, ctx->spool_ram_evicts, ctx->spool_iova_unmaps);
+            fprintf(stderr, "[ork STREAM] resolve-split: dequant(src->f32) %.0fms tile(f32->i8) %.0fms pack(i8->IOVA) %.0fms | load(.orkpack) %.0fms install(inflate+map) %.0fms remap(MEM_CREATE) %.0fms\n",
+                ctx->s_dequant/1e3, ctx->s_tile/1e3, ctx->s_pack/1e3, ctx->s_load/1e3, ctx->s_install/1e3, ctx->s_remap/1e3);
+            // LEVER3: split the t_quant bucket into pure activation-quant ARITHMETIC (NEON absmax+quantize loop),
+            // weight RESOLVE (s_resolve), and the remaining act-side MISC (t_quant - actq - resolve = vector
+            // setup/realloc/loop overhead not inside the timed loop). Answers: is the bucket arithmetic or misc?
+            {
+                double actq = ctx->t_actq, resolve_in_q = sr;   // both measured inside the t0..t1 window
+                double misc = ctx->t_quant - actq - resolve_in_q; if (misc < 0) misc = 0;
+                double W = ctx->t_quant + gtot;
+                fprintf(stderr, "[ork ACTQ] t_quant=%.0fms = arith(NEON absmax+quant) %.0fms (%.0f%% of wall) + resolve %.0fms (%.0f%%) + misc %.0fms (%.0f%%) | act-quant calls=%ld\n",
+                    ctx->t_quant/1e3, actq/1e3, 100*actq/W, resolve_in_q/1e3, 100*resolve_in_q/W, misc/1e3, 100*misc/W, ctx->n_actq);
+            }
+        }
         if (ctx->moe_calls) {
             double mt = ctx->moe_prequant + ctx->moe_pack + ctx->moe_gather + ctx->moe_chain + ctx->moe_scatter;
             fprintf(stderr, "[ork MoE-chain] %ld calls, %.0fms total | prequant %.0fms (%.0f%%) pack/repack %.0fms (%.0f%%) gather %.0fms (%.0f%%) chain-submit %.0fms (%.0f%%) scatter %.0fms (%.0f%%)\n",
@@ -1326,6 +1579,12 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
                 rt_tot/rt_n, rt_s/rt_n, rt_sub/rt_n, rt_cp/rt_n);
         }
     }
+}
+// LEVER3: atexit shim — fires the profile dump even when llama-bench never calls backend free.
+static void ork_profile_atexit(void) { ork_profile_dump(g_ork_ctx); }
+static void ggml_backend_ork_free(ggml_backend_t backend) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    ork_profile_dump(ctx);
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
     ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
     if (ctx->persist_mode) fprintf(stderr, "[ORK PERSIST] this run: loaded %ld from disk, packed %ld\n", ctx->persist_hits, ctx->persist_misses);
@@ -1359,8 +1618,13 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
             }
         }
     }
+    if (ctx->spool)
+        fprintf(stderr, "[ork STREAM-POOL] entries=%zu | RAM held=%.2f GiB | IOVA mapped=%.2f GiB | remaps(cheap)=%ld IOVA-unmaps=%ld RAM-evicts=%ld\n",
+            ctx->wcache.size(), ctx->spool_ram_bytes/(1024.0*1024.0*1024.0), ctx->wcache_bytes/(1024.0*1024.0*1024.0),
+            ctx->spool_remaps, ctx->spool_iova_unmaps, ctx->spool_ram_evicts);
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
-    for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);
+    if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
+    for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
@@ -1385,19 +1649,6 @@ static bool ork_is_expert(const char * name) {
     return false;
 }
 
-// Hybrid precision policy (ORK_HYBRID): choose W8A8 vs W4A4 per weight by SIZE. A weight whose int8-
-// resident footprint (K*N bytes) is >= ctx->hybrid_w4_above runs W4A4 — that's the FFN / expert bulk,
-// where int4 halves both resident bytes AND streaming bandwidth (the binding constraints for large
-// models against the ~4 GiB NPU IOVA window + KV-cache headroom). Smaller, numerically-sensitive
-// weights (attention, gates, norms-adjacent projections) stay W8A8, where the byte cost is trivial and
-// accuracy matters more. This generalizes the old FFN=4/attn=8 name heuristic: on a standard transformer
-// it lands on the same split, but it is architecture-agnostic and tunable via ORK_HYBRID_W4_ABOVE_MB
-// (default 8 MB; set 0 to force all-W8A8 under hybrid). With ORK_HYBRID off, ctx->qbits is used verbatim.
-static int ork_pick_qbits(const ggml_backend_ork_context * ctx, int64_t K, int64_t N) {
-    if (!ctx->hybrid) return ctx->qbits;
-    return (ctx->hybrid_w4_above && (size_t) (K * N) >= ctx->hybrid_w4_above) ? 4 : 8;
-}
-
 enum ork_chain_type {
     ORK_CHAIN_NONE,
     ORK_CHAIN_I8,
@@ -1412,7 +1663,15 @@ static ork_chain_type get_node_chain_type(ggml_backend_ork_context * ctx, struct
     int64_t K = src0->ne[0];
     int64_t N = src0->ne[1];
 
-    int target_qbits = ork_pick_qbits(ctx, K, N);
+    const char * name = src0->name;
+    bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
+    bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
+    
+    int target_qbits = ctx->qbits;
+    if (ctx->hybrid) {
+        if (is_ffn) target_qbits = 4;
+        else if (is_attn) target_qbits = 8;
+    }
     if (target_qbits == 8) {
         if (K <= 10752 && N <= 4096 && (K % 32 == 0) && (N % 32 == 0)) {
             return ORK_CHAIN_I8;
@@ -1750,6 +2009,8 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
+            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (SCALAR — lever2 NEON not applied here!)
+            #pragma omp parallel for if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
                     const float * yr = y + (size_t) m*K;
@@ -1768,6 +2029,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
                     task_as[m] = 0.0f;
                 }
             }
+            if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
             chain_act_cache[src1->data] = {task_A, task_as};
             ai_offset += (size_t)M_padded * K;
             as_offset += (size_t)M_padded;
@@ -1785,103 +2047,9 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
 
     const double t1 = ctx->profile ? ork_now_us() : 0;
 
-    // Per-task dequant: C_int32 (tasks[i].C, = ci_base + i's slice) * bscale * act-scale -> dst f32.
-    // Identical math to the post-submit loop below; factored out so the overlap pipeline can run it on
-    // task i-1's (already-completed) output while task i's submit is in flight. Bit-exact either way.
-    auto dequant_task = [&](int i) {
-        struct ggml_tensor * dst = nodes[i];
-        const char * x = (const char *) dst->src[0]->data;
-        const struct ggml_tensor * src1 = dst->src[1];
-        float * d = (float *) dst->data;
-        int N = dst->src[0]->ne[1];
-        int Mt = dst->src[1]->ne[1];
-        auto it = ctx->wcache.find(x);
-        const float * bs = it->second.bscale.data();
-        const float * task_as = chain_act_cache.find(src1->data)->second.second;
-        const int32_t * ctr = tasks[i].C;
-        for (int m = 0; m < Mt; m++) {
-            const float rs = task_as[m];
-            const int32_t * cr = ctr + (size_t) m*N;
-            float * dr = d + (size_t) m*N;
-#if defined(__ARM_NEON)
-            float32x4_t v_rs = vdupq_n_f32(rs);
-            int n = 0;
-            for (; n <= N - 8; n += 8) {
-                int32x4_t v_cr0 = vld1q_s32(cr + n);
-                int32x4_t v_cr1 = vld1q_s32(cr + n + 4);
-                float32x4_t v_cr_f0 = vcvtq_f32_s32(v_cr0);
-                float32x4_t v_cr_f1 = vcvtq_f32_s32(v_cr1);
-                float32x4_t v_bs0 = vld1q_f32(bs + n);
-                float32x4_t v_bs1 = vld1q_f32(bs + n + 4);
-                float32x4_t v_prod0 = vmulq_f32(v_bs0, v_cr_f0);
-                float32x4_t v_prod1 = vmulq_f32(v_bs1, v_cr_f1);
-                float32x4_t v_dr0 = vmulq_f32(v_prod0, v_rs);
-                float32x4_t v_dr1 = vmulq_f32(v_prod1, v_rs);
-                vst1q_f32(dr + n, v_dr0);
-                vst1q_f32(dr + n + 4, v_dr1);
-            }
-            for (; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
-#else
-            for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
-#endif
-        }
-    };
-
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
     fflush(stderr);
-
-    // LEVER C overlap path: pipeline per-task async submits so each task's NPU submit is hidden behind
-    // the previous task's CPU dequant. Exactly one async job is ever in flight (single-stream NPU
-    // contract). On ANY async-launch failure we wait out the in-flight job and fall back to the proven
-    // batched submit below — never two submits at once, never a leaked handle.
-    if (ctx->overlap && tasks.size() >= 2) {
-        ctx->overlap_chains++;
-        bool failed = false;
-        ork_async * h = ork_mm_run_i8_async(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
-        if (!h) {
-            failed = true;   // couldn't launch -> nothing in flight, fall through to batched path
-        } else {
-            for (size_t i = 1; i < tasks.size(); i++) {
-                if (ork_async_wait(h) != 0) { h = nullptr; failed = true; break; }  // task i-1 done
-                h = ork_mm_run_i8_async(ctx->npu, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
-                if (!h) { failed = true; break; }      // i-1 already waited; nothing in flight
-                dequant_task((int) i - 1);             // CPU dequant(i-1) ‖ NPU submit(i)
-            }
-            if (!failed) {
-                if (ork_async_wait(h) != 0) failed = true;   // last submit
-                else dequant_task((int) tasks.size() - 1);
-            }
-        }
-        if (!failed) {
-            // Profile + no_cache bookkeeping mirror the batched path's tail, then we're done.
-            if (ctx->profile) {
-                double t3 = ork_now_us();
-                ctx->t_quant += t1 - t0;
-                // submit/dequant are interleaved here; attribute the combined wall to t_run (NPU-bound).
-                ctx->t_run   += t3 - t1;
-                ctx->n_mm    += count;
-                for (int i = 0; i < count; i++) {
-                    int Mi = nodes[i]->src[1]->ne[1];
-                    double part_run = (t3 - t1) / count;
-                    if (Mi > 1) { ctx->t_run_pf += part_run; ctx->n_pf += 1; ctx->m_pf += Mi; }
-                    else        { ctx->t_run_dec += part_run; ctx->n_dec += 1; }
-                }
-            }
-            if (ctx->no_cache) {
-                for (int i = 0; i < count; i++) {
-                    const char * x = (const char *) nodes[i]->src[0]->data;
-                    auto it = ctx->wcache.find(x);
-                    if (it != ctx->wcache.end()) { ork_w_free(it->second.w); ctx->wcache.erase(it); }
-                }
-            }
-            return true;
-        }
-        // Overlap failed mid-pipeline: any in-flight job has been waited out (h==nullptr or never
-        // launched). Some tasks' dst may already hold correct dequantized data; the batched fallback
-        // below recomputes all of them, which is harmless (idempotent: same inputs -> same outputs).
-        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] overlap pipeline failed, falling back to batched\n");
-    }
-
+    
     int ok = 0;
     if (tasks.size() == 1) {
         ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
@@ -2645,7 +2813,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
     // MULTI-DOMAIN RESIDENCE: the FIRST decode graph (max matmul M==1) means the full prefill has run and
     // every weight is now resident; from here ANY further pack/load is per-token churn (the thing this
-    // eliminates). Clear load_phase + report the per-domain resident split, once.
+    // breakthrough eliminates). Clear load_phase + report the per-domain resident split, once.
     if (ctx->n_domains > 1 && ctx->load_phase) {
         int64_t max_m = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2697,7 +2865,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             case GGML_OP_MUL_MAT: {
                 std::vector<struct ggml_tensor *> chain_nodes;
                 ork_chain_type type = get_node_chain_type(ctx, node);
-                
+
+                // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
+                // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
+                // co-resident under allow_evict=false, which the RAM/IOVA tiering can't guarantee).
+                if (ctx->spool) type = ORK_CHAIN_NONE;
+
                 if (type != ORK_CHAIN_NONE && node->ne[2] == 1 && node->ne[3] == 1) {
                     chain_nodes.push_back(node);
                     while (i + chain_nodes.size() < cgraph->n_nodes && chain_nodes.size() < 32) {
@@ -2746,7 +2919,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
                         i += ng - 1;
                     } else {
-                        int target_qbits = ork_pick_qbits(ctx, node->src[0]->ne[0], node->src[0]->ne[1]);
+                        const char * name = node->src[0]->name;
+                        bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
+                        bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
+                        
+                        int target_qbits = ctx->qbits;
+                        if (ctx->hybrid) {
+                            if (is_ffn) target_qbits = 4;
+                            else if (is_attn) target_qbits = 8;
+                        }
 
                         if (target_qbits == 4
                                ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
@@ -2810,24 +2991,26 @@ ggml_backend_t ggml_backend_ork_init(void) {
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
+    if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
-    {   // size-aware hybrid threshold (see ork_pick_qbits): weights with int8 footprint >= this go W4A4
-        const char * t = getenv("ORK_HYBRID_W4_ABOVE_MB");
-        ctx->hybrid_w4_above = (size_t)(t ? atoll(t) : 8) * 1024 * 1024;
-    }
     ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
-    ctx->overlap = env_enabled("ORK_OVERLAP");   // LEVER C: CPU‖NPU dequant/submit pipeline (default OFF)
     // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
     // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
     // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
-    // residence never evicts. The ork-driver side (set_pack_domain / per-domain submit scratch) is in 0.6.x.
+    // residence never evicts.
     { const char * nd = getenv("ORK_DOMAINS"); ctx->n_domains = nd ? atoi(nd) : 1; if (ctx->n_domains < 1) ctx->n_domains = 1; if (ctx->n_domains > 16) ctx->n_domains = 16;
       const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0;
       if (ctx->n_domains > 1) fprintf(stderr, "[ork] MULTI-DOMAIN RESIDENCE: %d domains, %d layers/domain (0=auto), wcache budget %zu MB\n",
             ctx->n_domains, ctx->domain_layers, ork_wcache_budget()>>20); }
+    if (ork_stream_pool_enabled()) {
+        ctx->spool = ork_stream_pool_create(ctx->npu);   // NULL if dma-heap import unavailable -> plain wcache
+        if (ctx->spool) fprintf(stderr, "[ork] STREAM-POOL enabled: RAM budget %zu MB, IOVA budget %zu MB\n",
+                                ork_stream_ram_budget()>>20, ork_wcache_budget()>>20);
+        else fprintf(stderr, "[ork] STREAM-POOL requested but import unavailable — falling back to plain wcache\n");
+    }
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
@@ -2919,16 +3102,18 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
-            // N-cap: very wide matmuls (lm_head/output N~152k) blow up DMA/IOVA and can hang the driver, so
-            // keep them on CPU. Default cap 16384 EXCLUDES the FFN gate/up (N=intermediate, e.g. 18944); raise
-            // it (ORK_MAXN=20000) so the whole FFN resides on the NPU and gate/up offload too.
+            // Explicitly block output and lm_head (vocabulary projection) layers from offloading to NPU.
+            // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
+            // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
             const char * name = src0->name;
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
             fflush(stderr);
+            // N-cap: very wide matmuls (lm_head/output N~152k) blow up DMA/IOVA and can hang the driver, so
+            // keep them on CPU. Default cap 16384 EXCLUDES the FFN gate/up (N=intermediate, e.g. 18944) — for
+            // the multi-domain FULL-RESIDENCE test raise it (ORK_MAXN=20000) so the whole FFN resides on NPU.
             static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 16384;
-            // LEVER D: dropped the strstr("output")/strstr("lm_head") guard — it over-matched attn_output.weight
-            // (a normal [3584,3584] matmul, N=3584), wrongly declining it to CPU. The real lm_head (output.weight,
-            // N=152064) stays excluded by N>max_n. Validated +12.6% prefill (pp256 35.79->40.2), bit-exact.
+            // LEVER D: dropped strstr("output")/strstr("lm_head") over-match (it wrongly declined attn_output.weight,
+            // a normal [3584,3584] matmul N=3584). Real lm_head (output.weight N=152064) still excluded by N>max_n.
             if (N > max_n) {
                 return false;
             }
@@ -2978,15 +3163,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             bool ork_accept = pass_m_threshold &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
-                   K % 32 == 0 && N % 64 == 0 &&           // K%32; N%64 satisfies both int8 (%32) and int4 (%64)
+                   K % 32 == 0 && N % 64 == 0 &&
                    K >= 32 &&
                    src1->ne[2] % src0->ne[2] == 0 &&
                    src1->ne[3] % src0->ne[3] == 0 &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
-            // LEVER D: confirm attn_output now reaches the NPU (it was wrongly declined by the old strstr guard).
             if (getenv("ORK_VERBOSE") && name && strstr(name, "attn_output"))
-                fprintf(stderr, "[ORK LEVERD attn_output] M=%ld N=%ld pass_m=%d -> ACCEPT=%d\n",
-                        (long)M, (long)N, (int)pass_m_threshold, (int)ork_accept);
+                fprintf(stderr, "[ORK LEVERD attn_output] M=%ld contigSrc0=%d contigSrc1=%d pass_m=%d -> ACCEPT=%d\n", (long)M, (int)ggml_is_contiguous(src0), (int)ggml_is_contiguous(src1), (int)pass_m_threshold, (int)ork_accept);
             return ork_accept;
         }
         case GGML_OP_MUL_MAT_ID: {
