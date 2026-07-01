@@ -3108,10 +3108,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const char * name = src0->name;
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
             fflush(stderr);
-            // N-cap: very wide matmuls (lm_head/output N~152k) blow up DMA/IOVA and can hang the driver, so
-            // keep them on CPU. Default cap 16384 EXCLUDES the FFN gate/up (N=intermediate, e.g. 18944) — for
-            // the multi-domain FULL-RESIDENCE test raise it (ORK_MAXN=20000) so the whole FFN resides on NPU.
-            static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 16384;
+            // N-cap: keep only the EXTREME vocab-projection (lm_head/output, N~152k, ~0.5 GiB resident,
+            // once-per-token) on CPU — it's an IOVA-budget policy, NOT a matmul limit. Byte-exact sweep
+            // (int8 K=3584, isolated, 2026-06-30): N=18944/32768/65536/131072/152064 ALL bit-exact, no
+            // hang — the NPU handles any real width via N-tiling. The old default 16384 was arbitrary and
+            // wrongly EXCLUDED the FFN gate/up (N=18944, the bulk of NPU-worthy compute), forcing it to CPU.
+            // Default 32768: FFN in (with headroom for wider models), 152k vocab out. ORK_MAXN overrides
+            // (e.g. =200000 to put lm_head on NPU too for a full-residence test).
+            static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 32768;
             // LEVER D: dropped strstr("output")/strstr("lm_head") over-match (it wrongly declined attn_output.weight,
             // a normal [3584,3584] matmul N=3584). Real lm_head (output.weight N=152064) still excluded by N>max_n.
             if (N > max_n) {
