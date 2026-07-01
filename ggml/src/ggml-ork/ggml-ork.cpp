@@ -713,51 +713,78 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
 // (int4 re-packs from the f32 plane internally; the int8 temp weight is only needed for the int8-tier dump).
 // Guarded to write mode and deduped via persist_dumped (per synthetic key), so a convert-decode re-pack
 // never double-writes. Resident NPU bytes stay ~0: the temp int8 weight is freed before the next slice.
+// Fuse dequant(src->f32) + per-output-channel int8 quant for ONE expert slice into caller buffers,
+// PARALLEL across the N output channels (each n independent → disjoint regions, no locking), un-pinned
+// across all online cores. CPU-only (touches no NPU/ctx state) so it can run on a helper thread while
+// the main thread does the serial NPU pack/DMA of another slice.
+static void ork_expert_dequant_quant(const struct ggml_tensor * src0, int e, int K, int N,
+                                      enum ggml_type type, ggml_to_float_t to_float,
+                                      float * f32, int8_t * bi, float * bscale) {
+    const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
+    const size_t nb01 = src0->nb[1];
+    int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
+    if (nthr > N) nthr = (int) N;
+    auto worker = [&](int n0, int n1) {
+        ork_unpin_current_thread();
+        for (int n = n0; n < n1; n++) {
+            float * frow = f32 + (size_t) n * K;
+            if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
+            else                        to_float(x + n*nb01, frow, K);
+            float mx = 1e-9f;
+            for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
+            float scale_val = mx / 127.0f; bscale[n] = scale_val;
+            for (int k = 0; k < K; k++) {
+                int q = (int) lrintf(frow[k] / scale_val);
+                bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+            }
+        }
+    };
+    if (nthr <= 1) { worker(0, (int) N); return; }
+    std::vector<std::thread> th; int chunk = ((int) N + nthr - 1) / nthr;
+    for (int t = 0; t < nthr; t++) { int a = t*chunk, b = std::min((int) N, a+chunk); if (a < b) th.emplace_back(worker, a, b); }
+    for (auto & t : th) t.join();
+}
+
 static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
                                       int K, int N, enum ggml_type type, ggml_to_float_t to_float) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     const int n_expert = (int) src0->ne[2];
-    std::vector<float> f32((size_t) N * K);
-    for (int e = 0; e < n_expert; e++) {
+
+    // Experts still needing a (re)build this run — skip any already dumped.
+    std::vector<int> todo;
+    for (int e = 0; e < n_expert; e++)
+        if (!ctx->persist_dumped.count(ork_expert_key(src0->name, e))) todo.push_back(e);
+    if (todo.empty()) return;
+
+    // COMPUTE→DMA PIPELINE. The per-expert work splits into a parallel CPU half (dequant+quant) and a
+    // serial NPU/IO half (ork_mm_pack_i8's bcreate + IOMMU-map + bsync DMA, then dump). The serial half
+    // is single-stream and leaves every core idle (~70% idle measured). So double-buffer: while THIS
+    // thread runs the serial NPU pack/dump of expert i, a helper thread dequant+quants expert i+1 (all
+    // cores) into the other buffer. Producer touches no NPU/ctx state → safe alongside the consumer.
+    // Consumed strictly in `todo` order, so the .orkpack is bit-identical to the serial version.
+    struct Stage { std::vector<float> f32; std::vector<int8_t> bi; std::vector<float> bscale; };
+    Stage buf[2];
+    for (auto & s : buf) { s.f32.resize((size_t) N * K); s.bi.resize((size_t) K * N); s.bscale.resize(N); }
+
+    auto consume = [&](Stage & s, int e) {
         const std::string key = ork_expert_key(src0->name, e);
-        if (ctx->persist_dumped.count(key)) continue;   // already dumped this slice
-        const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
-        const size_t nb01 = src0->nb[1];
-        // Dequant (src->f32) + per-output-channel int8 quant, FUSED and PARALLEL across the N output
-        // channels — mirrors the dense path (each n is independent: disjoint f32/bi/bscale regions, no
-        // locking). MoE models are expert-dominated, so this loop is the bulk of an .orkpack conversion;
-        // leaving it serial pinned the whole conversion to one core. Un-pinned across all online cores.
-        ork_weight ow; ow.bscale.resize(N);
-        std::vector<int8_t> bi((size_t) K * N);
-        {
-            int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
-            if (nthr > N) nthr = (int) N;
-            auto worker = [&](int n0, int n1) {
-                ork_unpin_current_thread();
-                for (int n = n0; n < n1; n++) {
-                    float * frow = f32.data() + (size_t) n * K;
-                    if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
-                    else                        to_float(x + n*nb01, frow, K);
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
-                    float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
-                    for (int k = 0; k < K; k++) {
-                        int q = (int) lrintf(frow[k] / scale_val);
-                        bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
-                    }
-                }
-            };
-            if (nthr <= 1) worker(0, (int) N);
-            else {
-                std::vector<std::thread> th; int chunk = ((int) N + nthr - 1) / nthr;
-                for (int t = 0; t < nthr; t++) { int a = t*chunk, b = std::min((int) N, a+chunk); if (a < b) th.emplace_back(worker, a, b); }
-                for (auto & t : th) t.join();
-            }
-        }
-        ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
-        if (!ow.w) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert pack FAIL %s\n", key.c_str()); continue; }
-        ork_persist_write(ctx, key.c_str(), K, N, ow, f32.data(), type);
+        ork_weight ow; ow.bscale = s.bscale;
+        ow.w = ork_mm_pack_i8(ctx->npu, K, N, s.bi.data());
+        if (!ow.w) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert pack FAIL %s\n", key.c_str()); return; }
+        ork_persist_write(ctx, key.c_str(), K, N, ow, s.f32.data(), type);
         ork_mm_free(ctx->npu, ow.w);   // resident ~0: free before the next slice
+    };
+
+    ork_expert_dequant_quant(src0, todo[0], K, N, type, to_float, buf[0].f32.data(), buf[0].bi.data(), buf[0].bscale.data());
+    for (size_t i = 0; i < todo.size(); i++) {
+        std::thread prod;
+        if (i + 1 < todo.size()) {
+            Stage & ns = buf[(i + 1) & 1];
+            prod = std::thread(ork_expert_dequant_quant, src0, todo[i + 1], K, N, type, to_float,
+                               ns.f32.data(), ns.bi.data(), ns.bscale.data());
+        }
+        consume(buf[i & 1], todo[i]);
+        if (prod.joinable()) prod.join();
     }
 }
 
