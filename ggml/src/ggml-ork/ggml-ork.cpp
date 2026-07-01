@@ -723,22 +723,35 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
         if (ctx->persist_dumped.count(key)) continue;   // already dumped this slice
         const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
         const size_t nb01 = src0->nb[1];
-        if (type == GGML_TYPE_F32) {
-            for (int64_t n = 0; n < N; n++) memcpy(f32.data() + n*K, x + n*nb01, (size_t) K*sizeof(float));
-        } else {
-            for (int64_t n = 0; n < N; n++) to_float(x + n*nb01, f32.data() + n*K, K);
-        }
-        // pack a temporary int8 weight from the f32 plane (per-channel absmax, mirrors the dense path) so
-        // ork_persist_write's int8 tier can dump ow.w; the int4 tier ignores ow.w and re-packs from f32.
+        // Dequant (src->f32) + per-output-channel int8 quant, FUSED and PARALLEL across the N output
+        // channels — mirrors the dense path (each n is independent: disjoint f32/bi/bscale regions, no
+        // locking). MoE models are expert-dominated, so this loop is the bulk of an .orkpack conversion;
+        // leaving it serial pinned the whole conversion to one core. Un-pinned across all online cores.
         ork_weight ow; ow.bscale.resize(N);
         std::vector<int8_t> bi((size_t) K * N);
-        for (int n = 0; n < N; n++) {
-            float mx = 1e-9f;
-            for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-            float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
-            for (int k = 0; k < K; k++) {
-                int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
-                bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+        {
+            int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
+            if (nthr > N) nthr = (int) N;
+            auto worker = [&](int n0, int n1) {
+                ork_unpin_current_thread();
+                for (int n = n0; n < n1; n++) {
+                    float * frow = f32.data() + (size_t) n * K;
+                    if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
+                    else                        to_float(x + n*nb01, frow, K);
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
+                    float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
+                    for (int k = 0; k < K; k++) {
+                        int q = (int) lrintf(frow[k] / scale_val);
+                        bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                    }
+                }
+            };
+            if (nthr <= 1) worker(0, (int) N);
+            else {
+                std::vector<std::thread> th; int chunk = ((int) N + nthr - 1) / nthr;
+                for (int t = 0; t < nthr; t++) { int a = t*chunk, b = std::min((int) N, a+chunk); if (a < b) th.emplace_back(worker, a, b); }
+                for (auto & t : th) t.join();
             }
         }
         ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
