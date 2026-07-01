@@ -662,8 +662,14 @@ static inline std::string ork_expert_key(const char * exps_name, int e) {
 // tier per ork_orkpack_tier(). int8: dump the already-packed tiled bytes (ow.w) + bscale[N]. int4: pack a
 // temporary int4-W4A8 weight from the f32 plane (n-major [N][K], as ggml's to_float produced) and dump its
 // self-describing 'O4N1' blob (carries K,N,quant_kind,bscale internally → no separate bscale trailer).
+// bi_i8 (optional): the raw int8 weights [K*N, k-major]. When the int8 tier is chosen and no NPU-packed
+// ow.w is supplied (the hybrid CPU route — NPU busy, or persistence-only weights that never went
+// resident), the blob is tiled on the CPU straight from bi_i8 (ork_w_dump_i8_cpu, byte-identical to the
+// NPU pack+dump) — no bcreate/IOVA. The int4 tier's NPU pack (ork_mm_pack_i4a8) is likewise gated on the
+// NPU being idle; if it's busy the weight falls through to the int8 CPU dump (correct, just less compact).
 static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N,
-                              const ork_weight & ow, const float * f32_plane, enum ggml_type src_type) {
+                              const ork_weight & ow, const float * f32_plane, enum ggml_type src_type,
+                              const int8_t * bi_i8 = nullptr) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
 
@@ -671,7 +677,7 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     if (getenv("ORK_VERBOSE"))
         fprintf(stderr, "[ORK PERSIST] tier %s K=%d N=%d src=%s -> int%d\n",
                 name, K, N, ggml_type_name(src_type), tier);
-    if (tier == 4) {
+    if (tier == 4 && !ork_npu_busy(ctx->npu)) {   // int4 uses the NPU packer — only when the NPU is idle
         std::vector<float> bscale_tmp(N);   // pack_i4a8 always writes bscale_out (no NULL check); the dump
         const float * im = ork_imatrix_lookup(name, K);   // per-input-channel importance, length K (or NULL)
         if (im && getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] imatrix %s (K=%d)\n", name, K);
@@ -693,9 +699,13 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
         }
         // int4 pack/dump failed → fall through to int8 (never persist a broken entry)
     }
-    size_t tb = ork_w_dump(ow.w, nullptr, 0);
+    // int8 tier: dump the NPU-packed tiles if we have them, else tile on the CPU from the raw int8
+    // weights (hybrid CPU route — no NPU/IOVA). Both produce byte-identical blobs.
+    size_t tb = ow.w ? ork_w_dump(ow.w, nullptr, 0)
+                     : ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, nullptr, 0);
     std::vector<char> tmp(tb);
-    ork_w_dump(ow.w, tmp.data(), tb);
+    if (ow.w) ork_w_dump(ow.w, tmp.data(), tb);
+    else      ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, tmp.data(), tb);
     orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
@@ -769,10 +779,12 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     auto consume = [&](Stage & s, int e) {
         const std::string key = ork_expert_key(src0->name, e);
         ork_weight ow; ow.bscale = s.bscale;
-        ow.w = ork_mm_pack_i8(ctx->npu, K, N, s.bi.data());
-        if (!ow.w) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] expert pack FAIL %s\n", key.c_str()); return; }
-        ork_persist_write(ctx, key.c_str(), K, N, ow, s.f32.data(), type);
-        ork_mm_free(ctx->npu, ow.w);   // resident ~0: free before the next slice
+        // HYBRID gate: experts are persistence-only (not used in the convert forward pass), so tile
+        // them on the NPU packer ONLY when the device is idle; while it's serving, tile on the CPU
+        // (ork_persist_write's int8 CPU path from s.bi) — no bcreate, no contention with inference.
+        if (!ork_npu_busy(ctx->npu)) ow.w = ork_mm_pack_i8(ctx->npu, K, N, s.bi.data());
+        ork_persist_write(ctx, key.c_str(), K, N, ow, s.f32.data(), type, s.bi.data());
+        if (ow.w) ork_mm_free(ctx->npu, ow.w);   // resident ~0: free before the next slice
     };
 
     ork_expert_dequant_quant(src0, todo[0], K, N, type, to_float, buf[0].f32.data(), buf[0].bi.data(), buf[0].bscale.data());
@@ -995,7 +1007,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
     if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
-    ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier)
+    ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type, bi);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier; bi = int8 CPU-dump fallback if NPU busy)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
     // STREAM-POOL: move the just-packed int8 weight into the RAM tier (cheap remaps on future hits).
     if (ctx->spool) {
