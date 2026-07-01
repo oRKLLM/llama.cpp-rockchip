@@ -126,8 +126,11 @@ static bool env_enabled(const char * name) {
 // ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled (mixed int8 / int4) weights ----
 // File: [ blobs: per weight, packed bytes then (int8 only) N bscale floats ][ index ][ footer@EOF ].
 // First run with ORK_PERSIST=<path> writes it (one slow pass); later runs mmap it and load the bytes
-// straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load, so a
-// stale/mismatched file can never feed wrong weights (a mismatch just falls back to packing).
+// straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load AND the
+// footer carries ork_pack_format_version() (ork-driver's MAJOR ver): a tile-layout / quant change bumps
+// that major, so an incompatible file is rejected wholesale at startup and regenerated (the read path
+// falls through to write mode). (K,N,dtype) alone can't catch a tiling change — same-(K,N) blobs from
+// an incompatible major have identical size — which is exactly what the token guards.
 //
 // Per-tensor tier is carried in `dtype` (the field is back-compatible — v1 files only ever wrote dtype==1):
 //   dtype == ORKPACK_DT_I8 (1): blob = ork_w_dump bytes (tiled int8), followed by bscale_n bscale floats.
@@ -137,11 +140,15 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 2u
+#define ORKPACK_VERSION 3u   // v3 adds ork_fmt (ork-driver pack-compat token = its MAJOR ver) to the footer
 #define ORKPACK_DT_I8   1u
 #define ORKPACK_DT_I4   4u
 struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
-struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; char magic[8]; };
+// ork_fmt = ork_pack_format_version() at write time. A tile-layout / quant change bumps ork-driver's
+// MAJOR version, so a stored ork_fmt != this build's => the tiled bytes are incompatible; the file is
+// rejected on read and regenerated (the read path falls through to write mode). magic stays last so it
+// remains the final 8 bytes of the file regardless of footer growth.
+struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; char magic[8]; };
 
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
 // Evicting those mmap'd pages keeps the source's RSS shrinking as packed RSS grows (peak ~max(src,packed)
@@ -158,13 +165,18 @@ static void ork_evict_src(const void * p, size_t n) {
 }
 
 struct ggml_backend_ork_context;   // fwd
-// Layer-streaming: the NPU IOMMU addresses only ~4 GiB at once (rk_iommu is 32-bit), so a >4 GiB model
-// can't keep every weight resident. Cap wcache resident bytes at a budget and evict the LRU weight
-// (reclaiming IOVA via ork_mm_free) to make room. In one prefill pass each weight packs once → amortizes.
+static size_t g_ork_weight_bytes = 0;   // diagnostic only; ork weights live on CPU buffers, so this stays ~0
+// Residence budget = the process RAM ceiling (total RAM - 1 GiB for the OS). Weights reside across the
+// IOMMU domains (each ~4 GiB; up to ~64 GiB total), and the wcache tracks the resident set; sizing the
+// budget to system RAM keeps a model that fits FULLY resident (no eviction, no churn). Only a model
+// larger than this budget evicts the LRU weight. This is the oRKLLM global memory limit — override with
+// ORK_WCACHE_BUDGET_MB (min(model, frontend cap, sysram-1GiB)); unset = sysram-1GiB.
 static size_t ork_wcache_budget() {
-    static size_t b = 0;
-    if (!b) { const char * e = getenv("ORK_WCACHE_BUDGET_MB"); b = (size_t)(e ? atoll(e) : 3072) * 1024 * 1024; }
-    return b;
+    const char * e = getenv("ORK_WCACHE_BUDGET_MB");
+    if (e) return (size_t) atoll(e) * 1024 * 1024;
+    size_t ram = (size_t) sysconf(_SC_PHYS_PAGES) * (size_t) sysconf(_SC_PAGE_SIZE);
+    size_t rsv = (size_t) 1024 * 1024 * 1024;
+    return ram > rsv ? ram - rsv : (ram ? ram : (size_t) 4 * 1024 * 1024 * 1024);
 }
 
 // ---- STREAM-POOL tier (ORK_STREAM_POOL=1) -------------------------------------------------------
@@ -176,14 +188,17 @@ static size_t ork_wcache_budget() {
 // Measured uABI costs drive this: inflate(fill) 0.4-2.7ms + MEM_DESTROY(unmap) 0.5-2ms are expensive
 // (paid once on add / only on eviction); MEM_CREATE(map) is cheap (~48-169us, paid per (re)map on a hit).
 // So: keep hot entries MAPPED, evict the IOVA mapping rarely, and NEVER re-inflate on a RAM hit.
-static int ork_stream_pool_enabled() {
-    static int e = -1;
-    if (e < 0) { const char * s = getenv("ORK_STREAM_POOL"); e = (s && s[0] && s[0] != '0') ? 1 : 0; }
-    return e;
-}
+// RAM tier = the process RAM ceiling (total RAM - 1 GiB for the OS): how much inflated int8 we hold
+// resident in CPU RAM (>> the 4 GiB IOVA window). This is the oRKLLM global memory limit; override with
+// ORK_STREAM_RAM_BUDGET_MB. The hot IOVA subset is capped separately by ork_wcache_budget() (< 4 GiB).
 static size_t ork_stream_ram_budget() {
     static size_t b = 0;
-    if (!b) { const char * e = getenv("ORK_STREAM_RAM_BUDGET_MB"); b = (size_t)(e ? atoll(e) : 10240) * 1024 * 1024; }
+    if (!b) {
+        const char * e = getenv("ORK_STREAM_RAM_BUDGET_MB");
+        if (e) b = (size_t) atoll(e) * 1024 * 1024;
+        else { size_t ram = (size_t) sysconf(_SC_PHYS_PAGES) * (size_t) sysconf(_SC_PAGE_SIZE);
+               size_t r = (size_t) 1024 * 1024 * 1024; b = ram > r ? ram - r : (ram ? ram : (size_t)10240*1024*1024); }
+    }
     return b;
 }
 
@@ -320,24 +335,40 @@ struct ggml_backend_ork_context {
     size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
+    int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
 static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
-// MULTI-DOMAIN RESIDENCE: pick the IOMMU domain a weight should reside in from its tensor name.
-// "blk.<i>.<...>" -> domain = min(i / domain_layers, n_domains-1); anything else -> domain 0.
-// domain_layers defaults (when ORK_DOMAIN_LAYERS unset) to ceil(28 / n_domains) (Qwen2.5-7B = 28 layers);
-// for a different layer count pass ORK_DOMAIN_LAYERS explicitly. Returns 0 when multi-domain is off.
-static int ork_weight_domain(ggml_backend_ork_context * ctx, const char * name) {
-    if (ctx->n_domains <= 1 || !name) return 0;
-    int layer = -1;
-    if (strncmp(name, "blk.", 4) == 0) layer = atoi(name + 4);
-    if (layer < 0) return 0;   // token_embd / output / norms -> domain 0
-    int dl = ctx->domain_layers;
-    if (dl <= 0) dl = (28 + ctx->n_domains - 1) / ctx->n_domains;
-    int d = layer / dl;
-    if (d >= ctx->n_domains) d = ctx->n_domains - 1;
+// MULTI-DOMAIN RESIDENCE: place each weight in an IOMMU domain, filled SELF-CALIBRATING + sequential.
+// ork is a compute-only accelerator: the model's weights live on CPU/mmap buffers (not ork buffers, so
+// g_ork_weight_bytes stays ~0) and arrive one matmul at a time, so the resident total is NOT known up
+// front, and the exact usable IOVA per domain isn't a fixed number (alignment/fragmentation + the full-K
+// Bf rebuild inflate it). So instead of a magic per-domain byte cap, we fill the CURRENT domain until a
+// pack actually fails (bcreate EFAULT = that domain's real IOVA limit), then the caller advances the
+// cursor and retries the weight in the next domain (see ork_domain_advance). This uses the full usable
+// window of each domain and needs neither the total nor a hardcoded cap. Returns the current domain
+// (0 when multi-domain is off).
+static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes) {
+    if (ctx->n_domains <= 1) return 0;
+    // Advance to the next domain BEFORE this one hits its IOVA EFAULT. Critical: a domain filled to its
+    // ~4 GiB limit EFAULTs and soft-resets the NPU, which corrupts the IOMMU so the NEXT domain fails to
+    // start (measured: fill domain 0 to EFAULT → domain 1 dies on its first tile). domain_probe shows the
+    // real per-domain limit is ~4.16 GiB; cap at 3.0 GiB to leave margin for the full-K Bf inflation and a
+    // one-weight overshoot — so no domain ever EFAULTs and the hand-off to the next domain is clean.
+    const size_t cap = (size_t) 3000 * 1024 * 1024;
+    int d = ctx->domain_cursor;
+    if (d < ctx->n_domains - 1 && ctx->domain_bytes[d] + bytes > cap) d = ++ctx->domain_cursor;
+    return d;
+}
+// A pack/load just failed in the current domain (its IOVA window is full). Advance to the next domain if
+// one remains; returns the new domain, or -1 when the last domain is also exhausted (a real OOM).
+static int ork_domain_advance(ggml_backend_ork_context * ctx) {
+    if (ctx->domain_cursor >= ctx->n_domains - 1) return -1;
+    int d = ++ctx->domain_cursor;
+    ork_npu_set_pack_domain(ctx->npu, d);
+    fprintf(stderr, "[ork] domain %d full — advancing residence to domain %d\n", d - 1, d);
     return d;
 }
 
@@ -427,7 +458,18 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             void * m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
             if (m != MAP_FAILED) {
                 orkpack_footer f; memcpy(&f, (char *) m + sz - sizeof f, sizeof f);
-                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && (f.version == 1u || f.version == 2u) && f.index_off < (uint64_t) sz) {
+                // Reject (=> regenerate below) if the ork-driver pack format is incompatible: an older
+                // footer schema (< v3, no ork_fmt) or a different pack-compat token (a tiling/quant
+                // change bumps ork-driver's MAJOR version). Same-(K,N) blobs from an incompatible major
+                // are the SAME size, so this token is the only thing that catches them.
+                bool magic_ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
+                if (magic_ok && f.version != ORKPACK_VERSION)          // older footer schema (pre-v3, no token)
+                    fprintf(stderr, "[ORK PERSIST] %s predates the pack-compat token (footer < v%u) — regenerating\n", p, ORKPACK_VERSION);
+                else if (magic_ok && f.ork_fmt != ork_pack_format_version())   // v3 file, but tiling/quant major differs
+                    fprintf(stderr, "[ORK PERSIST] %s is stale (pack-compat token %u != this build's %u) — regenerating\n",
+                            p, f.ork_fmt, ork_pack_format_version());
+                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+                    f.ork_fmt == ork_pack_format_version() && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
@@ -721,6 +763,7 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     }
     orkpack_footer f; memset(&f, 0, sizeof f);
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
+    f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
     memcpy(f.magic, ORKPACK_MAGIC, 8);
     fwrite(&f, sizeof f, 1, ctx->persist_out);
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
@@ -807,18 +850,23 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
-            const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
+            int _dom = ork_weight_domain(ctx, (size_t) K * N);     // multi-domain residence: byte-balanced (advance before EFAULT)
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
-            if (e.dtype == ORKPACK_DT_I4) {
-                ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);
-                if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
-            } else {
-                const double _l0 = ctx->profile ? ork_now_us_e() : 0;
-                ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size);
-                if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
-                if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
-                            ow.bscale.assign(bs, bs + e.bscale_n); }
+            for (;;) {                                             // retry in the next domain on IOVA exhaustion
+                if (e.dtype == ORKPACK_DT_I4) {
+                    ow.w = ork_mm_load_i4a8_import(ctx->npu, K, N, blob, e.blob_size);   // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                    if (!ow.w) ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);  // fallback: copy (import unavailable)
+                    if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
+                } else {
+                    const double _l0 = ctx->profile ? ork_now_us_e() : 0;
+                    ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                    if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // fallback: copy (import unavailable)
+                    if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
+                    if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                                ow.bscale.assign(bs, bs + e.bscale_n); }
+                }
+                if (ow.w || (_dom = ork_domain_advance(ctx)) < 0) break;   // packed, or all domains exhausted
             }
             if (ow.w) {
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
@@ -850,38 +898,52 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     ctx->bi .resize((size_t) K * N);
     float  * f32 = ctx->f32.data();
     int8_t * bi  = ctx->bi.data();
-    const double _d0 = ctx->profile ? ork_now_us_e() : 0;
-    if (type == GGML_TYPE_F32) {
-        for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
-    } else {
-        for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
-    }
-    if (ctx->profile) ctx->s_dequant += ork_now_us_e() - _d0;
-    const double _t0 = ctx->profile ? ork_now_us_e() : 0;
     ork_weight ow; ow.bscale.resize(N);
-    for (int n = 0; n < N; n++) {
-        float mx = 1e-9f;
-        for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-        float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
-        for (int k = 0; k < K; k++) {
-            int q = (int) lrintf(f32[(size_t) n*K + k] / scale_val);
-            bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+    const double _d0 = ctx->profile ? ork_now_us_e() : 0;
+    // Dequant (Q8_0 -> f32) + per-output-channel symmetric int8 quant, FUSED and PARALLEL across the N
+    // output channels. Each channel n is independent: it reads x[n], writes f32[n*K..] and bi[.,n] +
+    // bscale[n] — disjoint regions, so no locking. This is the residence-fill / .orkpack-conversion hot
+    // path (was single-threaded — ~2 min on a 7B); there is no live inference to protect during a pack,
+    // so use ALL cores (big+little), dynamic core count from the OS, no knob.
+    {
+        int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
+        if (nthr > N) nthr = (int) N;
+        auto worker = [&](int n0, int n1) {
+            for (int n = n0; n < n1; n++) {
+                float * frow = f32 + (size_t) n * K;
+                if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
+                else                        to_float((const char *) x + n*nb01, frow, K);
+                float mx = 1e-9f;
+                for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
+                float scale_val = mx / 127.0f; ow.bscale[n] = scale_val;
+                for (int k = 0; k < K; k++) {
+                    int q = (int) lrintf(frow[k] / scale_val);
+                    bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                }
+            }
+        };
+        if (nthr <= 1) worker(0, (int) N);
+        else {
+            std::vector<std::thread> th; int chunk = ((int) N + nthr - 1) / nthr;
+            for (int t = 0; t < nthr; t++) { int a = t*chunk, b = std::min((int) N, a+chunk); if (a < b) th.emplace_back(worker, a, b); }
+            for (auto & t : th) t.join();
         }
     }
-    if (ctx->profile) ctx->s_tile += ork_now_us_e() - _t0;
-    // STREAM-POOL bugfix: when the pool is active, free IOVA by UNMAPPING the LRU stream entry
-    // (ork_spool_iova_evict — keeps the RAM-resident inflate, next touch is a cheap remap), NOT by
-    // ERASING the wcache slot (ork_wcache_evict), which destroys the cached entry and forces a full
-    // re-inflate (re-pack) on the next touch. Plain wcache (no spool) still uses the erase-evict.
+    if (ctx->profile) ctx->s_dequant += ork_now_us_e() - _d0;
+    // Multi-domain residence: weights pack once into their IOMMU domain (ork_weight_domain byte-balances
+    // them across domains; dom_activate swaps the active domain per submit). A 7B fits ~2 domains fully
+    // resident — no eviction/churn. wcache_evict only fires if the whole set exceeds the (large) budget.
     if (allow_evict) {
         if (ctx->spool) ork_spool_iova_evict(ctx, (size_t) K * N);
         else            ork_wcache_evict(ctx, (size_t) K * N);
     }
     const double _p0 = ctx->profile ? ork_now_us_e() : 0;
-    const int _dom = ork_weight_domain(ctx, src0->name);   // multi-domain residence: place this weight
+    int _dom = ork_weight_domain(ctx, (size_t) K * N);     // multi-domain residence: byte-balanced (advance before EFAULT)
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
+    while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)  // domain's IOVA full -> next domain, retry
+        ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
     if (ctx->profile) ctx->s_pack += ork_now_us_e() - _p0;
     if (!ow.w) return ctx->wcache.end();
     it = ctx->wcache.emplace(x, std::move(ow)).first;
@@ -3001,16 +3063,26 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
     // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
     // residence never evicts.
-    { const char * nd = getenv("ORK_DOMAINS"); ctx->n_domains = nd ? atoi(nd) : 1; if (ctx->n_domains < 1) ctx->n_domains = 1; if (ctx->n_domains > 16) ctx->n_domains = 16;
-      const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0;
-      if (ctx->n_domains > 1) fprintf(stderr, "[ork] MULTI-DOMAIN RESIDENCE: %d domains, %d layers/domain (0=auto), wcache budget %zu MB\n",
-            ctx->n_domains, ctx->domain_layers, ork_wcache_budget()>>20); }
-    if (ork_stream_pool_enabled()) {
-        ctx->spool = ork_stream_pool_create(ctx->npu);   // NULL if dma-heap import unavailable -> plain wcache
-        if (ctx->spool) fprintf(stderr, "[ork] STREAM-POOL enabled: RAM budget %zu MB, IOVA budget %zu MB\n",
-                                ork_stream_ram_budget()>>20, ork_wcache_budget()>>20);
-        else fprintf(stderr, "[ork] STREAM-POOL requested but import unavailable — falling back to plain wcache\n");
-    }
+    { const char * nd = getenv("ORK_DOMAINS");
+      if (nd) {                                                  // explicit override (debug/pinning)
+          ctx->n_domains = atoi(nd);
+          if (ctx->n_domains < 1)  ctx->n_domains = 1;
+          if (ctx->n_domains > 16) ctx->n_domains = 16;
+      } else {
+          // OPERATION-DRIVEN: a ceiling of domains; ork_weight_domain() byte-balanced-fills only as many
+          // as the resident set actually needs (each ~3.6 GiB, < the 4 GiB rk_iommu IOVA window). The
+          // model total isn't known here (ork is compute-only: weights live on CPU buffers, and arrive
+          // one matmul at a time), so we can't size it exactly up front — the cursor grows on demand.
+          // 8 domains cover up to ~28 GiB of resident weights (the 32 GiB board's practical max).
+          ctx->n_domains = 8;
+      }
+      const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0; }
+    // Residency = ork-driver's MULTI-DOMAIN mechanism (weights resident across up to 16 IOMMU domains,
+    // each its own ~4 GiB IOVA window; dom_activate zero-copy-swaps the active domain per submit). This
+    // resides up to ~64 GiB with no streaming — every practical model. The stream pool (RAM-hold + dma-buf
+    // map/unmap) is only needed BEYOND that; leave it off (NULL) so the domain path is used.
+    ctx->spool = nullptr;
+    fprintf(stderr, "[ork] residency: multi-domain (up to %d domains x ~4 GiB IOVA, dom_activate swap)\n", ctx->n_domains);
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
@@ -3083,8 +3155,72 @@ static void ggml_backend_ork_device_get_props(ggml_backend_dev_t dev, struct ggm
 static ggml_backend_t ggml_backend_ork_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     return ggml_backend_ork_init(); GGML_UNUSED(dev); GGML_UNUSED(params);
 }
+// ================= M1: ork's own weight buffer type =================
+// MUST be distinct from ggml_backend_cpu_buffer_type() so make_cpu_buft_list (llama-model.cpp:880,
+// "if (buft != cpu_buffer_type)") ADDS it to the weight-preference list. The loader then routes every
+// matmul weight ork supports_op onto this buft; those weights live on the ork backend, so the scheduler
+// runs their MUL_MAT on ork by weight-locality — which is what finally makes graph_compute fire and the
+// NPU light up (previously get_buffer_type aliased the CPU buffer type -> line 880 skipped ork -> weights
+// went to the aarch64 repack buffer (is_host=false) -> ork never got any op -> NPU 0%).
+// Host-backed for M1 (holds the plain ggml bytes; CPU fallback + normal weight load work unchanged).
+// M2: set_tensor will substitute the pre-tiled .orkpack blob (native NPU, mmap) instead of the ggml bytes.
+static void * ggml_backend_ork_buffer_get_base(ggml_backend_buffer_t buffer) { return buffer->context; }
+static void   ggml_backend_ork_buffer_free_buffer(ggml_backend_buffer_t buffer) { free(buffer->context); }
+static void   ggml_backend_ork_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *) tensor->data + offset, data, size); GGML_UNUSED(buffer);
+}
+static void   ggml_backend_ork_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size); GGML_UNUSED(buffer);
+}
+static void   ggml_backend_ork_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    memset((char *) tensor->data + offset, value, size); GGML_UNUSED(buffer);
+}
+static bool   ggml_backend_ork_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) { memcpy(dst->data, src->data, ggml_nbytes(src)); return true; }
+    return false; GGML_UNUSED(buffer);
+}
+static void   ggml_backend_ork_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) { memset(buffer->context, value, buffer->size); }
+
+static const struct ggml_backend_buffer_i ggml_backend_ork_buffer_i = {
+    /* .free_buffer   = */ ggml_backend_ork_buffer_free_buffer,
+    /* .get_base      = */ ggml_backend_ork_buffer_get_base,
+    /* .init_tensor   = */ NULL,
+    /* .memset_tensor = */ ggml_backend_ork_buffer_memset_tensor,
+    /* .set_tensor    = */ ggml_backend_ork_buffer_set_tensor,
+    /* .get_tensor    = */ ggml_backend_ork_buffer_get_tensor,
+    /* .set_tensor_2d = */ NULL,
+    /* .get_tensor_2d = */ NULL,
+    /* .cpy_tensor    = */ ggml_backend_ork_buffer_cpy_tensor,
+    /* .clear         = */ ggml_backend_ork_buffer_clear,
+    /* .reset         = */ NULL,
+};
+static const char * ggml_backend_ork_buffer_type_get_name(ggml_backend_buffer_type_t buft) { return "ORK_Weights"; GGML_UNUSED(buft); }
+static ggml_backend_buffer_t ggml_backend_ork_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * data = NULL;
+    if (posix_memalign(&data, 64, size ? size : 64) != 0) return NULL;
+    g_ork_weight_bytes += size;   // (diagnostic only; ork weights live on CPU buffers so this stays ~0)
+    return ggml_backend_buffer_init(buft, ggml_backend_ork_buffer_i, data, size);
+}
+static size_t ggml_backend_ork_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) { return 64; GGML_UNUSED(buft); }
+static bool   ggml_backend_ork_buffer_type_is_host(ggml_backend_buffer_type_t buft) { return true; GGML_UNUSED(buft); }
+static ggml_backend_buffer_type_t ggml_backend_ork_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name       = */ ggml_backend_ork_buffer_type_get_name,
+            /* .alloc_buffer   = */ ggml_backend_ork_buffer_type_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_ork_buffer_type_get_alignment,
+            /* .get_max_size   = */ NULL,
+            /* .get_alloc_size = */ NULL,
+            /* .is_host        = */ ggml_backend_ork_buffer_type_is_host,
+        },
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+    if (buft.device == NULL) buft.device = ggml_backend_reg_dev_get(ggml_backend_ork_reg(), 0);
+    return &buft;
+}
 static ggml_backend_buffer_type_t ggml_backend_ork_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type(); GGML_UNUSED(dev);
+    return ggml_backend_ork_buffer_type(); GGML_UNUSED(dev);
 }
 static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     return ggml_backend_cpu_buffer_from_ptr(ptr, size); GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
