@@ -909,6 +909,11 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
         if (nthr > N) nthr = (int) N;
         auto worker = [&](int n0, int n1) {
+            // Un-pin: the host pins this worker process to the big cluster for inference, but a
+            // pack has no live inference to protect — spread across ALL cores (ork-driver owns
+            // the affinity logic). Otherwise these threads inherit the big-core pin and the
+            // conversion never saturates the little cores.
+            ork_unpin_current_thread();
             for (int n = n0; n < n1; n++) {
                 float * frow = f32 + (size_t) n * K;
                 if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
