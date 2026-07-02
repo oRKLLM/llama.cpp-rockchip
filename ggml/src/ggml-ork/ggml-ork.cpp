@@ -95,6 +95,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <sys/resource.h>   // getrusage — process CPU time for the decode wall-vs-busy trace
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -279,6 +280,12 @@ struct ggml_backend_ork_context {
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
+    // DECODE WALL vs CPU-BUSY (ORK_PROFILE): per graph_compute call, wall time and process CPU time
+    // (getrusage, summed across all threads). wall≈token latency; cpu/wall/ncores = busy fraction; the
+    // idle remainder is time the CPU spends WAITING (blocked on NPU submits / sync). Splits the ~78%
+    // "outside the matmul kernel" into round-trip WAIT (→ async overlap) vs CPU graph COMPUTE (→ offload).
+    // Skips the first calls (warmup/prefill/one-time weight resolve) so the window is steady decode.
+    double dt_wall = 0, dt_cpu = 0, dt_ork = 0; long dt_calls = 0, dt_skip = 0;
     double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
     // STREAMING sub-breakdown (ORK_PROFILE): where weight-resolution time goes for the 7B streamed prefill.
@@ -1044,6 +1051,10 @@ void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
 }
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
+// Process CPU time (all threads) in microseconds — for the decode wall-vs-busy trace. wall-per-token vs
+// this tells us how much of a token is CPU work vs idle WAIT (blocked on NPU submits).
+static inline double ork_cpu_us(void) { struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+    return (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1e6 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec); }
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
 // Central dispatcher: pick the right ork-driver entry for a set of independent int8 matmul tasks
@@ -1732,6 +1743,15 @@ static void ork_profile_dump(ggml_backend_ork_context * ctx) {
     if (!ctx || g_ork_prof_dumped) return;
     if (ctx->profile) fprintf(stderr, "[ork DUMP] profile=%d n_mm=%ld t_quant=%.0fms t_run=%.0fms t_deq=%.0fms t_actq=%.0fms\n",
                               ctx->profile, ctx->n_mm, ctx->t_quant/1e3, ctx->t_run/1e3, ctx->t_deq/1e3, ctx->t_actq/1e3);
+    // Decode wall-vs-busy: splits the ~78% "outside the matmul kernel". cores≈cpu/wall = avg CPU cores busy
+    // per token: LOW (≪1) ⇒ the CPU is idle most of the token = WAIT-bound (blocked on NPU submits →
+    // async CPU‖NPU overlap is the lever); HIGH (→ -t) ⇒ CPU-compute-bound (ggml graph → offload to NPU).
+    // ork-submit% vs non-ork% splits the matmul path from the ggml graph.
+    if (ctx->profile && ctx->dt_calls > 0) {
+        double wall = ctx->dt_wall / ctx->dt_calls, cpu = ctx->dt_cpu / ctx->dt_calls, ork = ctx->dt_ork / ctx->dt_calls;
+        fprintf(stderr, "[ork DECODE] steady tokens=%ld | wall %.0f us/tok | CPU-busy %.0f us/tok = %.2f cores avg | ork-submit %.0f us (%.0f%% wall) | non-ork/ggml %.0f us (%.0f%% wall)\n",
+                ctx->dt_calls, wall, cpu, wall > 0 ? cpu / wall : 0, ork, wall > 0 ? 100 * ork / wall : 0, wall - ork, wall > 0 ? 100 * (wall - ork) / wall : 0);
+    }
     if (ctx->profile && ctx->n_mm) {
         g_ork_prof_dumped = 1;
         double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
@@ -3018,6 +3038,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
+    // Decode wall-vs-busy trace: wall + process-CPU + ork-run at graph entry; accumulated at the success
+    // return, skipping the first ~24 calls (warmup / prefill / one-time weight resolve) → steady decode.
+    const double _gw0 = ctx->profile ? ork_now_us()  : 0;
+    const double _gc0 = ctx->profile ? ork_cpu_us()  : 0;
+    const double _gr0 = ctx->profile ? ctx->t_run    : 0;
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
     // MULTI-DOMAIN RESIDENCE: the FIRST decode graph (max matmul M==1) means the full prefill has run and
     // every weight is now resident; from here ANY further pack/load is per-token churn (the thing this
@@ -3187,6 +3212,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             default:
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
+    }
+    if (ctx->profile) {
+        if (ctx->dt_skip < 24) { ctx->dt_skip++; }   // warmup / prefill / one-time weight resolve
+        else { ctx->dt_wall += ork_now_us() - _gw0; ctx->dt_cpu += ork_cpu_us() - _gc0; ctx->dt_ork += ctx->t_run - _gr0; ctx->dt_calls++; }
     }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
