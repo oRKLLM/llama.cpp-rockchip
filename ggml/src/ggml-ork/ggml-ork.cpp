@@ -1062,11 +1062,14 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     } else {
         bool same_dom = true; const int d0 = ork_w_domain(tasks[0].w);
         for (size_t t = 1; t < tasks.size(); t++) if (ork_w_domain(tasks[t].w) != d0) { same_dom = false; break; }
-        // RR (run_stream, all cores concurrently) wins ONLY at M==1 (decode): the independent matmuls
-        // run serially on one core otherwise, so RR is 2–3x. At M>1 run_i8 already N-tile-multicores per
-        // matmul, and RR's extra submits lose — so chain there. RR is also single-domain (one active
-        // IOMMU domain at a time) → only when all weights share a domain.
-        const bool rr = same_dom && tasks[0].M == 1;
+        // Decode (M==1) group dispatch. Measured: RR (run_stream, spread the group across cores) gives NO
+        // end-to-end decode gain — decode is bound by the per-submit dispatch FLOOR + shared DRAM bandwidth,
+        // not per-core compute, so parallelizing the same submit COUNT doesn't help. run_chain PC-chains the
+        // whole group into ONE submit (one floor for S matmuls, single core) — how librkllmrt keeps decode
+        // fast — which REDUCES the submit count that actually bounds decode. So chain the M==1 group by
+        // default; ORK_GROUP=stream opts back into RR for A/B comparison.
+        const char * gm = getenv("ORK_GROUP");
+        const bool rr = same_dom && tasks[0].M == 1 && gm && strcmp(gm, "stream") == 0;
         rc = rr ? ork_mm_run_stream_i8(ctx->npu, tasks.size(), tasks.data())
                 : ork_mm_run_chain_i8 (ctx->npu, tasks.size(), tasks.data());
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] dispatch: %zu tasks M=%d same_dom=%d -> %s rc=%d\n",
@@ -3080,7 +3083,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 // collect them, run all concurrently across the NPU cores (2–3x vs the serial single-core
                 // path, measured), and skip them when the loop reaches their positions. Their inputs
                 // (shared src1 + static weights) are ready here; their outputs are consumed only later.
-                if (!ctx->spool && type == ORK_CHAIN_I8 && node->ne[2] == 1 && node->ne[3] == 1 &&
+                if (getenv("ORK_GROUP") && !ctx->spool && type == ORK_CHAIN_I8 && node->ne[2] == 1 && node->ne[3] == 1 &&
                     node->src[1]->ne[1] == 1) {
                     struct ggml_tensor * grp[16]; int ng = 1; grp[0] = node;
                     for (int j = i + 1; j < cgraph->n_nodes && (j - i) < 96 && ng < 16; j++) {
