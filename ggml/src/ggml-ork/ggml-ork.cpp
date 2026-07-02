@@ -336,6 +336,7 @@ struct ggml_backend_ork_context {
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
+    int    domain_last_layer = -1;   // last blk.N layer index seen by ork_weight_domain (advance domains only at layer boundaries)
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -350,7 +351,7 @@ static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK
 // cursor and retries the weight in the next domain (see ork_domain_advance). This uses the full usable
 // window of each domain and needs neither the total nor a hardcoded cap. Returns the current domain
 // (0 when multi-domain is off).
-static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes) {
+static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, const char * name) {
     if (ctx->n_domains <= 1) return 0;
     // Advance to the next domain BEFORE this one hits its IOVA EFAULT. Critical: a domain filled to its
     // ~4 GiB limit EFAULTs and soft-resets the NPU, which corrupts the IOMMU so the NEXT domain fails to
@@ -358,8 +359,17 @@ static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes) {
     // real per-domain limit is ~4.16 GiB; cap at 3.0 GiB to leave margin for the full-K Bf inflation and a
     // one-weight overshoot — so no domain ever EFAULTs and the hand-off to the next domain is clean.
     const size_t cap = (size_t) 3000 * 1024 * 1024;
+    // Advance ONLY at a LAYER boundary (the blk.N index changed), never mid-layer, so a layer's whole
+    // matmul set (Q/K/V, gate/up) stays co-domain. That (a) lets the independent QKV/gate-up chain run
+    // round-robin across cores (run_stream is single-domain), and (b) keeps decode's per-token domain
+    // swaps at their minimum (~one per boundary). A layer's weights are tens of MB — far under the cap's
+    // ~1.16 GiB margin — so deferring the advance to the next layer never risks an EFAULT.
+    int layer = -1;
+    if (name) { const char * p = strstr(name, "blk."); if (p) layer = atoi(p + 4); }
+    const bool new_layer = (layer >= 0 && layer != ctx->domain_last_layer);
     int d = ctx->domain_cursor;
-    if (d < ctx->n_domains - 1 && ctx->domain_bytes[d] + bytes > cap) d = ++ctx->domain_cursor;
+    if (d < ctx->n_domains - 1 && ctx->domain_bytes[d] + bytes > cap && new_layer) d = ++ctx->domain_cursor;
+    if (layer >= 0) ctx->domain_last_layer = layer;
     return d;
 }
 // A pack/load just failed in the current domain (its IOVA window is full). Advance to the next domain if
@@ -910,7 +920,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
-            int _dom = ork_weight_domain(ctx, (size_t) K * N);     // multi-domain residence: byte-balanced (advance before EFAULT)
+            int _dom = ork_weight_domain(ctx, (size_t) K * N, src0->name);     // multi-domain residence: byte-balanced, layer-aligned (advance only at layer boundaries)
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             for (;;) {                                             // retry in the next domain on IOVA exhaustion
@@ -1003,7 +1013,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         else            ork_wcache_evict(ctx, (size_t) K * N);
     }
     const double _p0 = ctx->profile ? ork_now_us_e() : 0;
-    int _dom = ork_weight_domain(ctx, (size_t) K * N);     // multi-domain residence: byte-balanced (advance before EFAULT)
+    int _dom = ork_weight_domain(ctx, (size_t) K * N, src0->name);     // multi-domain residence: byte-balanced, layer-aligned (advance only at layer boundaries)
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
@@ -1036,6 +1046,34 @@ void ggml_backend_ork_set_hybrid(bool use_hybrid) {
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // dst = src0 x src1 :  src0 [K=ne00, N=ne01], src1 [K=ne10=ne00, M=ne11], dst [N, M] (row-major [M][N])
+// Central dispatcher: pick the right ork-driver entry for a set of independent int8 matmul tasks
+// (a single weight, or a chain of matmuls that share src1 — Q/K/V, gate/up — hence data-independent).
+//   • 1 task              → ork_mm_run_i8 (does its own K-split / N-tiling / M-scheduler multicore)
+//   • N, SAME domain      → ork_mm_run_stream_i8 — round-robin the independent matmuls across the 3 NPU
+//                           cores concurrently (the NPU has ONE active IOMMU domain at a time, so RR is
+//                           only valid within a domain; layer-aligned placement keeps a chain co-domain)
+//   • N, cross-domain     → ork_mm_run_chain_i8 (single-core chain; cross-domain concurrency unsupported)
+// On any error, falls back to sequential per-task run_i8. Returns true on success.
+static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
+    if (tasks.empty()) return true;
+    int rc;
+    if (tasks.size() == 1) {
+        rc = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
+    } else {
+        bool same_dom = true; const int d0 = ork_w_domain(tasks[0].w);
+        for (size_t t = 1; t < tasks.size(); t++) if (ork_w_domain(tasks[t].w) != d0) { same_dom = false; break; }
+        rc = same_dom ? ork_mm_run_stream_i8(ctx->npu, tasks.size(), tasks.data())
+                      : ork_mm_run_chain_i8 (ctx->npu, tasks.size(), tasks.data());
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] dispatch: %zu tasks, same_dom=%d -> %s rc=%d\n",
+                                           tasks.size(), (int)same_dom, same_dom ? "run_stream" : "run_chain", rc);
+    }
+    if (rc != 0) {   // fallback: sequential single-task
+        for (size_t t = 0; t < tasks.size(); t++)
+            if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) return false;
+    }
+    return true;
+}
+
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -1197,18 +1235,9 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             for (size_t t = 0; t < tasks.size(); t++)
                 if (ork_stream_pool_run(ctx->spool, task_se[t], tasks[t].M, tasks[t].A, tasks[t].C)) { ok = -1; break; }
             if (ok != 0) return false;
-        } else if (tasks.size() == 1) {
-            ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
         } else {
-            ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
-            if (ok != 0) {
-                // Fallback to sequential single-task run
-                for (size_t t = 0; t < tasks.size(); t++) {
-                    if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
-                        return false;
-                    }
-                }
-            }
+            if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
+            ok = 0;
         }
 
         const double t2 = ctx->profile ? ork_now_us() : 0;
@@ -2177,22 +2206,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
     fflush(stderr);
     
-    int ok = 0;
-    if (tasks.size() == 1) {
-        ok = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
-    } else {
-        ok = ork_mm_run_chain_i8(ctx->npu, tasks.size(), tasks.data());
-    }
-    
-    if (ok != 0) {
-        // Fallback to sequential single-task run
-        if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain failed (%d), falling back to sequential\n", ok); fflush(stderr);
-        for (size_t t = 0; t < tasks.size(); t++) {
-            if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) {
-                return false;
-            }
-        }
-    }
+    if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
 
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
