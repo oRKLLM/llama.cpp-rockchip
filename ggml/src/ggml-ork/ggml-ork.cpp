@@ -3365,7 +3365,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
-            bool ork_accept = pass_m_threshold &&
+            // src0 must be a plain 2-D STATIC weight. mul_mat_i8 resolves src0 as ONE resident 2-D
+            // weight keyed on its data pointer (packed/tiled once, cached). A BATCHED src0 (ne[2]/ne[3]>1,
+            // e.g. per-head Gated-Delta-Net state or attention-score K) is multiple weights → mispacked;
+            // a DYNAMIC/computed src0 (op != NONE — GDN delta-net intermediates like k_cumdecay/v_t_new,
+            // views/reshapes of activations) is repacked every token → IOVA churn/exhaustion. Both
+            // segfaulted mul_mat_i8 on Qwen3.5/3.6 (GDN arch). Require a leaf 2-D weight → the rest go to CPU.
+            const bool src0_static_2d = src0->ne[2] == 1 && src0->ne[3] == 1 && src0->op == GGML_OP_NONE;
+            bool ork_accept = pass_m_threshold && src0_static_2d &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    K % 32 == 0 && N % 64 == 0 &&
