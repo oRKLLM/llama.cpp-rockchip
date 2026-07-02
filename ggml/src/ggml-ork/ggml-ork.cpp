@@ -1062,15 +1062,79 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     } else {
         bool same_dom = true; const int d0 = ork_w_domain(tasks[0].w);
         for (size_t t = 1; t < tasks.size(); t++) if (ork_w_domain(tasks[t].w) != d0) { same_dom = false; break; }
-        rc = same_dom ? ork_mm_run_stream_i8(ctx->npu, tasks.size(), tasks.data())
-                      : ork_mm_run_chain_i8 (ctx->npu, tasks.size(), tasks.data());
-        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] dispatch: %zu tasks, same_dom=%d -> %s rc=%d\n",
-                                           tasks.size(), (int)same_dom, same_dom ? "run_stream" : "run_chain", rc);
+        // RR (run_stream, all cores concurrently) wins ONLY at M==1 (decode): the independent matmuls
+        // run serially on one core otherwise, so RR is 2–3x. At M>1 run_i8 already N-tile-multicores per
+        // matmul, and RR's extra submits lose — so chain there. RR is also single-domain (one active
+        // IOMMU domain at a time) → only when all weights share a domain.
+        const bool rr = same_dom && tasks[0].M == 1;
+        rc = rr ? ork_mm_run_stream_i8(ctx->npu, tasks.size(), tasks.data())
+                : ork_mm_run_chain_i8 (ctx->npu, tasks.size(), tasks.data());
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] dispatch: %zu tasks M=%d same_dom=%d -> %s rc=%d\n",
+                                           tasks.size(), tasks[0].M, (int)same_dom, rr ? "run_stream(RR)" : "run_chain", rc);
     }
     if (rc != 0) {   // fallback: sequential single-task
         for (size_t t = 0; t < tasks.size(); t++)
             if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) return false;
     }
+    return true;
+}
+
+// Round-robin a group of INDEPENDENT matmuls that share src1 (Q/K/V, gate/up), possibly scattered in
+// the graph by intervening reshape/RoPE. Decode-only (M==1). Each weight is resolved individually — it's
+// already resident from the single path, so NO extra IOVA — the shared activation is int8-quantized once,
+// the group is dispatched (RR across cores), and each int32 result is dequantized into its own dst. Correct
+// because the matmuls are independent: shared read-only src1, distinct weights, distinct outputs.
+static bool ggml_backend_ork_mul_mat_rr_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
+    const struct ggml_tensor * src1 = g[0]->src[1];
+    if (!ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32) return false;
+    const int K = (int) g[0]->src[0]->ne[0];
+    const int M = (int) src1->ne[1];
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+
+    const ork_weight * ow[16]; int Ns[16];
+    for (int i = 0; i < ng; i++) {
+        const struct ggml_tensor * w = g[i]->src[0];
+        const int Ni = (int) w->ne[1];
+        const auto * tt = ggml_get_type_traits(w->type);
+        auto it = ork_resolve_weight_i8(ctx, w, K, Ni, w->nb[1], w->type, tt->to_float, /*allow_evict=*/false);
+        if (it == ctx->wcache.end()) return false;          // couldn't resolve → caller falls back to singles
+        it->second.last_use = ++ctx->wcache_tick;
+        ow[i] = &it->second; Ns[i] = Ni;
+    }
+
+    // quantize the shared activation once (per-row absmax int8), shape-padded
+    ctx->ai.resize((size_t) M_padded * K); ctx->as.resize(M_padded);
+    ctx->last_src1 = nullptr; ctx->last_type = 0;           // we overwrote ctx->ai — kill the reuse cache
+    int8_t * ai = ctx->ai.data(); float * as = ctx->as.data();
+    const float * y = (const float *) src1->data;
+    for (int m = 0; m < M_padded; m++) {
+        if (m < M) {
+            const float * yr = y + (size_t) m*K; int8_t * ar = ai + (size_t) m*K;
+            float mx = 1e-9f;
+            for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+            as[m] = mx / 127.0f; const float inv = 127.0f / mx;
+            for (int k = 0; k < K; k++) { float q = yr[k]*inv; int qi = (int)(q + copysignf(0.5f, q));
+                ar[k] = (int8_t)(qi > 127 ? 127 : qi < -127 ? -127 : qi); }
+        } else { memset(ai + (size_t) m*K, 0, K); as[m] = 0.0f; }
+    }
+
+    std::vector<std::vector<int32_t>> C(ng);
+    std::vector<ork_mm_task_i8> tasks(ng);
+    for (int i = 0; i < ng; i++) { C[i].resize((size_t) M_padded * Ns[i]); tasks[i] = ork_mm_task_i8{ ow[i]->w, M_padded, ai, C[i].data() }; }
+    const double t1 = ctx->profile ? ork_now_us() : 0;
+    if (!ork_dispatch_i8(ctx, tasks)) return false;
+    const double t2 = ctx->profile ? ork_now_us() : 0;
+
+    for (int i = 0; i < ng; i++) {                          // dequant each result: dst[m][n] = as[m]*bscale[n]*C[m][n]
+        const int Ni = Ns[i]; const float * bs = ow[i]->bscale.data();
+        float * dbase = (float *) g[i]->data; const int32_t * Cb = C[i].data();
+        for (int m = 0; m < M; m++) {
+            const float rs = as[m]; const int32_t * cr = Cb + (size_t) m*Ni; float * dr = dbase + (size_t) m*Ni;
+            for (int n = 0; n < Ni; n++) dr[n] = rs * bs[n] * (float) cr[n];
+        }
+    }
+    if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm += ng;
+        if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf += ng; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec += ng; } }
     return true;
 }
 
@@ -3000,12 +3064,39 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
     // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
     const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
+    // DECODE cross-core RR: matmuls computed early as part of an independent same-src1 group (QKV,
+    // gate/up) are recorded here and skipped when the loop reaches them.
+    std::unordered_set<const struct ggml_tensor *> rr_done;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        if (rr_done.count(node)) continue;                  // already run in an RR group
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
                 std::vector<struct ggml_tensor *> chain_nodes;
                 ork_chain_type type = get_node_chain_type(ctx, node);
+
+                // DECODE-ONLY (M==1) cross-core round-robin of the independent same-src1 group (Q/K/V,
+                // gate/up), which the graph scatters across intervening reshape/RoPE ops. Scan ahead and
+                // collect them, run all concurrently across the NPU cores (2–3x vs the serial single-core
+                // path, measured), and skip them when the loop reaches their positions. Their inputs
+                // (shared src1 + static weights) are ready here; their outputs are consumed only later.
+                if (!ctx->spool && type == ORK_CHAIN_I8 && node->ne[2] == 1 && node->ne[3] == 1 &&
+                    node->src[1]->ne[1] == 1) {
+                    struct ggml_tensor * grp[16]; int ng = 1; grp[0] = node;
+                    for (int j = i + 1; j < cgraph->n_nodes && (j - i) < 96 && ng < 16; j++) {
+                        struct ggml_tensor * nj = cgraph->nodes[j];
+                        if (nj->op != GGML_OP_MUL_MAT || rr_done.count(nj)) continue;
+                        if (nj->src[1] != node->src[1]) continue;          // must share the input activation
+                        if (get_node_chain_type(ctx, nj) != ORK_CHAIN_I8) continue;
+                        if (nj->ne[2] != 1 || nj->ne[3] != 1) continue;
+                        grp[ng++] = nj;
+                    }
+                    if (ng >= 2 && ggml_backend_ork_mul_mat_rr_i8(ctx, grp, ng)) {
+                        for (int q = 1; q < ng; q++) rr_done.insert(grp[q]);   // grp[0] == node, done now
+                        break;   // out of the switch; grp members are skipped when reached
+                    }
+                    // ng<2 or RR failed (resolve/IOVA) → fall through to the normal per-matmul path
+                }
 
                 // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
                 // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
