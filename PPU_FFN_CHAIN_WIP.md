@@ -30,7 +30,29 @@ applies a SINGLE scalar R → cannot express per-row/per-channel. So the chain R
 - glu:  ork_npu_ewmul_i8, s_glu = s_silu*s_up*128 (gain 1/128).
 - down: ork_mm_run_i8 (K=Nff=6144>4096 → high-level K-split path), dst = down_i32 * s_glu * s_Wd.
 
-## RESULT (2026-07-04) — NET LOSS, not yet viable
+## RESULT v2 (2026-07-04) — SPEED PARITY+ reached; QUALITY gap remains (structural)
+After the parity work below, the chain BEATS the per-node baseline on speed and is coherent:
+- **pp128 174 vs baseline 148 t/s (+18%); pp512 ~193 vs 32 (6×)** (Qwen3-1.7B-Q8_0, RK3588, -t4).
+  pp512's 6× = baseline's large-M CPU-GLU transcendental-silu bottleneck, which the chain avoids (silu free on-NPU).
+- **PPL ~20–24 vs baseline ~9** — coherent but ~2.3× worse. Structural: the fused scalar-R stage forces
+  per-tensor STATIC activation (can't do baseline's per-row) → residual quality gap. SmoothQuant got PPL
+  23041→~22 (gate/up outliers→weights, glu outliers→down weight; static scales calibrated on first batch).
+- **Intermittent NPU soft-reset** on the fast path (ACT_RESET removed for the 97× win; always-reset would
+  drop pp128 below baseline). Recovered-from but unreliable at pp512 in combined runs.
+
+Parity levers landed (all validated):
+1. Fused M-tile cap 64→mg_max*64 (bit-exact, tools/fused_mtile_check).
+2. SiLU LUT loaded once/call not per-tile (bit-exact vs probe).
+3. ewmul → CPU int8 (arithmetic-intensity split; SiLU free on-NPU). Killed the ~6ms/ffn on-NPU ewmul.
+4. SmoothQuant per-layer (gate/up via x, down via glu) → coherence.
+5. Domain-safe Af/Cc reuse.
+
+Remaining to reach QUALITY parity (hard): per-row activation is impossible in the fused scalar-R SDP output
+stage. Options: per-channel SDP output CVT RE (fixes weight per-channel, NOT per-row activation); adaptive
+per-batch s_x + per-call LUT rebuild (fixes chunk drift, +28 submits/prefill); accept PPL ~20 as a fast-but-
+lower-quality mode. Wedge: needs an ACT_RESET/warmup redesign that primes without the per-op cost.
+
+## RESULT v1 (2026-07-04) — NET LOSS, not yet viable (superseded by v2)
 Built end-to-end: detection (M≥32) + ggml_backend_ork_ffn_swiglu_chain (per-tensor ptcache + per-layer
 lutcache + all 4 ops on NPU int8) + wired into graph_compute (ORK_FFN_CHAIN=1, off by default).
 Measured in-model on Qwen3-1.7B-Q8_0 (board 10.3.0.236, `sudo timeout ... llama-bench -p 128 -r 1`):
