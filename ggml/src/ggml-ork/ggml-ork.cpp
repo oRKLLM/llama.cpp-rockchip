@@ -2959,11 +2959,27 @@ static inline bool ork_ppu_add_on()  { static const int e = env_enabled("ORK_PPU
 static inline bool ork_ppu_silu_on() { static const int e = env_enabled("ORK_PPU_SILU");  return e; }
 static inline bool ork_ppu_gelu_on() { static const int e = env_enabled("ORK_PPU_GELU");  return e; }
 static inline int  ork_ppu_minm()    { static const int m = getenv("ORK_PPU_MINM") ? atoi(getenv("ORK_PPU_MINM")) : 32; return m; }
+// One-time loud warning: measured on RK3588 (Qwen3-1.7B-Q8_0, 2026-07-04) that standalone
+// element-wise/activation offload is a NET LOSS and NPU-unstable — it exists as a research/measurement
+// hook, NOT a recommended path. Kept default-off; the real on-NPU-activation win is FUSION (activation in
+// the matmul output stage), tracked in the ork-driver RE-roadmap (M4.6).
+static inline void ork_ppu_warn_once() {
+    static bool warned = false;
+    if (warned) return; warned = true;
+    fprintf(stderr, "[ork] WARNING: ORK_PPU_* standalone element-wise/activation offload is EXPERIMENTAL and "
+        "a measured NET LOSS on RK3588 (residual ADD: pp128 157->19 t/s, ~8x slower) — element-wise ops have "
+        "no arithmetic intensity to amortize the NPU submit-floor + DMA round-trip vs inline NEON, and per-op "
+        "DMA-buffer churn can fragment/exhaust the ~4 GiB IOVA window (IOMMU-wedge risk; mitigated by the "
+        "ork-driver IOVA guard -> CPU fallback). Also, modern llama.cpp fuses SwiGLU/GEGLU into GGML_OP_GLU, "
+        "so standalone SILU/MUL never even fire on the FFN. The productionizable path is matmul-output-stage "
+        "FUSION (ork-driver RE-roadmap M4.6), not standalone offload.\n");
+}
 
 // SwiGLU element-wise multiply: dst = src0 * src1 (same-shape, contiguous, f32),
 // computed on the NPU in fp16 via ork_npu_ewmul_f16. fp16 is bit-exact for this
 // op (no lossy quant). Falls back to CPU on any NPU error.
 static bool ggml_backend_ork_mul_f16(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    ork_ppu_warn_once();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const int64_t ne  = ggml_nelements(dst);
@@ -2988,6 +3004,7 @@ static bool ggml_backend_ork_mul_f16(ggml_backend_ork_context * ctx, struct ggml
 
 // Residual ADD: dst = src0 + src1 (same-shape, contiguous, f32) via ork_npu_add_f16.
 static bool ggml_backend_ork_add_f16(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    ork_ppu_warn_once();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const int64_t ne  = ggml_nelements(dst);
@@ -3014,6 +3031,7 @@ static bool ggml_backend_ork_add_f16(ggml_backend_ork_context * ctx, struct ggml
 // small bounded undershoot for x<0), so out_scale = in_scale covers it. int8
 // (256 levels) is a quality trade — gated, opt-in, CPU fallback on NPU error.
 static bool ggml_backend_ork_unary_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst, bool gelu) {
+    ork_ppu_warn_once();
     const struct ggml_tensor * src0 = dst->src[0];
     const int64_t ne  = ggml_nelements(dst);
     const int     N   = (int) dst->ne[0];
