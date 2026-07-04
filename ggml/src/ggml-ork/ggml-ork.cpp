@@ -240,6 +240,12 @@ struct ggml_backend_ork_context {
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
+    // ORK_FFN_CHAIN: PER-TENSOR (scalar-scale) packed weights for the round-trip-free SwiGLU chain (the
+    // fused SiLU stage's scalar R can't carry per-channel scale). Keyed by weight host ptr. Separate from
+    // wcache (which is per-channel). Plus a per-layer fused-SiLU LUT cache keyed by the gate weight ptr.
+    struct ork_pt_weight { ork_w * w = nullptr; float scale = 0; };
+    std::unordered_map<const void *, ork_pt_weight>    ptcache;
+    std::unordered_map<const void *, std::vector<int16_t>> lutcache;   // gate ptr -> fused-SiLU LUT (1030)
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
     // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
     ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
@@ -3068,6 +3074,191 @@ static bool ggml_backend_ork_unary_i8(ggml_backend_ork_context * ctx, struct ggm
 }
 
 static inline bool ork_ppu_glu_on() { static const int e = env_enabled("ORK_PPU_GLU"); return e; }
+// ORK_FFN_CHAIN: round-trip-free on-NPU SwiGLU FFN inner (gate+SiLU int8-out -> up int8-out -> ewmul int8
+// -> down), int8 intermediates never touching fp32. Requires PER-TENSOR activation+weight scales (the fused
+// SiLU output stage applies a single scalar R; it cannot express the model's per-row/per-channel scales) —
+// an accuracy concession, gated off by default. Also flips GLU support on so the 4 nodes land on ork together.
+static inline bool ork_ffn_chain_on() { static const int e = env_enabled("ORK_FFN_CHAIN"); return e; }
+
+// Skip ggml no-op view/reshape nodes when scanning for the next compute node in a pattern.
+static inline bool ork_is_noop_node(const struct ggml_tensor * n) {
+    return n->op == GGML_OP_NONE || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
+           n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
+}
+
+// Detect the fused-SwiGLU FFN inner starting at cgraph->nodes[i]:
+//   gate = MUL_MAT(ffn_gate.*, x) ; up = MUL_MAT(ffn_up.*, x) ; glu = GLU_SWIGLU(gate, up) ; down = MUL_MAT(ffn_down.*, glu)
+// within a small window (tolerating interleaved no-op nodes). On match fills the four node ptrs and *last_idx
+// = the highest cgraph index consumed; returns true. Pure structural check — no compute.
+static bool ork_ffn_chain_match(struct ggml_cgraph * cg, int i,
+                                struct ggml_tensor ** g, struct ggml_tensor ** u,
+                                struct ggml_tensor ** gl, struct ggml_tensor ** dn, int * last_idx) {
+    struct ggml_tensor * gate = cg->nodes[i];
+    if (gate->op != GGML_OP_MUL_MAT || gate->ne[2] != 1 || gate->ne[3] != 1) return false;
+    if (!gate->src[0] || !strstr(gate->src[0]->name, "ffn_gate")) return false;
+    struct ggml_tensor *up = nullptr, *glu = nullptr, *down = nullptr; int iu=-1, ig=-1, id=-1;
+    const int WIN = 10;
+    for (int j = i + 1; j < cg->n_nodes && j <= i + WIN; j++) {
+        struct ggml_tensor * n = cg->nodes[j];
+        if (ork_is_noop_node(n)) continue;
+        if (!up && n->op == GGML_OP_MUL_MAT && n->src[0] && strstr(n->src[0]->name, "ffn_up") &&
+            n->src[1] == gate->src[1]) { up = n; iu = j; continue; }
+        if (up && !glu && n->op == GGML_OP_GLU && ggml_get_glu_op(n) == GGML_GLU_OP_SWIGLU &&
+            n->src[0] == gate && n->src[1] == up) { glu = n; ig = j; continue; }
+        if (glu && !down && n->op == GGML_OP_MUL_MAT && n->src[0] && strstr(n->src[0]->name, "ffn_down") &&
+            n->src[1] == glu) { down = n; id = j; break; }
+    }
+    if (up && glu && down) { *g=gate; *u=up; *gl=glu; *dn=down; *last_idx=id; return true; }
+    return false;
+}
+
+// ORK_FFN_CHAIN: resolve a PER-TENSOR (single scalar scale) packed int8 weight for `src0` [K,N], cached in
+// ptcache. Dequant each output channel to f32, take the GLOBAL abs-max -> one scale, quantize int8 in the
+// bi[k*N+n] layout ork_mm_pack_i8 expects. Simpler than ork_resolve_weight_i8 (no stream/orkpack/domain
+// machinery) — this is an experimental gated path. Returns nullptr on failure.
+static ggml_backend_ork_context::ork_pt_weight *
+ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0) {
+    const void * key = src0->data;
+    auto it = ctx->ptcache.find(key);
+    if (it != ctx->ptcache.end()) return &it->second;
+    const int K = (int) src0->ne[0], N = (int) src0->ne[1];
+    const size_t nb01 = src0->nb[1];
+    const enum ggml_type type = src0->type;
+    const auto * tt = ggml_get_type_traits(type);
+    ggml_to_float_t to_float = tt->to_float;
+    std::vector<float> f32((size_t) N * K);
+    float mx = 1e-9f;
+    for (int n = 0; n < N; n++) {
+        float * frow = f32.data() + (size_t) n * K;
+        if (type == GGML_TYPE_F32) memcpy(frow, (const char *) src0->data + n*nb01, (size_t) K*sizeof(float));
+        else                       to_float((const char *) src0->data + n*nb01, frow, K);
+        for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
+    }
+    const float scale = mx / 127.0f, inv = 127.0f / mx;
+    std::vector<int8_t> bi((size_t) K * N);
+    for (int n = 0; n < N; n++) { const float * frow = f32.data() + (size_t) n * K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(frow[k] * inv);
+            bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
+    int dom = ork_weight_domain(ctx, (size_t) K * N);
+    ork_npu_set_pack_domain(ctx->npu, dom);
+    ork_w * w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+    while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+    if (!w) return nullptr;
+    auto & e = ctx->ptcache[key]; e.w = w; e.scale = scale;
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] pt-pack %s K=%d N=%d scale=%.3e\n", src0->name, K, N, scale);
+    return &ctx->ptcache[key];
+}
+
+// ORK_FFN_CHAIN handler: run the whole SwiGLU FFN inner as one round-trip-free on-NPU int8 chain.
+//   gate:  ork_mm_run_i8_silu (gate matmul + fused SiLU int8-out, per-layer LUT)  -> silu_i8[M,Nff]
+//   up:    ork_mm_run_i8_out8 (up matmul int8-out)                                -> up_i8[M,Nff]
+//   glu:   ork_npu_ewmul_i8   (silu_i8 * up_i8 / 128)                             -> glu_i8[M,Nff]
+//   down:  ork_mm_run_i8      (down matmul, int8-in)                              -> down_i32[M,Kd]
+// then dequant down -> dst fp32. PER-TENSOR scales throughout (the fused SiLU stage's scalar R can't carry
+// per-row/per-channel). CPU fp32 fallback (recompute the whole inner) on ANY error, so output is always valid.
+static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
+        struct ggml_tensor * gate_n, struct ggml_tensor * up_n,
+        struct ggml_tensor * glu_n, struct ggml_tensor * down_n) {
+    const struct ggml_tensor * Wg = gate_n->src[0];   // [K, Nff]
+    const struct ggml_tensor * Wu = up_n->src[0];      // [K, Nff]
+    const struct ggml_tensor * Wd = down_n->src[0];    // [Nff, Kd]
+    const struct ggml_tensor * x  = gate_n->src[1];    // [K, M] (ffn_norm out)
+    const int K   = (int) Wg->ne[0];
+    const int Nff = (int) Wg->ne[1];
+    const int Kd  = (int) Wd->ne[1];                   // down output width (= K, the hidden size)
+    const int M   = (int) x->ne[1];
+    // guards: shapes the primitives require (K%512, K<=4096 for the fused gate/up; N%32; M in [1,64] per submit)
+    if (K % 512 || K > 4096 || Nff % 32 || Kd % 16 || M < 1) return false;
+    if (Nff > 8192) return false;
+
+    // per-tensor packed weights (cached)
+    auto * pg = ork_resolve_pt_weight(ctx, Wg); if (!pg) return false;
+    auto * pu = ork_resolve_pt_weight(ctx, Wu); if (!pu) return false;
+    auto * pd = ork_resolve_pt_weight(ctx, Wd); if (!pd) return false;
+
+    // per-tensor activation quant: s_x = max|x|/127
+    const float * xf = (const float *) x->data;
+    const size_t nx = (size_t) M * K;
+    float xmx = 1e-9f; for (size_t i = 0; i < nx; i++) { float v = fabsf(xf[i]); if (v > xmx) xmx = v; }
+    const float s_x = xmx / 127.0f, xinv = 127.0f / xmx;
+    std::vector<int8_t> xi(nx);
+    for (size_t i = 0; i < nx; i++) { int q = (int) lrintf(xf[i] * xinv);
+        xi[i] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); }
+
+    // chosen intermediate scales (fixed; see WIP — coherence-first, refine with calibration if needed)
+    const double s_silu = 0.08, s_up = 0.08;
+    const double s_glu  = s_silu * s_up * 128.0;                 // ewmul gain 1/128 (mult=0x4000, shift=21)
+    const double in_g   = (double) s_x * pg->scale;             // gate_real = acc * s_x * s_Wg
+    // fused-SiLU register config (silu_native's proven set); LUT built per (in_g, s_silu), cached per gate ptr
+    const int RM = 0x4000, RS = 0x10; const uint32_t OB = 0, IO = 0xffffc000u, C4 = 0x56391300u;
+    auto lit = ctx->lutcache.find(Wg->data);
+    if (lit == ctx->lutcache.end()) {
+        std::vector<int16_t> lut(1030);
+        if (ork_mm_silu_build_lut(ctx->npu, in_g, s_silu, RM, RS, C4, lut.data())) return false;
+        lit = ctx->lutcache.emplace(Wg->data, std::move(lut)).first;
+    }
+    const int16_t * lut = lit->second.data();
+
+    // up out8 requant: up_i8 = acc_u * (s_x*s_Wu) / s_up  ->  R_up = s_x*s_Wu/s_up
+    auto ratio_to_ms = [](double R, int * mult, int * shift) {
+        int sh = 0; while (R < 0x2000 && sh < 30) { R *= 2.0; sh++; }   // scale mantissa into ~[0x2000,0x4000)
+        int m = (int) llround(R); if (m > 0x7fff) m = 0x7fff; if (m < 1) m = 1; *mult = m; *shift = sh; };
+    int up_mult, up_shift; ratio_to_ms((double) s_x * pu->scale / s_up, &up_mult, &up_shift);
+
+    // int8 intermediates (M rows of Nff), M-tiled to <=64 per submit (the primitives' M cap)
+    std::vector<int8_t>  silu_i8((size_t) M * Nff), up_i8((size_t) M * Nff), glu_i8((size_t) M * Nff);
+    std::vector<int32_t> down_i32((size_t) M * Kd);
+    double us = 0; bool ok = true;
+    for (int m0 = 0; m0 < M && ok; m0 += 64) {
+        int mc = std::min(64, M - m0);
+        const int8_t * A = xi.data() + (size_t) m0 * K;
+        int8_t * sg = silu_i8.data() + (size_t) m0 * Nff;
+        int8_t * up = up_i8.data()   + (size_t) m0 * Nff;
+        int8_t * gl = glu_i8.data()  + (size_t) m0 * Nff;
+        if (ork_mm_run_i8_silu(ctx->npu, pg->w, mc, A, sg, RM, RS, OB, IO, C4, lut, 1030)) { ok = false; break; }
+        if (ork_mm_run_i8_out8(ctx->npu, pu->w, mc, A, up, up_mult, up_shift))              { ok = false; break; }
+        if (ork_npu_ewmul_i8(ctx->npu, up, sg, mc, Nff, 0x4000, 21, gl, &us))               { ok = false; break; }
+        if (ork_mm_run_i8(ctx->npu, pd->w, mc, gl, down_i32.data() + (size_t) m0 * Kd))     { ok = false; break; }
+    }
+    if (ok) {
+        // dequant down_i32 -> dst fp32: dst[m,n] = down_i32[m,n] * s_glu * s_Wd
+        float * d = (float *) down_n->data;
+        const double sd = s_glu * pd->scale;
+        const size_t nd = (size_t) M * Kd;
+        for (size_t i = 0; i < nd; i++) d[i] = (float) (down_i32[i] * sd);
+        return true;
+    }
+
+    // ---- CPU fp32 fallback: recompute the whole FFN inner exactly (output always valid) ----
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] NPU chain failed -> CPU fallback\n");
+    // gate = Wg^T x ; up = Wu^T x ; glu = silu(gate)*up ; down = Wd^T glu   (all fp32, dequant weights on the fly)
+    const auto * ttg = ggml_get_type_traits(Wg->type); ggml_to_float_t g2f = ttg->to_float;
+    std::vector<float> glu_f((size_t) M * Nff);
+    // dequant each gate/up output-channel plane once, accumulate ag/au, apply silu*up
+    std::vector<float> wg_row(K), wu_row(K);
+    for (int n = 0; n < Nff; n++) {
+        g2f((const char *) Wg->data + (size_t) n * Wg->nb[1], wg_row.data(), K);
+        g2f((const char *) Wu->data + (size_t) n * Wu->nb[1], wu_row.data(), K);
+        for (int m = 0; m < M; m++) {
+            const float * xr = xf + (size_t) m * K;
+            float ag = 0, au = 0;
+            for (int k = 0; k < K; k++) { ag += wg_row[k]*xr[k]; au += wu_row[k]*xr[k]; }
+            glu_f[(size_t) m * Nff + n] = (ag / (1.0f + expf(-ag))) * au;
+        }
+    }
+    const auto * ttd = ggml_get_type_traits(Wd->type); ggml_to_float_t d2f = ttd->to_float;
+    std::vector<float> wd_row(Nff);
+    float * d = (float *) down_n->data;
+    for (int n = 0; n < Kd; n++) {
+        d2f((const char *) Wd->data + (size_t) n * Wd->nb[1], wd_row.data(), Nff);
+        for (int m = 0; m < M; m++) {
+            const float * gr = glu_f.data() + (size_t) m * Nff;
+            float acc = 0; for (int j = 0; j < Nff; j++) acc += wd_row[j]*gr[j];
+            d[(size_t) m * Kd + n] = acc;
+        }
+    }
+    return true;
+}
 
 // SwiGLU on the NPU: dst = silu(gate) (x) up  (gate=src0, up=src1, both f32 [N=ne0, rows]).
 // Quantize per-tensor to int8, silu(gate) via ork_npu_silu_i8, (x)up via ork_npu_ewmul_i8 (gain 1/128 so
@@ -3155,8 +3346,30 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
     // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
     const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8;
+    if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
+        bool has_ffn = false, has_glu = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
+            if (n->op == GGML_OP_GLU) has_glu = true;
+            if (n->src[0] && (strstr(n->src[0]->name,"ffn_gate")||strstr(n->src[0]->name,"ffn_down"))) has_ffn = true; }
+        if ((has_ffn || has_glu) && dumped++ < 3) {
+            fprintf(stderr, "[ORK GRAPH] FFN subgraph, %d nodes (has_ffn=%d has_glu=%d):\n", cgraph->n_nodes, has_ffn, has_glu);
+            for (int i = 0; i < cgraph->n_nodes && i < 40; i++) { struct ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "  [%2d] %-12s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op),
+                        n->src[0]?n->src[0]->name:"-", n->src[1]?n->src[1]->name:"-", (long)n->ne[0], (long)n->ne[1]);
+            } fflush(stderr); } }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        // ORK_FFN_CHAIN: recognize the fused-SwiGLU FFN inner and run it as ONE round-trip-free int8 chain
+        // (int8 intermediates never touch fp32). Consumes all 4 nodes; falls through to per-node on any miss.
+        if (ffn_chain && node->op == GGML_OP_MUL_MAT) {
+            struct ggml_tensor *g,*u,*gl,*dn; int last;
+            if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last)) {
+                if (!ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn)) return GGML_STATUS_FAILED;
+                i = last;      // skip past gate/up/GLU/down — all handled by the chain
+                continue;
+            }
+        }
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
                 std::vector<struct ggml_tensor *> chain_nodes;
@@ -3642,7 +3855,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
         }
         case GGML_OP_GLU: {
             // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
-            if (!ork_ppu_glu_on()) return false;
+            // ORK_FFN_CHAIN also needs GLU on ork so the FFN's 4 nodes land in one ork subgraph (fused there).
+            if (!ork_ppu_glu_on() && !ork_ffn_chain_on()) return false;
             if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
             if (!src0 || !src1) return false;                        // split form only (two inputs)
             if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
