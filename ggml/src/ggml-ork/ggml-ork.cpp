@@ -2934,6 +2934,121 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     return true;
 }
 
+// ============================================================================
+// PPU element-wise / activation ops (ork-driver v0.6.39 on-NPU ops)
+// ----------------------------------------------------------------------------
+// Standalone on-NPU SDP ops: MUL (SwiGLU silu(gate)*up), ADD (residual),
+// SILU/GELU (unary activations). EXPERIMENTAL, default-OFF — this is a
+// buffer-less backend, so every offloaded op pays a fp32->(quant)->NPU-submit
+// ->(dequant) round-trip plus a scheduler backend-crossing; for memory-bound
+// element-wise work that can lose to inline CPU/NEON (the standalone-activation
+// finding). Gated so it can be measured and enabled where it wins (large-M
+// prefill). Each handler ALWAYS produces a correct result: if the NPU call
+// fails it falls back to computing the op on the CPU in-place (never aborts the
+// graph). Master gate ORK_PPU_OPS enables the bit-exact fp16 SwiGLU MUL; the
+// quality-lossier paths (fp16 residual ADD, int8 SILU/GELU) are opt-in per-op.
+//   ORK_PPU_OPS=1   -> fp16 element-wise MUL (SwiGLU multiply; bit-exact fp16)
+//   ORK_PPU_ADD=1   -> fp16 residual ADD          (fp16 accumulation caveat)
+//   ORK_PPU_SILU=1  -> int8 SILU unary            (int8 activation-quant caveat)
+//   ORK_PPU_GELU=1  -> int8 GELU unary            (int8 activation-quant caveat)
+//   ORK_PPU_MINM=<n> minimum rows (M) to offload (default 32; keeps M=1 decode
+//                    on CPU where the ~365us submit floor dominates).
+// ============================================================================
+static inline bool ork_ppu_ops_on()  { static const int e = env_enabled("ORK_PPU_OPS");  return e; }
+static inline bool ork_ppu_add_on()  { static const int e = env_enabled("ORK_PPU_ADD");   return e; }
+static inline bool ork_ppu_silu_on() { static const int e = env_enabled("ORK_PPU_SILU");  return e; }
+static inline bool ork_ppu_gelu_on() { static const int e = env_enabled("ORK_PPU_GELU");  return e; }
+static inline int  ork_ppu_minm()    { static const int m = getenv("ORK_PPU_MINM") ? atoi(getenv("ORK_PPU_MINM")) : 32; return m; }
+
+// SwiGLU element-wise multiply: dst = src0 * src1 (same-shape, contiguous, f32),
+// computed on the NPU in fp16 via ork_npu_ewmul_f16. fp16 is bit-exact for this
+// op (no lossy quant). Falls back to CPU on any NPU error.
+static bool ggml_backend_ork_mul_f16(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const int64_t ne  = ggml_nelements(dst);
+    const int     N   = (int) dst->ne[0];
+    const int     M   = (int) (ne / N);
+    const float * a   = (const float *) src0->data;
+    const float * b   = (const float *) src1->data;
+    float       * o   = (float *)       dst->data;
+
+    std::vector<ork_f16> ha((size_t) ne), hb((size_t) ne), ho((size_t) ne);
+    for (int64_t i = 0; i < ne; i++) { ha[i] = (ork_f16) a[i]; hb[i] = (ork_f16) b[i]; }
+    double us = 0;
+    int rc = ork_npu_ewmul_f16(ctx->npu, ha.data(), hb.data(), M, N, ho.data(), &us);
+    if (rc == 0) {
+        for (int64_t i = 0; i < ne; i++) o[i] = (float) ho[i];
+        return true;
+    }
+    // CPU fallback (fp32, exact) — keeps the graph correct if the NPU declined/failed.
+    for (int64_t i = 0; i < ne; i++) o[i] = a[i] * b[i];
+    return true;
+}
+
+// Residual ADD: dst = src0 + src1 (same-shape, contiguous, f32) via ork_npu_add_f16.
+static bool ggml_backend_ork_add_f16(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const int64_t ne  = ggml_nelements(dst);
+    const int     N   = (int) dst->ne[0];
+    const int     M   = (int) (ne / N);
+    const float * a   = (const float *) src0->data;
+    const float * b   = (const float *) src1->data;
+    float       * o   = (float *)       dst->data;
+
+    std::vector<ork_f16> ha((size_t) ne), hb((size_t) ne), ho((size_t) ne);
+    for (int64_t i = 0; i < ne; i++) { ha[i] = (ork_f16) a[i]; hb[i] = (ork_f16) b[i]; }
+    double us = 0;
+    int rc = ork_npu_add_f16(ctx->npu, ha.data(), hb.data(), M, N, ho.data(), &us);
+    if (rc == 0) {
+        for (int64_t i = 0; i < ne; i++) o[i] = (float) ho[i];
+        return true;
+    }
+    for (int64_t i = 0; i < ne; i++) o[i] = a[i] + b[i];
+    return true;
+}
+
+// int8 unary activation (SILU or GELU). Dynamic per-tensor abs-max quant; the
+// output range of both curves is bounded by ~|in| (silu/gelu(x)->x for large x,
+// small bounded undershoot for x<0), so out_scale = in_scale covers it. int8
+// (256 levels) is a quality trade — gated, opt-in, CPU fallback on NPU error.
+static bool ggml_backend_ork_unary_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst, bool gelu) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int64_t ne  = ggml_nelements(dst);
+    const int     N   = (int) dst->ne[0];
+    const int     M   = (int) (ne / N);
+    const float * x   = (const float *) src0->data;
+    float       * o   = (float *)       dst->data;
+
+    float mx = 1e-9f;
+    for (int64_t i = 0; i < ne; i++) { float v = fabsf(x[i]); if (v > mx) mx = v; }
+    const double in_scale  = mx / 127.0;
+    const double out_scale = in_scale;   // |act(x)| <= ~|x|
+    const float  inv = 127.0f / mx;
+
+    std::vector<int8_t> qi((size_t) ne), qo((size_t) ne);
+    for (int64_t i = 0; i < ne; i++) {
+        float q = x[i] * inv;
+        int v = (int) (q + copysignf(0.5f, q));
+        qi[i] = (int8_t) (v > 127 ? 127 : v < -127 ? -127 : v);
+    }
+    double us = 0;
+    int rc = gelu ? ork_npu_gelu_i8(ctx->npu, qi.data(), M, N, in_scale, out_scale, qo.data(), &us)
+                  : ork_npu_silu_i8(ctx->npu, qi.data(), M, N, in_scale, out_scale, qo.data(), &us);
+    if (rc == 0) {
+        for (int64_t i = 0; i < ne; i++) o[i] = (float) (qo[i] * out_scale);
+        return true;
+    }
+    // CPU fallback (fp32 curve, exact).
+    for (int64_t i = 0; i < ne; i++) {
+        float v = x[i];
+        o[i] = gelu ? 0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)))
+                    : v / (1.0f + expf(-v));
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -3068,6 +3183,19 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             }
             case GGML_OP_MUL_MAT_ID: {
                 if (!ggml_backend_ork_mul_mat_id_i8(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_MUL: {
+                if (!ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_ADD: {
+                if (!ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_UNARY: {
+                const bool gelu = ggml_get_unary_op(node) == GGML_UNARY_OP_GELU;
+                if (!ggml_backend_ork_unary_i8(ctx, node, gelu)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -3426,6 +3554,33 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK supid] name=%s K=%ld N=%ld bne2=%ld contigB=%d cont_a=%d -> %d\n",
                 a->name, (long)K, (long)N, (long)b->ne[2], (int)ggml_is_contiguous(b), (int)ggml_is_contiguous(a), (int)ok);
             return ok;
+        }
+        case GGML_OP_MUL:
+        case GGML_OP_ADD: {
+            // fp16 SwiGLU multiply / residual add (ork_npu_ewmul_f16 / add_f16). EXPERIMENTAL,
+            // default-off. MUL under ORK_PPU_OPS (bit-exact fp16); ADD needs ORK_PPU_ADD (fp16
+            // residual accumulation caveat). Only the same-shape contiguous f32 case (SwiGLU
+            // gate*up, residual x+y); broadcast MUL (norm-weight, RoPE) stays on CPU.
+            const bool on = (op->op == GGML_OP_MUL) ? ork_ppu_ops_on() : ork_ppu_add_on();
+            if (!on) return false;
+            if (!src0 || !src1) return false;
+            if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, op)) return false;
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(op)) return false;
+            const int64_t N = op->ne[0], ne = ggml_nelements(op), M = ne / N;
+            return N >= 8 && N <= 8192 && (N & 7) == 0 && M >= ork_ppu_minm() && M <= 8192;
+        }
+        case GGML_OP_UNARY: {
+            // int8 SILU / GELU (ork_npu_silu_i8 / gelu_i8). EXPERIMENTAL, per-op opt-in
+            // (ORK_PPU_SILU / ORK_PPU_GELU) — int8 activation-quant is a quality trade.
+            const enum ggml_unary_op u = ggml_get_unary_op(op);
+            const bool on = (u == GGML_UNARY_OP_SILU) ? ork_ppu_silu_on()
+                          : (u == GGML_UNARY_OP_GELU) ? ork_ppu_gelu_on() : false;
+            if (!on) return false;
+            if (!src0 || src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op) || !ggml_are_same_shape(src0, op)) return false;
+            const int64_t N = op->ne[0], ne = ggml_nelements(op), M = ne / N;
+            return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         default:
             return false;
