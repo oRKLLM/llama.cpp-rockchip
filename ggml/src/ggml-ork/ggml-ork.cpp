@@ -246,6 +246,20 @@ struct ggml_backend_ork_context {
     struct ork_pt_weight { ork_w * w = nullptr; float scale = 0; };
     std::unordered_map<const void *, ork_pt_weight>    ptcache;
     std::unordered_map<const void *, std::vector<int16_t>> lutcache;   // gate ptr -> fused-SiLU LUT (1030)
+    // ORK_FFN_CHAIN SmoothQuant: per-FFN-layer smoothing so per-tensor activation quant stays coherent (LLM
+    // activation outliers are per-input-channel; migrate them into the weights via x'=x/s, W'=s*W — equivalent).
+    // Computed once per layer (first sight, from that batch's per-channel |x| max + weight max), keyed by Wg ptr.
+    struct ork_ffn_smooth {
+        ork_w * wg = nullptr; ork_w * wu = nullptr; ork_w * wd = nullptr;
+        float sg = 0, su = 0, sd = 0;                 // per-tensor int8 scales of the smoothed weights
+        std::vector<float> s;                          // per-input-channel smoothing factor [K] (gate/up share x)
+        std::vector<float> f;                          // per-Nff ewmul->glu_i8 factor (folds down-smoothing + s_glu)
+        std::vector<int16_t> lut;                      // fused-SiLU LUT for (s_x'*sg -> s_silu)
+        double s_x = 0, s_silu = 0, s_up = 0, s_glu = 0; // calibrated per-tensor activation/intermediate scales
+        int up_mult = 0, up_shift = 0;
+        bool ready = false;
+    };
+    std::unordered_map<const void *, ork_ffn_smooth>   ffncache;       // gate ptr -> smoothed layer state
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
     // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
     ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
@@ -3163,6 +3177,106 @@ ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     return &ctx->ptcache[key];
 }
 
+// Pack a PER-TENSOR int8 weight from an fp32 [N*K] plane (row n = K contiguous), with an optional per-input
+// -channel smoothing vector s[K] folded in (W'[n,k] = W[n,k]*s[k]). Returns the ork_w* and the scalar scale.
+static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32, int K, int N,
+                               const float * s, float * out_scale) {
+    float mx = 1e-9f;
+    for (int n = 0; n < N; n++) { const float * r = f32 + (size_t) n * K;
+        for (int k = 0; k < K; k++) { float v = fabsf(r[k] * (s ? s[k] : 1.0f)); if (v > mx) mx = v; } }
+    const float scale = mx / 127.0f, inv = 127.0f / mx;
+    std::vector<int8_t> bi((size_t) K * N);
+    for (int n = 0; n < N; n++) { const float * r = f32 + (size_t) n * K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(r[k] * (s ? s[k] : 1.0f) * inv);
+            bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
+    int dom = ork_weight_domain(ctx, (size_t) K * N); ork_npu_set_pack_domain(ctx->npu, dom);
+    ork_w * w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+    while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+    if (w && out_scale) *out_scale = scale;
+    return w;
+}
+
+// Dequant a ggml weight tensor [K,N] (row n = K) into a f32 [N*K] plane.
+static void ork_deq_weight_f32(const struct ggml_tensor * W, int K, int N, std::vector<float> & out) {
+    out.resize((size_t) N * K);
+    const auto * tt = ggml_get_type_traits(W->type); ggml_to_float_t to_f = tt->to_float;
+    for (int n = 0; n < N; n++) {
+        if (W->type == GGML_TYPE_F32) memcpy(out.data() + (size_t) n*K, (const char *) W->data + n*W->nb[1], (size_t) K*sizeof(float));
+        else                          to_f((const char *) W->data + n*W->nb[1], out.data() + (size_t) n*K, K);
+    }
+}
+
+// ORK_FFN_CHAIN one-time per-layer prep: SmoothQuant smoothing (migrate x's per-channel outliers into the
+// gate/up weights), pack smoothed per-tensor weights, calibrate STATIC per-tensor scales (s_x, s_silu, s_up
+// via int32 matmuls on the calibration batch), build the fused-SiLU LUT. Fills fc. Returns false on failure.
+static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_context::ork_ffn_smooth & fc,
+        const struct ggml_tensor * Wg, const struct ggml_tensor * Wu, const struct ggml_tensor * Wd,
+        const float * xf, int M, int K, int Nff, int Kd) {
+    std::vector<float> wgf, wuf, wdf;
+    ork_deq_weight_f32(Wg, K, Nff, wgf);
+    ork_deq_weight_f32(Wu, K, Nff, wuf);
+    ork_deq_weight_f32(Wd, Nff, Kd, wdf);
+    // per-input-channel maxes: activation (over M rows of this batch) and weight (over Nff rows of Wg,Wu)
+    std::vector<float> cmax(K, 1e-9f), wmax(K, 1e-9f);
+    for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m * K;
+        for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > cmax[k]) cmax[k] = v; } }
+    for (int n = 0; n < Nff; n++) { const float * gr = wgf.data() + (size_t) n*K, * ur = wuf.data() + (size_t) n*K;
+        for (int k = 0; k < K; k++) { float a = fabsf(gr[k]); if (a > wmax[k]) wmax[k] = a;
+                                      a = fabsf(ur[k]);        if (a > wmax[k]) wmax[k] = a; } }
+    // SmoothQuant factor s[k] = cmax^a / wmax^(1-a), a=0.5; x'=x/s, W'=s*W (equivalent). Clamp to a sane band.
+    fc.s.resize(K);
+    for (int k = 0; k < K; k++) { double s = sqrt((double) cmax[k]) / sqrt((double) wmax[k]);
+        if (!(s > 1e-4)) s = 1e-4; if (s > 1e4) s = 1e4; fc.s[k] = (float) s; }
+    // pack smoothed gate/up (fold s)
+    fc.wg = ork_pack_pt_f32(ctx, wgf.data(), K, Nff, fc.s.data(), &fc.sg); if (!fc.wg) return false;
+    fc.wu = ork_pack_pt_f32(ctx, wuf.data(), K, Nff, fc.s.data(), &fc.su); if (!fc.wu) return false;
+    // provisional static s_x from smoothed activations x'=x/s
+    float xmx = 1e-9f;
+    for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m * K;
+        for (int k = 0; k < K; k++) { float v = fabsf(xr[k] / fc.s[k]); if (v > xmx) xmx = v; } }
+    fc.s_x = xmx / 127.0;
+    // calibrate s_silu, s_up + per-Nff-channel glu max on CPU from a token subset (NO NPU matmuls in prep).
+    // gate_real = x·Wg, up_real = x·Wu (equivalent to x'·smoothedW), glu = silu(gate)*up. gmax[n] = per-channel
+    // max|glu| over the subset -> used to SmoothQuant the DOWN matmul (its input is glu, its own outliers).
+    std::vector<float> gmax(Nff, 1e-9f);
+    { const int NS = M < 32 ? M : 32; double smax = 1e-9, umax = 1e-9;   // subset: prep is O(NS*Nff*K) CPU (one-time)
+      #pragma omp parallel for reduction(max:smax,umax) if (Nff >= 64)
+      for (int n = 0; n < Nff; n++) { const float * gr = wgf.data() + (size_t) n*K, * ur = wuf.data() + (size_t) n*K;
+          float gm = 1e-9f;
+          for (int m = 0; m < NS; m++) { const float * xr = xf + (size_t) m * K;
+              double ag = 0, au = 0; for (int k = 0; k < K; k++) { ag += (double) gr[k]*xr[k]; au += (double) ur[k]*xr[k]; }
+              double s_v = ag / (1.0 + exp(-ag)); double sv = fabs(s_v); if (sv > smax) smax = sv;
+              double uv = fabs(au); if (uv > umax) umax = uv;
+              float gv = (float) fabs(s_v * au); if (gv > gm) gm = gv; }
+          gmax[n] = gm; }
+      fc.s_silu = smax * 1.15 / 127.0; fc.s_up = umax * 1.15 / 127.0;   // 1.15 headroom (subset underestimates max)
+      if (!(fc.s_silu > 0)) fc.s_silu = 1e-6; if (!(fc.s_up > 0)) fc.s_up = 1e-6; }
+    // SmoothQuant the DOWN matmul: sd_smooth[n] = sqrt(gmax[n])/sqrt(wd_chan_max[n]); glu'=glu/sd, Wd'=sd*Wd.
+    std::vector<float> sd_sm(Nff);
+    { std::vector<float> wdmax(Nff, 1e-9f);
+      for (int kd = 0; kd < Kd; kd++) { const float * wr = wdf.data() + (size_t) kd*Nff;
+          for (int n = 0; n < Nff; n++) { float a = fabsf(wr[n]); if (a > wdmax[n]) wdmax[n] = a; } }
+      double gsm = 1e-9;
+      for (int n = 0; n < Nff; n++) { double s = sqrt((double) gmax[n]) / sqrt((double) wdmax[n]);
+          if (!(s > 1e-4)) s = 1e-4; if (s > 1e4) s = 1e4; sd_sm[n] = (float) s;
+          double gp = gmax[n] / s; if (gp > gsm) gsm = gp; }
+      fc.s_glu = gsm * 1.15 / 127.0; if (!(fc.s_glu > 0)) fc.s_glu = 1e-6; }
+    fc.wd = ork_pack_pt_f32(ctx, wdf.data(), Nff, Kd, sd_sm.data(), &fc.sd); if (!fc.wd) return false;
+    // per-Nff ewmul factor: glu'_i8[m,n] = round(silu_i8*up_i8 * f[n]), f[n] = (s_silu*s_up)/(sd_smooth[n]*s_glu)
+    fc.f.resize(Nff);
+    for (int n = 0; n < Nff; n++) fc.f[n] = (float) (fc.s_silu * fc.s_up / (sd_sm[n] * fc.s_glu));
+    // up out8 requant R_up = s_x*s_Wu/s_up
+    { double R = fc.s_x * fc.su / fc.s_up; int sh = 0; while (R < 0x2000 && sh < 30) { R *= 2.0; sh++; }
+      int m = (int) llround(R); if (m > 0x7fff) m = 0x7fff; if (m < 1) m = 1; fc.up_mult = m; fc.up_shift = sh; }
+    // fused-SiLU LUT for (in_g = s_x*s_Wg, s_silu)
+    fc.lut.resize(1030);
+    if (ork_mm_silu_build_lut(ctx->npu, fc.s_x * fc.sg, fc.s_silu, 0x4000, 0x10, 0x56391300u, fc.lut.data())) return false;
+    fc.ready = true;
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep %s: s_x=%.3e s_silu=%.3e s_up=%.3e sg=%.3e su=%.3e sd=%.3e\n",
+        Wg->name, fc.s_x, fc.s_silu, fc.s_up, fc.sg, fc.su, fc.sd);
+    return true;
+}
+
 // ORK_FFN_CHAIN handler: run the whole SwiGLU FFN inner as one round-trip-free on-NPU int8 chain.
 //   gate:  ork_mm_run_i8_silu (gate matmul + fused SiLU int8-out, per-layer LUT)  -> silu_i8[M,Nff]
 //   up:    ork_mm_run_i8_out8 (up matmul int8-out)                                -> up_i8[M,Nff]
@@ -3185,59 +3299,50 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     if (K % 512 || K > 4096 || Nff % 32 || Kd % 16 || M < 1) return false;
     if (Nff > 8192) return false;
 
-    // per-tensor packed weights (cached)
-    auto * pg = ork_resolve_pt_weight(ctx, Wg); if (!pg) return false;
-    auto * pu = ork_resolve_pt_weight(ctx, Wu); if (!pu) return false;
-    auto * pd = ork_resolve_pt_weight(ctx, Wd); if (!pd) return false;
-
-    // per-tensor activation quant: s_x = max|x|/127
     const float * xf = (const float *) x->data;
+    // one-time per-layer SmoothQuant prep (smoothing + smoothed-weight pack + static-scale calibration + LUT)
+    auto & fc = ctx->ffncache[Wg->data];
+    if (!fc.ready) { if (!ork_ffn_prep(ctx, fc, Wg, Wu, Wd, xf, M, K, Nff, Kd)) return false; }
+
+    // apply smoothing x'=x/s + static per-tensor quant (s_x fixed at calibration): x'_i8
     const size_t nx = (size_t) M * K;
-    float xmx = 1e-9f; for (size_t i = 0; i < nx; i++) { float v = fabsf(xf[i]); if (v > xmx) xmx = v; }
-    const float s_x = xmx / 127.0f, xinv = 127.0f / xmx;
+    const double xinv = 1.0 / fc.s_x;
     std::vector<int8_t> xi(nx);
-    for (size_t i = 0; i < nx; i++) { int q = (int) lrintf(xf[i] * xinv);
-        xi[i] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); }
+    for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m * K; int8_t * a = xi.data() + (size_t) m*K;
+        for (int k = 0; k < K; k++) { int q = (int) lrint((xr[k] / fc.s[k]) * xinv);
+            a[k] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
 
-    // chosen intermediate scales (fixed; see WIP — coherence-first, refine with calibration if needed)
-    const double s_silu = 0.08, s_up = 0.08;
-    const double s_glu  = s_silu * s_up * 128.0;                 // ewmul gain 1/128 (mult=0x4000, shift=21)
-    const double in_g   = (double) s_x * pg->scale;             // gate_real = acc * s_x * s_Wg
-    // fused-SiLU register config (silu_native's proven set); LUT built per (in_g, s_silu), cached per gate ptr
     const int RM = 0x4000, RS = 0x10; const uint32_t OB = 0, IO = 0xffffc000u, C4 = 0x56391300u;
-    auto lit = ctx->lutcache.find(Wg->data);
-    if (lit == ctx->lutcache.end()) {
-        std::vector<int16_t> lut(1030);
-        if (ork_mm_silu_build_lut(ctx->npu, in_g, s_silu, RM, RS, C4, lut.data())) return false;
-        lit = ctx->lutcache.emplace(Wg->data, std::move(lut)).first;
-    }
-    const int16_t * lut = lit->second.data();
+    const int16_t * lut = fc.lut.data();
+    const int up_mult = fc.up_mult, up_shift = fc.up_shift;
 
-    // up out8 requant: up_i8 = acc_u * (s_x*s_Wu) / s_up  ->  R_up = s_x*s_Wu/s_up
-    auto ratio_to_ms = [](double R, int * mult, int * shift) {
-        int sh = 0; while (R < 0x2000 && sh < 30) { R *= 2.0; sh++; }   // scale mantissa into ~[0x2000,0x4000)
-        int m = (int) llround(R); if (m > 0x7fff) m = 0x7fff; if (m < 1) m = 1; *mult = m; *shift = sh; };
-    int up_mult, up_shift; ratio_to_ms((double) s_x * pu->scale / s_up, &up_mult, &up_shift);
-
-    // int8 intermediates (M rows of Nff), M-tiled to <=64 per submit (the primitives' M cap)
+    // int8 intermediates (M rows of Nff), M-tiled to mg_max*64 per submit (the primitives' fused M cap)
+    const int MT = 128;
     std::vector<int8_t>  silu_i8((size_t) M * Nff), up_i8((size_t) M * Nff), glu_i8((size_t) M * Nff);
     std::vector<int32_t> down_i32((size_t) M * Kd);
-    double us = 0; bool ok = true;
-    for (int m0 = 0; m0 < M && ok; m0 += 64) {
-        int mc = std::min(64, M - m0);
+    bool ok = true;
+    for (int m0 = 0; m0 < M && ok; m0 += MT) {
+        int mc = std::min(MT, M - m0);
         const int8_t * A = xi.data() + (size_t) m0 * K;
         int8_t * sg = silu_i8.data() + (size_t) m0 * Nff;
         int8_t * up = up_i8.data()   + (size_t) m0 * Nff;
         int8_t * gl = glu_i8.data()  + (size_t) m0 * Nff;
-        if (ork_mm_run_i8_silu(ctx->npu, pg->w, mc, A, sg, RM, RS, OB, IO, C4, lut, 1030)) { ok = false; break; }
-        if (ork_mm_run_i8_out8(ctx->npu, pu->w, mc, A, up, up_mult, up_shift))              { ok = false; break; }
-        if (ork_npu_ewmul_i8(ctx->npu, up, sg, mc, Nff, 0x4000, 21, gl, &us))               { ok = false; break; }
-        if (ork_mm_run_i8(ctx->npu, pd->w, mc, gl, down_i32.data() + (size_t) m0 * Kd))     { ok = false; break; }
+        if (ork_mm_run_i8_silu(ctx->npu, fc.wg, mc, A, sg, RM, RS, OB, IO, C4, lut, 1030)) { ok = false; break; }
+        if (ork_mm_run_i8_out8(ctx->npu, fc.wu, mc, A, up, up_mult, up_shift))              { ok = false; break; }
+        // ewmul on CPU (int8), NOT the NPU: the elementwise multiply has NO arithmetic-intensity, so the
+        // on-NPU SDP ewmul loses (per-call IOMMU churn + cube-marshaling ~6ms/ffn, and it wedged). Per-Nff-
+        // channel factor f[n] folds the down-SmoothQuant (glu'=glu/sd_smooth[n]) + s_glu requant. SiLU itself
+        // rode the gate matmul output stage for FREE — arithmetic-intensity split: matmuls NPU, elementwise CPU.
+        for (int r = 0; r < mc; r++) { const int8_t * srow = sg + (size_t) r*Nff, * urow = up + (size_t) r*Nff;
+            int8_t * grow = gl + (size_t) r*Nff;
+            for (int n = 0; n < Nff; n++) { long q = lrintf((float) srow[n] * (float) urow[n] * fc.f[n]);
+                grow[n] = (int8_t) (q > 127 ? 127 : q < -128 ? -128 : q); } }
+        if (ork_mm_run_i8(ctx->npu, fc.wd, mc, gl, down_i32.data() + (size_t) m0 * Kd))     { ok = false; break; }
     }
     if (ok) {
         // dequant down_i32 -> dst fp32: dst[m,n] = down_i32[m,n] * s_glu * s_Wd
         float * d = (float *) down_n->data;
-        const double sd = s_glu * pd->scale;
+        const double sd = fc.s_glu * fc.sd;
         const size_t nd = (size_t) M * Kd;
         for (size_t i = 0; i < nd; i++) d[i] = (float) (down_i32[i] * sd);
         return true;
