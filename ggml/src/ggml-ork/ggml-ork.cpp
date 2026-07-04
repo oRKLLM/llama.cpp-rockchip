@@ -3081,6 +3081,42 @@ static bool ggml_backend_ork_unary_i8(ggml_backend_ork_context * ctx, struct ggm
     return true;
 }
 
+static inline bool ork_ppu_glu_on() { static const int e = env_enabled("ORK_PPU_GLU"); return e; }
+
+// SwiGLU on the NPU: dst = silu(gate) (x) up  (gate=src0, up=src1, both f32 [N=ne0, rows]).
+// Quantize per-tensor to int8, silu(gate) via ork_npu_silu_i8, (x)up via ork_npu_ewmul_i8 (gain 1/128 so
+// up_i8*silu_i8/128 fits int8), dequant with s_glu = s_up*s_silu*128. int8 (lossy) — the wiring foothold
+// for the on-NPU FFN inner; the round-trip-free int8-chain (matmul int8-out feeding this) is the next step.
+// CPU fp32 fallback on any NPU error, so output is always correct.
+static bool ggml_backend_ork_glu(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * g = dst->src[0];
+    const struct ggml_tensor * u = dst->src[1];
+    const int64_t ne = ggml_nelements(dst);
+    const int N = (int) dst->ne[0], M = (int) (ne / N);
+    const float * gate = (const float *) g->data;
+    const float * up   = (const float *) u->data;
+    float * o = (float *) dst->data;
+    float amg = 1e-9f, amu = 1e-9f;
+    for (int64_t i = 0; i < ne; i++) { float a = fabsf(gate[i]); if (a > amg) amg = a; a = fabsf(up[i]); if (a > amu) amu = a; }
+    const double s_gate = amg/127.0, s_up = amu/127.0, s_silu = s_gate;
+    std::vector<int8_t> gi((size_t)ne), ui((size_t)ne), si((size_t)ne), glu((size_t)ne);
+    const float invg = 127.0f/amg, invu = 127.0f/amu;
+    for (int64_t i = 0; i < ne; i++) {
+        int v = (int)(gate[i]*invg + copysignf(0.5f, gate[i])); gi[i] = (int8_t)(v>127?127:v<-127?-127:v);
+        v     = (int)(up[i]*invu   + copysignf(0.5f, up[i]));   ui[i] = (int8_t)(v>127?127:v<-127?-127:v);
+    }
+    double us = 0;
+    int r1 = ork_npu_silu_i8(ctx->npu, (const signed char*)gi.data(), M, N, s_gate, s_silu, (signed char*)si.data(), &us);
+    int r2 = r1 ? -1 : ork_npu_ewmul_i8(ctx->npu, ui.data(), si.data(), M, N, 0x4000, 21, glu.data(), &us);
+    if (r1 == 0 && r2 == 0) {
+        const double s_glu = s_up * s_silu * 128.0;
+        for (int64_t i = 0; i < ne; i++) o[i] = (float)(glu[i] * s_glu);
+        return true;
+    }
+    for (int64_t i = 0; i < ne; i++) { float x = gate[i]; o[i] = (x/(1.0f+expf(-x))) * up[i]; }  // CPU fallback
+    return true;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -3228,6 +3264,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             case GGML_OP_UNARY: {
                 const bool gelu = ggml_get_unary_op(node) == GGML_UNARY_OP_GELU;
                 if (!ggml_backend_ork_unary_i8(ctx, node, gelu)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_GLU: {
+                if (!ggml_backend_ork_glu(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -3611,6 +3651,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if (!on) return false;
             if (!src0 || src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op) || !ggml_are_same_shape(src0, op)) return false;
+            const int64_t N = op->ne[0], ne = ggml_nelements(op), M = ne / N;
+            return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
+        }
+        case GGML_OP_GLU: {
+            // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
+            if (!ork_ppu_glu_on()) return false;
+            if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
+            if (!src0 || !src1) return false;                        // split form only (two inputs)
+            if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, op)) return false;
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(op)) return false;
             const int64_t N = op->ne[0], ne = ggml_nelements(op), M = ne / N;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
