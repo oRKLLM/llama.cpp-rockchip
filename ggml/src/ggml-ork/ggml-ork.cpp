@@ -3119,20 +3119,26 @@ static bool ork_ffn_chain_match(struct ggml_cgraph * cg, int i,
     struct ggml_tensor * gate = cg->nodes[i];
     if (gate->op != GGML_OP_MUL_MAT || gate->ne[2] != 1 || gate->ne[3] != 1) return false;
     if (!gate->src[0] || !strstr(gate->src[0]->name, "ffn_gate")) return false;
-    struct ggml_tensor *up = nullptr, *glu = nullptr, *down = nullptr; int iu=-1, ig=-1, id=-1;
-    const int WIN = 10;
+    // llama.cpp's build_ffn emits ffn_up BEFORE ffn_gate (llama-graph.cpp: `tmp = build_lora_mm(up, cur)`
+    // precedes the gate matmul), so a forward-only scan from the gate never finds up and the whole match
+    // fails. Instead anchor forward on the SWIGLU GLU node (created after BOTH gate and up) and take up
+    // straight from glu->src[1]: ggml_swiglu_split(gate, up) => GLU src0=gate, src1=up (not swapped,
+    // verified in ggml.c). Position-independent, so it matches regardless of gate/up node ordering.
+    struct ggml_tensor *glu = nullptr, *down = nullptr; int id=-1;
+    const int WIN = 12;
     for (int j = i + 1; j < cg->n_nodes && j <= i + WIN; j++) {
         struct ggml_tensor * n = cg->nodes[j];
         if (ork_is_noop_node(n)) continue;
-        if (!up && n->op == GGML_OP_MUL_MAT && n->src[0] && strstr(n->src[0]->name, "ffn_up") &&
-            n->src[1] == gate->src[1]) { up = n; iu = j; continue; }
-        if (up && !glu && n->op == GGML_OP_GLU && ggml_get_glu_op(n) == GGML_GLU_OP_SWIGLU &&
-            n->src[0] == gate && n->src[1] == up) { glu = n; ig = j; continue; }
+        if (!glu && n->op == GGML_OP_GLU && ggml_get_glu_op(n) == GGML_GLU_OP_SWIGLU &&
+            n->src[0] == gate) { glu = n; continue; }
         if (glu && !down && n->op == GGML_OP_MUL_MAT && n->src[0] && strstr(n->src[0]->name, "ffn_down") &&
             n->src[1] == glu) { down = n; id = j; break; }
     }
-    if (up && glu && down) { *g=gate; *u=up; *gl=glu; *dn=down; *last_idx=id; return true; }
-    return false;
+    if (!glu || !down) return false;
+    struct ggml_tensor * up = glu->src[1];               // the up MUL_MAT feeding the SwiGLU
+    if (!up || up->op != GGML_OP_MUL_MAT || !up->src[0] || !strstr(up->src[0]->name, "ffn_up")) return false;
+    if (up->src[1] != gate->src[1]) return false;        // gate and up must share the same ffn input x
+    *g=gate; *u=up; *gl=glu; *dn=down; *last_idx=id; return true;
 }
 
 // ORK_FFN_CHAIN: resolve a PER-TENSOR (single scalar scale) packed int8 weight for `src0` [K,N], cached in
@@ -3474,6 +3480,10 @@ static bool ggml_backend_ork_glu(ggml_backend_ork_context * ctx, struct ggml_ten
     const float * gate = (const float *) g->data;
     const float * up   = (const float *) u->data;
     float * o = (float *) dst->data;
+    if (N > 8192) {   // standalone NPU ewmul_i8 is capped at N<=8192; large-N GLUs (e.g. 7B Nff=18944) are the
+        for (int64_t i = 0; i < ne; i++) { float x = gate[i]; o[i] = (x/(1.0f+expf(-x))) * up[i]; }  // chain's job
+        return true;  // (this standalone path is only reached if the ffn_chain matcher missed the layer)
+    }
     float amg = 1e-9f, amu = 1e-9f;
     for (int64_t i = 0; i < ne; i++) { float a = fabsf(gate[i]); if (a > amg) amg = a; a = fabsf(up[i]); if (a > amu) amu = a; }
     const double s_gate = amg/127.0, s_up = amu/127.0, s_silu = s_gate;
@@ -3547,7 +3557,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
     // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
     const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8;
+    // FUSED FFN chain requires ALL of a layer's FFN weights (gate/up/down + the SiLU scratch) to be
+    // co-resident in ONE IOMMU domain: each ork_mm_run_* submit binds buffers in the active domain, and a
+    // submit that touches a buffer whose IOVA was reserved in a DIFFERENT domain faults the NPU (soft reset;
+    // see ork_mm_run_i8_silu). Under MULTI-DOMAIN streaming residence (n_domains>1, the >4GiB path) the model's
+    // weights are spread across domains, so a fused chain would issue cross-domain submits -> NPU fault ->
+    // wedge (empirically hard-wedged the RK3588). So fire the fused chain ONLY under single-domain residence
+    // (n_domains<=1, its validated regime: models that fit one 4GiB IOVA window, e.g. 1.7B). Streamed models
+    // keep the per-node NPU FFN (streaming-safe). Making the chain run co-domain under streaming is future work.
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && ctx->n_domains <= 1;
     if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
         bool has_ffn = false, has_glu = false;
         for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
@@ -3733,12 +3751,23 @@ ggml_backend_t ggml_backend_ork_init(void) {
           ctx->n_domains = atoi(nd);
           if (ctx->n_domains < 1)  ctx->n_domains = 1;
           if (ctx->n_domains > 16) ctx->n_domains = 16;
+      } else if (!ctx->persist_idx.empty()) {
+          // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate ~1.7x for the full-K Bf rebuild,
+          // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
+          // 4 GiB domain -> n_domains=1 (the single-domain FAST PATH — and the regime the fused FFN chain
+          // requires: all of a layer's weights co-resident so its submits never cross a domain). A >4 GiB
+          // model -> exactly the domains it needs. The 1.7x factor overestimates (an unused ceiling domain is
+          // harmless; under-sizing EFAULTs), so this never under-sizes. Explicit ORK_DOMAINS overrides above.
+          size_t total = 0; for (const auto & kv : ctx->persist_idx) total += kv.second.blob_size;
+          const size_t cap = (size_t) 3000 * 1024 * 1024;
+          long nd2 = (long) ((total * 17 / 10 + cap - 1) / cap);   // ceil(total * 1.7 / cap)
+          ctx->n_domains = nd2 < 1 ? 1 : (nd2 > 16 ? 16 : (int) nd2);
+          if (getenv("ORK_VERBOSE"))
+              fprintf(stderr, "[ORK] auto n_domains=%d from .orkpack footprint %.2f GiB int8 (x1.7 Bf / 3.0 GiB cap)\n",
+                      ctx->n_domains, total / (1024.0 * 1024.0 * 1024.0));
       } else {
-          // OPERATION-DRIVEN: a ceiling of domains; ork_weight_domain() byte-balanced-fills only as many
-          // as the resident set actually needs (each ~3.6 GiB, < the 4 GiB rk_iommu IOVA window). The
-          // model total isn't known here (ork is compute-only: weights live on CPU buffers, and arrive
-          // one matmul at a time), so we can't size it exactly up front — the cursor grows on demand.
-          // 8 domains cover up to ~28 GiB of resident weights (the 32 GiB board's practical max).
+          // No .orkpack index (live-pack / write mode): footprint unknown up front (weights arrive one matmul
+          // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
           ctx->n_domains = 8;
       }
       const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0; }
@@ -4064,6 +4093,12 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, op)) return false;
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(op)) return false;
             const int64_t N = op->ne[0], ne = ggml_nelements(op), M = ne / N;
+            // ORK_FFN_CHAIN consumes the GLU INSIDE the fused chain handler (the ewmul runs on CPU/tiled), so
+            // it is NOT bound by the standalone ork_npu_ewmul_i8 N<=8192 cap. Claim support at any N so the
+            // FFN's gate/up/GLU/down land in ONE ork subgraph and the chain matcher can fuse them — otherwise
+            // the 7B's Nff=18944 GLU is rejected, the scheduler splits the FFN across backends, and the 4
+            // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
+            if (ork_ffn_chain_on()) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         default:
