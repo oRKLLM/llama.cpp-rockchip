@@ -3228,14 +3228,24 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         for (int k = 0; k < K; k++) { float v = fabsf(xr[k] / fc.s[k]); if (v > xmx) xmx = v; } }
     fc.s_x = xmx / 127.0;
     double gmax_gate = 1e-9;
+    // ORK_FFN_SILU_PCT: option-3 (output-scale outlier clamp). Default = max-based s_silu (unchanged). When set
+    // (e.g. 99.9), s_silu = that PERCENTILE of |silu| instead of the max, so a few large-gate outlier neurons
+    // don't blow up the per-tensor output scale — the bulk small silu values then get much finer int8 (outliers
+    // saturate at 127, which is fine since silu(large)≈large is ~linear). One-line lever vs the CPU sprinkle.
     { const int NS = M < 32 ? M : 32; double smax = 1e-9, gm = 1e-9;   // calibrate s_silu + max|gate| (subset)
+      const char* pe = getenv("ORK_FFN_SILU_PCT"); double pct = pe ? atof(pe) : 0.0;
+      std::vector<float> sabs; if (pct > 0 && pct < 100) sabs.resize((size_t) Nff * NS);
       #pragma omp parallel for reduction(max:smax,gm) if (Nff >= 64)
       for (int n = 0; n < Nff; n++) { const float * gr = wgf.data() + (size_t) n*K;
           for (int m = 0; m < NS; m++) { const float * xr = xf + (size_t) m * K;
               double ag = 0; for (int k = 0; k < K; k++) ag += (double) gr[k]*xr[k];
               double sv = fabs(ag / (1.0 + exp(-ag))); if (sv > smax) smax = sv;
+              if (!sabs.empty()) sabs[(size_t) n*NS + m] = (float) sv;
               double av = fabs(ag); if (av > gm) gm = av; } }
-      fc.s_silu = smax * 1.15 / 127.0; if (!(fc.s_silu > 0)) fc.s_silu = 1e-6; gmax_gate = gm * 1.2; }
+      double sref = smax;
+      if (!sabs.empty()) { size_t idx = (size_t)(pct/100.0 * (double)(sabs.size()-1));
+          std::nth_element(sabs.begin(), sabs.begin()+idx, sabs.end()); sref = sabs[idx]; if (sref < 1e-9) sref = smax; }
+      fc.s_silu = sref * 1.15 / 127.0; if (!(fc.s_silu > 0)) fc.s_silu = 1e-6; gmax_gate = gm * 1.2; }
     fc.gmax = gmax_gate;
     // ORK_FFN_SILU_CPU_GMAX: strategic per-layer precision — layers whose gate range exceeds the threshold use
     // exact CPU fp32 silu (per-channel gate); the rest keep the fast int8 fused silu. Tune the ratio via the
