@@ -3287,22 +3287,65 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     const int RM = 0x4000, RS = 0x10; const uint32_t OB = 0, IO = 0xffffc000u, C4 = 0x56391300u;
     const int16_t * lut = fc.lut.data();
     const int MT = 128;
-    std::vector<int8_t>  silu_i8((size_t) M * Nff), glr_i8((size_t) M * Nff);
-    std::vector<int32_t> acc_i32((size_t) M * Nff);   // reused for up then down (Nff >= Kd)
-    std::vector<float>   glu_f((size_t) M * Nff), as_g(M);
+    // ORK_GATE_ABLATE: isolate the gate's 3 error sources (unset = normal fused hybrid).
+    //   0 = exact: per-channel Wg + per-row x + fp32 silu (should ~= baseline; confirms fused-silu is the culprit)
+    //   1 = +per-tensor WEIGHT (smoothed Wg, per-row smoothed x, fp32 silu)   [isolates source #2]
+    //   2 = +per-tensor STATIC activation (smoothed Wg, per-tensor-static x, fp32 silu)  [+ source #1]
+    //   3 = +int8 SILU output (mode 2 then round-trip silu through int8)       [+ source #3 ~= full chain]
+    const int ablate = getenv("ORK_GATE_ABLATE") ? atoi(getenv("ORK_GATE_ABLATE")) : -1;
+    std::vector<int8_t>  glr_i8((size_t) M * Nff);
+    std::vector<int32_t> acc_i32((size_t) M * Nff);   // reused (Nff >= Kd)
+    std::vector<float>   up_f((size_t) M * Nff), silu_f((size_t) M * Nff), glu_f((size_t) M * Nff), as_g(M);
     bool ok = true;
-    for (int m0 = 0; m0 < M && ok; m0 += MT) {
-        int mc = std::min(MT, M - m0);
-        // gate: fused SiLU on NPU -> silu_i8 (per-tensor s_silu)
-        if (ork_mm_run_i8_silu(ctx->npu, fc.wg, mc, xi.data() + (size_t) m0*K, silu_i8.data() + (size_t) m0*Nff,
-                               RM, RS, OB, IO, C4, lut, 1030)) { ok = false; break; }
-        // up: per-channel int8 matmul -> int32 -> dequant per-row*per-channel -> glu_f = silu*up (fp32 ewmul)
+    // Phase 1: up (per-channel, per-row) -> up_f fp32
+    for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
         if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
-        for (int r = 0; r < mc; r++) { const int8_t * srow = silu_i8.data() + (size_t)(m0+r)*Nff;
-            const int32_t * ur = acc_i32.data() + (size_t) r*Nff; float * gr = glu_f.data() + (size_t)(m0+r)*Nff;
-            const float rs = as_x[m0+r] * (float) fc.s_silu;
-            for (int n = 0; n < Nff; n++) gr[n] = (float) srow[n] * rs * bsu[n] * (float) ur[n]; }
+        for (int r = 0; r < mc; r++) { const int32_t * ur = acc_i32.data() + (size_t) r*Nff;
+            float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
+            for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } }
+    // Phase 2: silu_f fp32
+    if (ok && ablate < 0) {
+        // normal fused path: silu on NPU -> int8 -> *s_silu
+        std::vector<int8_t> silu_i8((size_t) M * Nff);
+        for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+            if (ork_mm_run_i8_silu(ctx->npu, fc.wg, mc, xi.data() + (size_t) m0*K, silu_i8.data() + (size_t) m0*Nff,
+                                   RM, RS, OB, IO, C4, lut, 1030)) { ok = false; break; } }
+        for (size_t i = 0; i < (size_t) M*Nff; i++) silu_f[i] = (float) silu_i8[i] * (float) fc.s_silu;
+    } else if (ok) {
+        // ablation gate: matmul (int32) + host silu at the selected precision
+        const bool perchan = (ablate == 0);
+        const int8_t * gx = nullptr; std::vector<int8_t> xsr; std::vector<float> as_xs;
+        ork_w * gw = nullptr; const float * bsg = nullptr; double sg_pt = 0;
+        if (perchan) {   // mode 0: per-channel Wg + per-row ORIGINAL x
+            auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+            if (itg == ctx->wcache.end()) return false;
+            gw = itg->second.w; bsg = itg->second.bscale.data(); gx = xr_i8.data();
+        } else if (ablate == 1) {   // mode 1: smoothed per-tensor Wg + per-ROW smoothed x
+            xsr.resize(nx); as_xs.resize(M);
+            for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m*K; int8_t * a = xsr.data() + (size_t) m*K;
+                float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(xr[k]/fc.s[k]); if (v > mx) mx = v; }
+                as_xs[m] = mx/127.0f; float iv = 127.0f/mx;
+                for (int k = 0; k < K; k++) { int q=(int)lrintf((xr[k]/fc.s[k])*iv); a[k]=(int8_t)(q>127?127:q<-127?-127:q); } }
+            gw = fc.wg; sg_pt = fc.sg; gx = xsr.data();
+        } else {   // modes 2,3: smoothed per-tensor Wg + per-tensor STATIC smoothed x (xi)
+            gw = fc.wg; sg_pt = fc.sg; gx = xi.data();
+        }
+        for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+            if (ork_mm_run_i8(ctx->npu, gw, mc, gx + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+            for (int r = 0; r < mc; r++) { const int32_t * ar = acc_i32.data() + (size_t) r*Nff;
+                float * so = silu_f.data() + (size_t)(m0+r)*Nff;
+                const float rrow = perchan ? as_x[m0+r] : (ablate==1 ? as_xs[m0+r] : (float) fc.s_x);
+                for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rrow * (perchan ? bsg[n] : (float) sg_pt);
+                    so[n] = g / (1.0f + expf(-g)); } }
+        }
+        if (ok && ablate == 3) {   // source #3: round-trip silu through per-tensor int8
+            float mx = 1e-9f; for (size_t i = 0; i < (size_t) M*Nff; i++) { float v = fabsf(silu_f[i]); if (v > mx) mx = v; }
+            float s = mx/127.0f, iv = 127.0f/mx;
+            for (size_t i = 0; i < (size_t) M*Nff; i++) { int q=(int)lrintf(silu_f[i]*iv); if(q>127)q=127; if(q<-128)q=-128; silu_f[i]=(float)q*s; }
+        }
     }
+    // Phase 3: glu = silu_f * up_f
+    if (ok) for (size_t i = 0; i < (size_t) M*Nff; i++) glu_f[i] = silu_f[i] * up_f[i];
     if (ok) {
         // down: per-row quant of glu_f -> int8, per-channel int8 matmul -> int32 -> dequant per-row*per-channel
         for (int m = 0; m < M; m++) { const float * gr = glu_f.data() + (size_t) m*Nff; int8_t * a = glr_i8.data() + (size_t) m*Nff;
