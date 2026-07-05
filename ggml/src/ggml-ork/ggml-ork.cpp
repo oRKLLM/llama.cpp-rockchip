@@ -262,6 +262,11 @@ struct ggml_backend_ork_context {
         ork_w * wg_f16 = nullptr;                      // gate weight packed fp16 as -S*Wg (negate: fp16 index spreads on neg acc)
         std::vector<int16_t> lut_f16;                  // universal fp16 silu LUT (calibrated once per layer's gate range)
         double f16_out = 0;                            // dequant: silu(gate) = C_out * f16_out
+        // ORK_FFN_SILU_CPU_GMAX: per-layer precision policy. High-|gate| layers lose the most to int8 fused
+        // silu (fixed-range LUT); when this layer's gmax exceeds the threshold, use the EXACT path instead —
+        // per-channel gate matmul on-NPU + fp32 silu on CPU (baseline quality, ~2.3x the fused-silu gate cost).
+        bool silu_cpu = false;
+        double gmax = 0;                               // this layer's calibrated max|gate| (the sensitivity signal)
     };
     std::unordered_map<const void *, ork_ffn_smooth>   ffncache;       // gate ptr -> smoothed layer state
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
@@ -3245,6 +3250,11 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
               double sv = fabs(ag / (1.0 + exp(-ag))); if (sv > smax) smax = sv;
               double av = fabs(ag); if (av > gm) gm = av; } }
       fc.s_silu = smax * 1.15 / 127.0; if (!(fc.s_silu > 0)) fc.s_silu = 1e-6; gmax_gate = gm * 1.2; }
+    fc.gmax = gmax_gate;
+    // ORK_FFN_SILU_CPU_GMAX: strategic per-layer precision — layers whose gate range exceeds the threshold use
+    // exact CPU fp32 silu (per-channel gate); the rest keep the fast int8 fused silu. Tune the ratio via the
+    // threshold (lower = more layers exact = higher quality, lower speed).
+    if (const char * t = getenv("ORK_FFN_SILU_CPU_GMAX")) fc.silu_cpu = (gmax_gate > atof(t));
     // ORK_FFN_GATE_F16: precise fp16 gate — build the fp16 SiLU LUT for this layer's gate range and pack the
     // gate weight as -S*Wg (fp16). silu output = C*f16_out at fp16 precision (no int8 activation quant).
     if (getenv("ORK_FFN_GATE_F16")) {
@@ -3264,8 +3274,8 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         if (ork_mm_silu_build_lut(ctx->npu, fc.s_x * fc.sg, fc.s_silu, 0x4000, 0x10, 0x56391300u, fc.lut.data())) return false;
     }
     fc.ready = true;
-    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep(hybrid) %s: s_x=%.3e s_silu=%.3e sg=%.3e\n",
-        Wg->name, fc.s_x, fc.s_silu, fc.sg);
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep(hybrid) %s: s_x=%.3e s_silu=%.3e sg=%.3e gmax=%.2f silu=%s\n",
+        Wg->name, fc.s_x, fc.s_silu, fc.sg, fc.gmax, fc.silu_cpu ? "CPU-fp32" : "int8-fused");
     return true;
     (void) Wu; (void) Wd;   // up/down resolved per-channel in the handler
 }
@@ -3340,7 +3350,19 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
             float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
             for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } }
     // Phase 2: silu_f fp32
-    if (ok && fc.wg_f16 && ablate < 0) {
+    if (ok && fc.silu_cpu && ablate < 0) {
+        // EXACT gate (strategic high-gmax layer): per-channel gate matmul on-NPU + fp32 silu on CPU. Same recipe
+        // as the up projection (per-channel weight, per-row x), so quality matches baseline; only the fused-silu
+        // stage is skipped for this layer. Reuses xr_i8 + as_x (per-row original x, already computed above).
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg == ctx->wcache.end()) { ok = false; }
+        else { const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+                if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+                for (int r = 0; r < mc; r++) { const int32_t * ar = acc_i32.data() + (size_t) r*Nff;
+                    float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
+                    for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } } } }
+    } else if (ok && fc.wg_f16 && ablate < 0) {
         // ORK_FFN_GATE_F16: precise fp16 gate matmul + fused fp16 SiLU. x -> fp16 (cast), gate weight is -S*Wg
         // (baked in prep), so acc = -S*gate spreads the fp16 LUT. silu(gate) = C_out * fc.f16_out (no int8 quant).
         std::vector<ork_f16> xh((size_t) M * K);
