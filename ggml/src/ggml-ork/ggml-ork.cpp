@@ -3294,9 +3294,13 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     const int Nff = (int) Wg->ne[1];
     const int Kd  = (int) Wd->ne[1];                   // down output width (= K, the hidden size)
     const int M   = (int) x->ne[1];
-    // guards: shapes the primitives require (K%512, K<=4096 for the fused gate/up; N%32; M in [1,64] per submit)
-    if (K % 512 || K > 4096 || Nff % 32 || Kd % 16 || M < 1) return false;
-    if (Nff > 8192) return false;
+    // guards: shapes the fused gate/up primitives require. K (hidden) must be K%512 && K<=4096 (the
+    // fused-SiLU / out8 full-K Bf envelope). Nff is the gate/up OUTPUT width (Sn-tiled at NMAX=8192 by
+    // the primitives) AND the down projection's CONTRACTION dim (run() K-slices it, Sk=ceil(Nff/1024),
+    // host-accumulate — the exact path the default 7B ffn_down K=18944 already uses). So Nff only needs
+    // Nff%512==0 (down K-slice bit-exactness) && Nff%32==0 (gate/up N). No Nff<=8192 cap: the streamed
+    // 7B (Nff=18944) tiles fine — validated the primitives handle it, perf may degrade (acceptable).
+    if (K % 512 || K > 4096 || Nff % 512 || Nff % 32 || Kd % 16 || M < 1) return false;
 
     const float * xf = (const float *) x->data;
     // one-time per-layer SmoothQuant prep (smoothing + smoothed-weight pack + static-scale calibration + LUT)
