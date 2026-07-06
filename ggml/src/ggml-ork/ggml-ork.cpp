@@ -953,14 +953,27 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             for (;;) {                                             // retry in the next domain on IOVA exhaustion
+                // ORK_NO_IMPORT: skip the zero-copy dma-buf import and use the COPY load (ork_mm_load_i8,
+                // bcreate DRM-handle buffers). The zero-copy import maps .orkpack pages into ONE IOMMU domain,
+                // but under MULTI-DOMAIN residence (>4GiB, e.g. 7B) a cross-domain submit against an imported
+                // buffer faults the NPU (RKNPU_SUBMIT errno=22/110 self-heal loop). The copy path uses the same
+                // buffer type as the (working) Q8_0 pack, so it's multi-domain-safe. Slightly slower load
+                // (a memcpy per weight vs a page map) but still loads pre-tiled bytes — NO Q8_0 conversion.
+                // The zero-copy dma-buf import maps .orkpack pages into ONE IOMMU domain; under MULTI-DOMAIN
+                // residence (the >4GiB sliding window, n_domains>1) a cross-domain submit against an imported
+                // buffer faults the NPU (errno=22/110 self-heal loop — the regression that broke the 7B
+                // sliding window). So force copy-mode (bcreate DRM handles, multi-domain-safe) whenever the
+                // sliding window is active; keep zero-copy for the single-domain (<=4GiB) fast path. Explicit
+                // ORK_NO_IMPORT still forces copy everywhere.
+                const bool no_import = env_enabled("ORK_NO_IMPORT") || ctx->n_domains > 1;
                 if (e.dtype == ORKPACK_DT_I4) {
-                    ow.w = ork_mm_load_i4a8_import(ctx->npu, K, N, blob, e.blob_size);   // ZERO-COPY: map .orkpack page-cache pages into IOVA
-                    if (!ow.w) ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);  // fallback: copy (import unavailable)
+                    if (!no_import) ow.w = ork_mm_load_i4a8_import(ctx->npu, K, N, blob, e.blob_size);   // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                    if (!ow.w) ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);  // copy (import off / unavailable)
                     if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
                 } else {
                     const double _l0 = ctx->profile ? ork_now_us_e() : 0;
-                    ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
-                    if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // fallback: copy (import unavailable)
+                    if (!no_import) ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                    if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // copy (import off / unavailable)
                     if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
                     if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
                                 ow.bscale.assign(bs, bs + e.bscale_n); }
