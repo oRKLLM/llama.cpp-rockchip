@@ -22,9 +22,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>     // getenv/setenv — ork .orkpack sidecar default
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>  // stat — ork .orkpack sidecar existence check
+#include <strings.h>   // strcasecmp — ork .orkpack sidecar suffix match
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -363,6 +368,28 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
     ggml_time_init();
+
+#if !defined(_WIN32)
+    // ork-driver coupling: this fork always expects a pre-tiled `.orkpack` sidecar (the orkllm frontend
+    // builds `<model>.gguf` -> `<model>.orkpack` on model download/detect). Default ORK_PERSIST to that
+    // sidecar so EVERY entry point (llama-cli / llama-bench / llama-completion — not just the frontend's
+    // pool.js) loads the pre-tiled weights ZERO-COPY instead of re-doing the slow Q8_0->int8-tile
+    // conversion every run (measured ~25x the resolve cost: 16.7s vs 0.66s on a 1.7B). Only when the
+    // sidecar EXISTS (the frontend owns conversion — we never build here) and ORK_PERSIST is unset
+    // (an explicit / frontend-provided value wins; setenv overwrite=0). A miss then still warns loudly.
+    if (!path_model.empty() && getenv("ORK_PERSIST") == nullptr) {
+        static const char sfx[] = ".gguf";
+        const size_t ns = sizeof(sfx) - 1;
+        if (path_model.size() > ns && strcasecmp(path_model.c_str() + path_model.size() - ns, sfx) == 0) {
+            std::string pack = path_model.substr(0, path_model.size() - ns) + ".orkpack";
+            struct stat st;
+            if (stat(pack.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                setenv("ORK_PERSIST", pack.c_str(), 0);
+                LLAMA_LOG_INFO("%s: ork: defaulting ORK_PERSIST to sidecar %s\n", __func__, pack.c_str());
+            }
+        }
+    }
+#endif
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
