@@ -361,6 +361,9 @@ struct ggml_backend_ork_context {
     // for the load-time report. Default n_domains=1 -> unchanged single-domain behavior.
     int    n_domains = 1;        // ORK_DOMAINS (default 1 = off)
     int    domain_layers = 0;    // ORK_DOMAIN_LAYERS (layers per domain; 0 = auto from ORK_DOMAINS+max layer)
+    size_t domain_fill_cap = (size_t) 3000 * 1024 * 1024;  // per-domain fill ceiling (ork_domain_for); auto = EVEN
+                                 // inflated_total/n_domains so domains fill uniformly with equal IOVA headroom,
+                                 // instead of greedily to 3.0 GiB (which packs early domains tight + overflows last)
     size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
@@ -380,21 +383,42 @@ static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK
 // cursor and retries the weight in the next domain (see ork_domain_advance). This uses the full usable
 // window of each domain and needs neither the total nor a hardcoded cap. Returns the current domain
 // (0 when multi-domain is off).
-static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, const char * name) {
+// Parse the transformer layer index from a weight name ("blk.<N>.<...>"), or -1 for a non-layer weight
+// (token_embd / output / *_norm). Used for LAYER-ALIGNED domain assignment.
+static int ork_layer_of(const char * name) {
+    if (!name) return -1;
+    const char * p = strstr(name, "blk.");
+    if (!p) return -1;
+    p += 4; if (*p < '0' || *p > '9') return -1;
+    int l = 0; while (*p >= '0' && *p <= '9') l = l * 10 + (*p++ - '0');
+    return l;
+}
+// Domain a weight resides in. LAYER-ALIGNED (ctx->domain_layers>0): a whole layer's weights -> ONE domain
+// (domain = layer/domain_layers), so a per-layer fused FFN chain never crosses a domain boundary (enables
+// per-domain fusion for >4GiB models). Deterministic by layer, so the lazily-packed fused gate lands in the
+// SAME domain as its up/down (both keyed by the same layer). Non-layer NPU weights (e.g. lm_head) -> the LAST
+// domain (it's under-filled by ceil rounding). When domain_layers==0 (byte-balanced auto sizing) the fill
+// still advances ONLY at a layer boundary, so a layer stays co-domain — preserving ork_dispatch_i8's
+// cross-core RR chains. `layer` = ork_layer_of(name), or -1 if non-layer/unknown.
+static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int layer) {
     if (ctx->n_domains <= 1) return 0;
+    if (ctx->domain_layers > 0) {
+        int d = (layer >= 0) ? layer / ctx->domain_layers : ctx->n_domains - 1;  // non-layer -> last (spare) domain
+        if (d >= ctx->n_domains) d = ctx->n_domains - 1;
+        if (d < 0) d = 0;
+        return d;
+    }
     // Advance to the next domain BEFORE this one hits its IOVA EFAULT. Critical: a domain filled to its
     // ~4 GiB limit EFAULTs and soft-resets the NPU, which corrupts the IOMMU so the NEXT domain fails to
     // start (measured: fill domain 0 to EFAULT → domain 1 dies on its first tile). domain_probe shows the
     // real per-domain limit is ~4.16 GiB; cap at 3.0 GiB to leave margin for the full-K Bf inflation and a
     // one-weight overshoot — so no domain ever EFAULTs and the hand-off to the next domain is clean.
-    const size_t cap = (size_t) 3000 * 1024 * 1024;
-    // Advance ONLY at a LAYER boundary (the blk.N index changed), never mid-layer, so a layer's whole
-    // matmul set (Q/K/V, gate/up) stays co-domain. That (a) lets the independent QKV/gate-up chain run
-    // round-robin across cores (run_stream is single-domain), and (b) keeps decode's per-token domain
-    // swaps at their minimum (~one per boundary). A layer's weights are tens of MB — far under the cap's
-    // ~1.16 GiB margin — so deferring the advance to the next layer never risks an EFAULT.
-    int layer = -1;
-    if (name) { const char * p = strstr(name, "blk."); if (p) layer = atoi(p + 4); }
+    const size_t cap = ctx->domain_fill_cap;   // EVEN target (footprint/n_domains), <= 3.0 GiB hard ceiling
+    // Advance ONLY at a LAYER boundary (the layer index changed), never mid-layer, so a layer's whole
+    // matmul set (Q/K/V, gate/up) stays co-domain. That (a) lets ork_dispatch_i8's independent QKV/gate-up
+    // chains run round-robin across cores (run_stream is single-domain), and (b) keeps decode's per-token
+    // domain swaps minimal. A layer's weights are tens of MB — far under the cap margin — so deferring the
+    // advance to the next layer never risks an EFAULT. `layer` is the ork_layer_of() index passed in.
     const bool new_layer = (layer >= 0 && layer != ctx->domain_last_layer);
     int d = ctx->domain_cursor;
     if (d < ctx->n_domains - 1 && ctx->domain_bytes[d] + bytes > cap && new_layer) d = ++ctx->domain_cursor;
@@ -949,7 +973,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
-            int _dom = ork_weight_domain(ctx, (size_t) K * N, src0->name);     // multi-domain residence: byte-balanced, layer-aligned (advance only at layer boundaries)
+            int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             for (;;) {                                             // retry in the next domain on IOVA exhaustion
@@ -965,7 +989,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 // sliding window). So force copy-mode (bcreate DRM handles, multi-domain-safe) whenever the
                 // sliding window is active; keep zero-copy for the single-domain (<=4GiB) fast path. Explicit
                 // ORK_NO_IMPORT still forces copy everywhere.
-                const bool no_import = env_enabled("ORK_NO_IMPORT") || ctx->n_domains > 1;
+                const bool no_import = (env_enabled("ORK_NO_IMPORT") || ctx->n_domains > 1) && !env_enabled("ORK_FORCE_IMPORT");
                 if (e.dtype == ORKPACK_DT_I4) {
                     if (!no_import) ow.w = ork_mm_load_i4a8_import(ctx->npu, K, N, blob, e.blob_size);   // ZERO-COPY: map .orkpack page-cache pages into IOVA
                     if (!ow.w) ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);  // copy (import off / unavailable)
@@ -1068,7 +1092,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         else            ork_wcache_evict(ctx, (size_t) K * N);
     }
     const double _p0 = ctx->profile ? ork_now_us_e() : 0;
-    int _dom = ork_weight_domain(ctx, (size_t) K * N, src0->name);     // multi-domain residence: byte-balanced, layer-aligned (advance only at layer boundaries)
+    int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_mm_pack_i8(ctx->npu, K, N, bi);
@@ -3208,7 +3232,7 @@ ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     for (int n = 0; n < N; n++) { const float * frow = f32.data() + (size_t) n * K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(frow[k] * inv);
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
-    int dom = ork_weight_domain(ctx, (size_t) K * N);
+    int dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));
     ork_npu_set_pack_domain(ctx->npu, dom);
     ork_w * w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
@@ -3221,7 +3245,7 @@ ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor *
 // Pack a PER-TENSOR int8 weight from an fp32 [N*K] plane (row n = K contiguous), with an optional per-input
 // -channel smoothing vector s[K] folded in (W'[n,k] = W[n,k]*s[k]). Returns the ork_w* and the scalar scale.
 static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32, int K, int N,
-                               const float * s, float * out_scale) {
+                               const float * s, float * out_scale, int layer) {
     float mx = 1e-9f;
     for (int n = 0; n < N; n++) { const float * r = f32 + (size_t) n * K;
         for (int k = 0; k < K; k++) { float v = fabsf(r[k] * (s ? s[k] : 1.0f)); if (v > mx) mx = v; } }
@@ -3230,7 +3254,7 @@ static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32
     for (int n = 0; n < N; n++) { const float * r = f32 + (size_t) n * K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(r[k] * (s ? s[k] : 1.0f) * inv);
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
-    int dom = ork_weight_domain(ctx, (size_t) K * N); ork_npu_set_pack_domain(ctx->npu, dom);
+    int dom = ork_weight_domain(ctx, (size_t) K * N, layer); ork_npu_set_pack_domain(ctx->npu, dom);
     ork_w * w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
     if (w && out_scale) *out_scale = scale;
@@ -3258,6 +3282,21 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     // that RKNN itself does matmul per-channel requant on the host, not in the SDP regcmd. So prep only needs
     // the gate: SmoothQuant the gate input (x outliers -> gate weight), pack the smoothed gate per-tensor,
     // calibrate static s_x + s_silu, build the fused-SiLU LUT.
+    // PER-DOMAIN FUSION: the fused path uses a PER-TENSOR gate (fc.wg, packed below) and NEVER the per-channel
+    // gate — but the per-channel gate was loaded during the normal load phase into the SAME domain, doubling
+    // this layer's gate storage. Under multi-domain that overflows the domain (PRIME_FD_TO_HANDLE fails on a
+    // later import -> partial down-proj -> multi-core submit reads unmapped IOVA -> errno 110/22 -> soft-reset;
+    // the exact trace). Evict the per-channel gate now (reclaim its IOVA) BEFORE packing fc.wg, so the domain
+    // holds ONE gate, not two. Safe: the fused handler resolves only up/down per-channel, never the gate again.
+    // Skip stream-pool-backed entries (se != nullptr) — the spool manages their IOVA separately.
+    if (ctx->n_domains > 1) {
+        auto git = ctx->wcache.find(Wg->data);
+        if (git != ctx->wcache.end() && !git->second.se && git->second.w) {
+            ork_mm_free(ctx->npu, git->second.w);
+            ctx->wcache_bytes -= git->second.bytes;
+            ctx->wcache.erase(git);
+        }
+    }
     std::vector<float> wgf;
     ork_deq_weight_f32(Wg, K, Nff, wgf);
     std::vector<float> cmax(K, 1e-9f), wmax(K, 1e-9f);
@@ -3268,7 +3307,8 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     fc.s.resize(K);   // SmoothQuant s[k] = sqrt(cmax)/sqrt(wmax); x'=x/s, Wg'=s*Wg (equivalent)
     for (int k = 0; k < K; k++) { double s = sqrt((double) cmax[k]) / sqrt((double) wmax[k]);
         if (!(s > 1e-4)) s = 1e-4; if (s > 1e4) s = 1e4; fc.s[k] = (float) s; }
-    fc.wg = ork_pack_pt_f32(ctx, wgf.data(), K, Nff, fc.s.data(), &fc.sg); if (!fc.wg) return false;
+    fc.wg = ork_pack_pt_f32(ctx, wgf.data(), K, Nff, fc.s.data(), &fc.sg, ork_layer_of(Wg->name));
+    if (!fc.wg) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep FAIL %s: fc.wg pack (K=%d N=%d dom=%d)\n", Wg->name, K, Nff, ork_weight_domain(ctx,(size_t)K*Nff,ork_layer_of(Wg->name))); return false; }
     float xmx = 1e-9f;   // static s_x from smoothed activations x'=x/s
     for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m * K;
         for (int k = 0; k < K; k++) { float v = fabsf(xr[k] / fc.s[k]); if (v > xmx) xmx = v; } }
@@ -3306,14 +3346,15 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         std::vector<ork_f16> wgh((size_t) Nff * K);   // pack -S*Wg as fp16 in [K][N] layout (ork_mm_pack convention)
         for (int n = 0; n < Nff; n++) for (int k = 0; k < K; k++)
             wgh[(size_t) k*Nff + n] = (ork_f16) (-(double) S * wgf[(size_t) n*K + k]);
-        int dom = ork_weight_domain(ctx, (size_t) K * Nff * 2); ork_npu_set_pack_domain(ctx->npu, dom);
+        int dom = ork_weight_domain(ctx, (size_t) K * Nff * 2, ork_layer_of(Wg->name)); ork_npu_set_pack_domain(ctx->npu, dom);
         fc.wg_f16 = ork_mm_pack(ctx->npu, K, Nff, wgh.data());
         while (!fc.wg_f16 && (dom = ork_domain_advance(ctx)) >= 0) fc.wg_f16 = ork_mm_pack(ctx->npu, K, Nff, wgh.data());
         if (!fc.wg_f16) return false;
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e\n", Wg->name, gmax_gate, S, os);
     } else {
         fc.lut.resize(1030);   // int8 fused-SiLU LUT for (in_g = s_x*s_Wg, s_silu)
-        if (ork_mm_silu_build_lut(ctx->npu, fc.s_x * fc.sg, fc.s_silu, 0x4000, 0x10, 0x56391300u, fc.lut.data())) return false;
+        if (ork_mm_silu_build_lut(ctx->npu, fc.s_x * fc.sg, fc.s_silu, 0x4000, 0x10, 0x56391300u, fc.lut.data())) {
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep FAIL %s: silu LUT build\n", Wg->name); return false; }
     }
     fc.ready = true;
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep(hybrid) %s: s_x=%.3e s_silu=%.3e sg=%.3e gmax=%.2f silu=%s\n",
@@ -3346,7 +3387,10 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     // host-accumulate — the exact path the default 7B ffn_down K=18944 already uses). So Nff only needs
     // Nff%512==0 (down K-slice bit-exactness) && Nff%32==0 (gate/up N). No Nff<=8192 cap: the streamed
     // 7B (Nff=18944) tiles fine — validated the primitives handle it, perf may degrade (acceptable).
-    if (K % 512 || K > 4096 || Nff % 512 || Nff % 32 || Kd % 16 || M < 1) return false;
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] swiglu_chain reached %s K=%d Nff=%d Kd=%d M=%d\n", Wg->name, K, Nff, Kd, M);
+    if (K % 512 || K > 4096 || Nff % 512 || Nff % 32 || Kd % 16 || M < 1) {
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] shape-guard REJECT %s K=%d Nff=%d Kd=%d M=%d\n", Wg->name, K, Nff, Kd, M);
+        return false; }
 
     const float * xf = (const float *) x->data;
     // one-time per-layer SmoothQuant prep (smoothing + smoothed-weight pack + static-scale calibration + LUT)
@@ -3375,6 +3419,19 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, ggml_get_type_traits(Wd->type)->to_float, true);
     if (itd == ctx->wcache.end()) return false;
     const ork_weight & owd = itd->second; const float * bsd = owd.bscale.data();
+    // PER-DOMAIN FUSION SAFETY (multi-domain): the three matmul weights (fused gate fc.wg, up owu.w, down
+    // owd.w) MUST reside in the SAME IOMMU domain — a fused submit binds buffers in one active domain, so a
+    // cross-domain weight would fault/soft-reset the NPU. Layer-aligned assignment (domain=layer/domain_layers)
+    // normally guarantees co-residence; verify at RUNTIME and fall back to the CPU recompute if it ever differs.
+    if (ctx->n_domains > 1) {
+        int dg = ork_w_domain(fc.wg), du = ork_w_domain(owu.w), dd = ork_w_domain(owd.w);
+        if (dg != du || du != dd) {
+            if (getenv("ORK_VERBOSE"))
+                fprintf(stderr, "[ORK FFN-CHAIN] %s: cross-domain weights (gate=%d up=%d down=%d) — per-node fallback\n",
+                        Wg->name, dg, du, dd);
+            return false;
+        }
+    }
 
     const int RM = 0x4000, RS = 0x10; const uint32_t OB = 0, IO = 0xffffc000u, C4 = 0x56391300u;
     const int16_t * lut = fc.lut.data();
@@ -3597,15 +3654,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
     // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
     const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
-    // FUSED FFN chain requires ALL of a layer's FFN weights (gate/up/down + the SiLU scratch) to be
-    // co-resident in ONE IOMMU domain: each ork_mm_run_* submit binds buffers in the active domain, and a
-    // submit that touches a buffer whose IOVA was reserved in a DIFFERENT domain faults the NPU (soft reset;
-    // see ork_mm_run_i8_silu). Under MULTI-DOMAIN streaming residence (n_domains>1, the >4GiB path) the model's
-    // weights are spread across domains, so a fused chain would issue cross-domain submits -> NPU fault ->
-    // wedge (empirically hard-wedged the RK3588). So fire the fused chain ONLY under single-domain residence
-    // (n_domains<=1, its validated regime: models that fit one 4GiB IOVA window, e.g. 1.7B). Streamed models
-    // keep the per-node NPU FFN (streaming-safe). Making the chain run co-domain under streaming is future work.
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && ctx->n_domains <= 1;
+    // FUSED FFN chain requires ALL of a layer's FFN weights (gate/up/down) co-resident in ONE IOMMU domain:
+    // each ork_mm_run_* submit binds buffers in the active domain, and a submit touching a buffer reserved in
+    // a DIFFERENT domain faults the NPU (soft reset). Enabled when EITHER single-domain (n_domains<=1) OR
+    // LAYER-ALIGNED multi-domain (domain_layers>0), which places every layer's weights — including the lazily
+    // packed fused gate — in ONE domain (domain=layer/domain_layers). Even so, the handler makes a RUNTIME
+    // co-domain check (ork_w_domain of gate/up/down) and falls back to per-node if they ever differ, so a
+    // cross-domain fused submit can never fire (wedge-safe). PER-DOMAIN FUSION for >4GiB models.
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && (ctx->n_domains <= 1 || ctx->domain_layers > 0);
     if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
         bool has_ffn = false, has_glu = false;
         for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
@@ -3792,19 +3848,42 @@ ggml_backend_t ggml_backend_ork_init(void) {
           if (ctx->n_domains < 1)  ctx->n_domains = 1;
           if (ctx->n_domains > 16) ctx->n_domains = 16;
       } else if (!ctx->persist_idx.empty()) {
-          // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate ~1.7x for the full-K Bf rebuild,
+          // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate for the resident Bb+Bf footprint,
           // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
           // 4 GiB domain -> n_domains=1 (the single-domain FAST PATH — and the regime the fused FFN chain
           // requires: all of a layer's weights co-resident so its submits never cross a domain). A >4 GiB
-          // model -> exactly the domains it needs. The 1.7x factor overestimates (an unused ceiling domain is
-          // harmless; under-sizing EFAULTs), so this never under-sizes. Explicit ORK_DOMAINS overrides above.
+          // model -> exactly the domains it needs. INFLATION = 2.1x: the resident set is Bb PLUS a full-K Bf
+          // rebuild for every K<=4096 weight (qkv/gate/up/o = most of the model), so the real footprint is
+          // ~2.0x the int8 blob (MEASURED: 7B = 12.26 GiB resident / 6.08 GiB blob = 2.02x), NOT 1.7x. The old
+          // 1.7x UNDER-sized (7B -> 4 domains, but 4 x 3.0 = 12.0 GiB < 12.26 -> the last domain, which
+          // ork_domain_for() leaves UNCAPPED, overflowed to 3.46 GiB -> a late weight's Bf import PRIME-failed
+          // -> partial residence -> warmup NPU soft-reset/wedge). 2.1x (> measured 2.02x) sizes 7B -> 5 domains
+          // so no domain overflows and each keeps IOVA headroom for imports + scratch. Explicit ORK_DOMAINS wins.
           size_t total = 0; for (const auto & kv : ctx->persist_idx) total += kv.second.blob_size;
           const size_t cap = (size_t) 3000 * 1024 * 1024;
-          long nd2 = (long) ((total * 17 / 10 + cap - 1) / cap);   // ceil(total * 1.7 / cap)
+          size_t inflated = total * 21 / 10;                       // resident Bb+Bf estimate (~2.1x int8 blob)
+          long nd2 = (long) ((inflated + cap - 1) / cap);          // ceil(inflated / 3.0 GiB) = min domains needed
           ctx->n_domains = nd2 < 1 ? 1 : (nd2 > 16 ? 16 : (int) nd2);
+          // EVEN packing: cap each domain at inflated/n_domains (+ small slack) instead of the 3.0 GiB ceiling,
+          // so domains fill UNIFORMLY (7B: ~2.55 GiB each x5, ~1.5 GiB headroom) rather than 3.0/3.0/3.0/3.0/0.26
+          // (early domains tight, last overflowing). Never exceeds the 3.0 GiB hard cap (inflated/n <= 3.0 by
+          // construction). +64 MiB slack absorbs per-weight granularity so the last domain isn't forced over.
+          if (ctx->n_domains > 1)
+              ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
+          // LAYER-ALIGNED domains: assign each transformer layer's weights to ONE domain (domain = layer/
+          // domain_layers) so a per-layer fused FFN chain never crosses a domain -> enables PER-DOMAIN
+          // FUSION for >4GiB models. domain_layers = ceil(n_layers / n_domains) spreads layers ~evenly;
+          // n_layers = max "blk.N" index + 1 over the .orkpack index. Non-layer NPU weights (lm_head) -> the
+          // last (under-filled) domain. When 0 (no index) ork_weight_domain falls back to byte-balanced fill.
+          if (ctx->n_domains > 1 && ctx->domain_layers == 0) {
+              int max_layer = -1;
+              for (const auto & kv : ctx->persist_idx) { int l = ork_layer_of(kv.first.c_str()); if (l > max_layer) max_layer = l; }
+              if (max_layer >= 0) ctx->domain_layers = (max_layer + 1 + ctx->n_domains - 1) / ctx->n_domains;
+          }
           if (getenv("ORK_VERBOSE"))
-              fprintf(stderr, "[ORK] auto n_domains=%d from .orkpack footprint %.2f GiB int8 (x1.7 Bf / 3.0 GiB cap)\n",
-                      ctx->n_domains, total / (1024.0 * 1024.0 * 1024.0));
+              fprintf(stderr, "[ORK] auto n_domains=%d (domain_layers=%d) from .orkpack footprint %.2f GiB int8 (x2.1 Bb+Bf; EVEN fill %.2f GiB/domain)\n",
+                      ctx->n_domains, ctx->domain_layers,
+                      total / (1024.0 * 1024.0 * 1024.0), ctx->domain_fill_cap / (1024.0 * 1024.0 * 1024.0));
       } else {
           // No .orkpack index (live-pack / write mode): footprint unknown up front (weights arrive one matmul
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
