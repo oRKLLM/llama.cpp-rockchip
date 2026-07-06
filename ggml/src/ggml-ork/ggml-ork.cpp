@@ -982,6 +982,19 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
 
     // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
     if (ctx->persist_mode) ctx->persist_misses++;
+    if (ctx->persist_mode == 1) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
+        // weight (name/shape/dtype mismatch or incomplete pack) so we fall back to live Q8_0->int8-tile
+        // conversion (~25x the orkpack load — measured 16.7s vs 0.66s resolve on the 1.7B). Make it LOUD
+        // (bounded) so "it's using Q8_0 not the orkpack" can never hide behind a silent fallback again.
+        static long _opk_warned = 0;
+        if (_opk_warned < 8)
+            fprintf(stderr, "[ork] WARN: %s (K=%d N=%d) NOT in the loaded .orkpack -> live Q8_0->int8-tile "
+                    "conversion (SLOW). Rebuild the .orkpack for THIS model (name/shape mismatch or stale pack).\n",
+                    src0->name, K, N);
+        else if (_opk_warned == 8)
+            fprintf(stderr, "[ork] WARN: (further .orkpack-miss warnings suppressed; see persist_misses in profile)\n");
+        _opk_warned++;
+    }
     if (ctx->profile) ctx->n_packmiss++;
     ctx->f32.resize((size_t) N * K);
     ctx->bi .resize((size_t) K * N);
