@@ -3916,18 +3916,22 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // ork_domain_for() leaves UNCAPPED, overflowed to 3.46 GiB -> a late weight's Bf import PRIME-failed
           // -> partial residence -> warmup NPU soft-reset/wedge). 2.1x (> measured 2.02x) sizes 7B -> 5 domains
           // so no domain overflows and each keeps IOVA headroom for imports + scratch. Explicit ORK_DOMAINS wins.
-          // Size domains from the RESIDENT footprint (dtype-AGNOSTIC), derived from each weight's K*N — NOT
-          // from the compact blob_size. An int4 blob is ~HALF the bytes of the int8 tile it expands to in
-          // IOVA, so the old blob*2.1 (calibrated on an int8 pack: 7B = 6.08 GiB blob -> 12.26 GiB resident
-          // = 2.02x) UNDER-sized int4 packs ~2x: the 35B Q4_K pack is 1.4 GiB blob -> 5.31 GiB resident (3.8x)
-          // -> nd computed as 1 -> the single domain overflowed at ~2.7 GiB and every import PRIME-failed
-          // (loaded 0 from disk). resident per weight = the int8 tile (K*N) PLUS a full-K Bf rebuild (another
-          // K*N for K<=4096, i.e. nearly all weights). This matches the int8 measurement AND fixes int4.
-          // FUSION adds NO volume: the fused per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1.
+          // Size domains from the RESIDENT footprint — derived from each weight's K*N and THIS quant path's
+          // resident tile, NOT from the compact blob_size (which under-sizes: an int4 blob is ~half the bytes
+          // of the int8 tile it expands to, so the old blob*2.1 gave the 35B Q4_K pack n_domains=1 -> the
+          // single domain overflowed at ~2.7 GiB and every import PRIME-failed -> "loaded 0 from disk").
+          // The resident tile is quant-path-specific (each path packs its own IOVA form), so branch on it:
+          //   W8A8 (qbits==8): int8 tile K*N  (also the resident form for Q4_K/q4_0 sources — the i4a8 storage
+          //                    path INFLATES their nibbles to int8; that's why we size from K*N, not the blob).
+          //   W4A4 (qbits==4): native int4 tile K*N/2 (nibbles resident, DT_I4).
+          // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). FUSION adds NO volume: the fused
+          // per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1. MEASURED (int8): 7B = 12.26 GiB resident.
           size_t inflated = 0;
           for (const auto & kv : ctx->persist_idx) {
-              size_t tile = (size_t) kv.second.K * kv.second.N;   // int8 resident tile (dtype-agnostic)
-              inflated += tile + (kv.second.K <= 4096 ? tile : 0);  // + full-K Bf rebuild
+              const int K = (int) kv.second.K, N = (int) kv.second.N;
+              size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
+                                              : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
+              inflated += tile + (K <= 4096 ? tile : 0);               // + full-K Bf rebuild
           }
           // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
           // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
