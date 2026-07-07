@@ -54,6 +54,15 @@
 //   ORK_FUSE=1           EXPERIMENTAL. QKV / gate-up fusion (int8). Measured neutral; off.
 //   ORK_QUANT=4          EXPERIMENTAL. int4 W4A4 instead of int8 (incoherent; research only).
 //   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated int4 path (with ORK_QUANT=4).
+//   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
+//                        (q4) sources onto the NPU (instead of CPU) and pick the compute path per tensor by
+//                        source precision. Default: 4-bit tier computes W8A8 (dequant q4->int8, fast +
+//                        coherent ≈ Q8_0; the compact-int4 win is realized in the .orkpack STORAGE, not the
+//                        compute — native W4A4 prefill is single-row/no-M-amortization so it loses); >4-bit
+//                        stays W8A8. On Q4_K_M this gives NPU prefill (~3.8× CPU) with a compact mixed .orkpack.
+//   ORK_MIXED_W4A4=1     With ORK_MIXED_DISPATCH: opt the 4-bit tier into NATIVE W4A4 compute (int4 MAC)
+//                        instead of W8A8. For the decode/streaming regimes where int4's bandwidth wins;
+//                        loses at prefill (measured run ~54× the W8A8 path — see ORK_PROFILE [ork i4prof]).
 //   ORK_ZC_OUT=1         EXPERIMENTAL/BUGGY. Output zero-copy (single-tile ~90% wrong). Off.
 //   ORK_HYBRID=1         EXPERIMENTAL. Hybrid CPU/NPU weight loading.
 //   ORK_MINM=<n>         Min M to route a matmul to the NPU (default 32). Tuning, not experimental.
@@ -592,6 +601,21 @@ static double ork_src_type_bits(enum ggml_type t) {
     case GGML_TYPE_IQ4_XS:  return 4.25;
     default:                return -1.0;   // unknown → conservative high-bit (int8)
     }
+}
+
+// ORK_MIXED_DISPATCH: per-tensor W4A4/W8A8 dispatch driven by the GGUF's OWN mixed quantization. A
+// k-quant/UD GGUF (e.g. Q4_K_M) already spent MORE bits on the PPL-critical tensors (output/embeddings,
+// bumped attn_v / ffn_down → Q6_K/Q5_K/Q8_0) and 4 bits on the robust bulk (Q4_K). So the source type IS
+// the sensitivity signal, per tensor, for free: run the =4-bit tensors on the native W4A4 path (int4
+// resident, ~2× decode bandwidth) and the >4-bit tensors on the coherent W8A8 path — the direct analog of
+// the int8 ORK_FFN_SILU_CPU_GMAX per-layer precision escalation, mirrored onto the int4↔int8 axis. This is
+// what protects PPL where a uniform Hadamard rotation alone did not: Hadamard tames the 4-bit bulk, and the
+// few tensors it can't (the quantizer already flagged them >4-bit) fall to W8A8. Opt-in — the default
+// (sub-5-bit → CPU) is unchanged until this is board-validated. Returns 1 only when the env is truthy.
+static int ork_mixed_dispatch_on(void) {
+    static int v = -1;
+    if (v < 0) v = env_enabled("ORK_MIXED_DISPATCH") ? 1 : 0;
+    return v;
 }
 
 // ---- ORK_ORKPACK_TIERMAP: external name<TAB>tier allocation map (Phase 4 STEP B) ------------
@@ -1499,6 +1523,10 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
                   float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);
 
+            // W4A4 (grouped) profiling — mirrors the W8A8 path (t_quant = weight pack + activation
+            // int4-quant; t_run = ork_mm_run_i4_grouped incl. the in-run per-group fp32 dequant), so
+            // ORK_PROFILE shows the int4 pack-vs-run split directly (it was invisible before).
+            double _t0 = ctx->profile ? ork_now_us() : 0.0;
             auto it = ctx->wcache.find(x);
             if (it == ctx->wcache.end()) {
                 if (type == GGML_TYPE_F32) {
@@ -1563,9 +1591,18 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                 tmp_d.resize((size_t) M_padded * N);
                 d_ptr = tmp_d.data();
             }
+            double _t1 = ctx->profile ? ork_now_us() : 0.0;
             if (ork_mm_run_i4_grouped(ctx->npu, ow.w, M_padded, ai, as, ow.bscale.data(), d_ptr)) return false;
             if (M != M_padded) {
                 memcpy(d, d_ptr, (size_t) M * N * sizeof(float));
+            }
+            if (ctx->profile) {
+                double _t2 = ork_now_us();
+                ctx->t_quant += _t1 - _t0; ctx->t_run += _t2 - _t1; ctx->n_mm += 1;
+                if (M > 1) { ctx->t_run_pf += _t2 - _t1; ctx->n_pf++; ctx->m_pf += M; }
+                else       { ctx->t_run_dec += _t2 - _t1; ctx->n_dec++; }
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ork i4prof] W4A4-grouped %s M=%d K=%d N=%d G=%d | quant %.1fms run %.1fms\n",
+                    src0->name, M, K, N, G, (_t1-_t0)/1e3, (_t2-_t1)/1e3);
             }
         }
     }
@@ -1614,6 +1651,9 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             const float * y = (const float *)((const char *) src1->data + i12*nb12 + i13*nb13);
                   float * d = (      float *)((      char *)  dst->data + i12*nb2  + i13*nb3);
 
+            // W4A4 (per-channel + Hadamard) profiling — t_quant = FWHT-rotate + weight/act int4-quant +
+            // pack; t_run = ork_mm_run_i4 (single full-K submit); t_deq = the per-channel fp32 scale-apply.
+            double _t0 = ctx->profile ? ork_now_us() : 0.0;
             auto it = ctx->wcache.find(x);
             if (it == ctx->wcache.end()) {
                 if (type == GGML_TYPE_F32) {
@@ -1676,12 +1716,22 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             ork_mm_task_i4 task = { ow.w, M_padded, ai, ci };
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
             fflush(stderr);
+            double _t1 = ctx->profile ? ork_now_us() : 0.0;
             if (ork_mm_run_i4(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
+            double _t2 = ctx->profile ? ork_now_us() : 0.0;
             #pragma omp parallel for if (M >= 16)
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
                 }
+            }
+            if (ctx->profile) {
+                double _t3 = ork_now_us();
+                ctx->t_quant += _t1 - _t0; ctx->t_run += _t2 - _t1; ctx->t_deq += _t3 - _t2; ctx->n_mm += 1;
+                if (M > 1) { ctx->t_run_pf += _t2 - _t1; ctx->n_pf++; ctx->m_pf += M; }
+                else       { ctx->t_run_dec += _t2 - _t1; ctx->n_dec++; }
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ork i4prof] W4A4-hadamard %s M=%d K=%d N=%d | quant %.1fms run %.1fms deq %.1fms\n",
+                    src0->name, M, K, N, (_t1-_t0)/1e3, (_t2-_t1)/1e3, (_t3-_t2)/1e3);
             }
         }
     }
@@ -3787,7 +3837,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     i += chain_nodes.size() - 1;
                 } else {
                     struct ggml_tensor * grp[16]; int ng = 1; grp[0] = node;
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1) {
+                    // mixed dispatch: skip the i8 group-fusion so each tensor is dispatched by its own
+                    // source precision below (grouping would force the 4-bit members onto W8A8, losing the
+                    // W4A4 bandwidth win). Per-tier grouping is a later optimization.
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && !ork_mixed_dispatch_on()) {
                         while (i + ng < cgraph->n_nodes && ng < 16) {
                             struct ggml_tensor * nj = cgraph->nodes[i + ng];
                             if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
@@ -3805,7 +3858,21 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         bool is_attn = strstr(name, "attn_q") || strstr(name, "attn_k") || strstr(name, "attn_v") || strstr(name, "attn_output");
                         
                         int target_qbits = ctx->qbits;
-                        if (ctx->hybrid) {
+                        if (ork_mixed_dispatch_on()) {
+                            // per-tensor dispatch driven by the GGUF's own quant precision. The 4-bit tier's
+                            // COMPUTE path: native W4A4 (mul_mat_i4) is structurally single-row on this NPU
+                            // (no M-tile weight-DMA amortization → re-streams each weight ~M times → loses to
+                            // int8 at prefill), so by DEFAULT the 4-bit tier computes W8A8 (dequant q4→int8,
+                            // amortized + coherent ≈ Q8_0 speed); the compact-int4 win is realized in the
+                            // .orkpack STORAGE (i4a8), not the compute. ORK_MIXED_W4A4=1 opts the 4-bit tier
+                            // into native W4A4 for the decode/streaming regimes where it actually wins.
+                            static const int w4a4 = env_enabled("ORK_MIXED_W4A4");
+                            double b = ork_src_type_bits(node->src[0]->type);
+                            target_qbits = (w4a4 && b >= 0.0 && b < 5.0) ? 4 : 8;
+                            if (getenv("ORK_VERBOSE"))
+                                fprintf(stderr, "[ORK MIXED] %s src=%s bits=%.2f -> W%dA%d\n",
+                                        name, ggml_type_name(node->src[0]->type), b, target_qbits, target_qbits);
+                        } else if (ctx->hybrid) {
                             if (is_ffn) target_qbits = 4;
                             else if (is_attn) target_qbits = 8;
                         }
@@ -4126,11 +4193,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // double-quant). Route any sub-5-bit source (Q4_*/Q3_K/Q2_K/IQ*) to CPU, and — since supports_op
             // also gates the convert-time forward — this stops the .orkpack from ever packing a q4 model.
             // Escape hatch: an explicit int4 RESEARCH mode (ORK_QUANT=4 / ORK_HADAMARD / ORK_HYBRID /
-            // ORK_ORKPACK_TIERMAP) still opts into the experimental int4 path.
+            // ORK_ORKPACK_TIERMAP) still opts into the experimental int4 path. ORK_MIXED_DISPATCH also
+            // opts in: it ACCEPTS the sub-5-bit tensors and runs them native-W4A4 (per-tensor dispatch in
+            // graph_compute), keeping the >4-bit tensors on W8A8 — the mixed-precision q4 NPU path.
             {
                 static const int i4_research = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
                     || getenv("ORK_HADAMARD") || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
-                if (!i4_research) {
+                if (!i4_research && !ork_mixed_dispatch_on()) {
                     double sbits = ork_src_type_bits(src0->type);
                     if (sbits >= 0.0 && sbits < 5.0) return false;   // q4/low-bit source -> CPU-only
                 }
