@@ -3855,37 +3855,40 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // ork_domain_for() leaves UNCAPPED, overflowed to 3.46 GiB -> a late weight's Bf import PRIME-failed
           // -> partial residence -> warmup NPU soft-reset/wedge). 2.1x (> measured 2.02x) sizes 7B -> 5 domains
           // so no domain overflows and each keeps IOVA headroom for imports + scratch. Explicit ORK_DOMAINS wins.
-          size_t total = 0; for (const auto & kv : ctx->persist_idx) total += kv.second.blob_size;
-          const size_t cap = (size_t) 3000 * 1024 * 1024;
-          size_t inflated = total * 21 / 10;                       // resident Bb+Bf estimate (~2.1x int8 blob)
-          long nd2 = (long) ((inflated + cap - 1) / cap);          // ceil(inflated / 3.0 GiB) = min domains needed
-          ctx->n_domains = nd2 < 1 ? 1 : (nd2 > 16 ? 16 : (int) nd2);
-          // EVEN packing: cap each domain at inflated/n_domains (+ small slack) instead of the 3.0 GiB ceiling,
-          // so domains fill UNIFORMLY (7B: ~2.55 GiB each x5, ~1.5 GiB headroom) rather than 3.0/3.0/3.0/3.0/0.26
-          // (early domains tight, last overflowing). Never exceeds the 3.0 GiB hard cap (inflated/n <= 3.0 by
-          // construction). +64 MiB slack absorbs per-weight granularity so the last domain isn't forced over.
-          if (ctx->n_domains > 1)
-              ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
-          // LAYER-ALIGNED domains: assign each transformer layer's weights to ONE domain (domain = layer/
-          // domain_layers) so a per-layer fused FFN chain never crosses a domain -> enables PER-DOMAIN
-          // FUSION for >4GiB models. domain_layers = ceil(n_layers / n_domains) spreads layers ~evenly;
-          // n_layers = max "blk.N" index + 1 over the .orkpack index. Non-layer NPU weights (lm_head) -> the
-          // last (under-filled) domain. When 0 (no index) ork_weight_domain falls back to byte-balanced fill.
-          if (ctx->n_domains > 1 && ctx->domain_layers == 0) {
-              int max_layer = -1;
-              for (const auto & kv : ctx->persist_idx) { int l = ork_layer_of(kv.first.c_str()); if (l > max_layer) max_layer = l; }
-              if (max_layer >= 0) ctx->domain_layers = (max_layer + 1 + ctx->n_domains - 1) / ctx->n_domains;
+          // Size domains from the RESIDENT footprint (dtype-AGNOSTIC), derived from each weight's K*N — NOT
+          // from the compact blob_size. An int4 blob is ~HALF the bytes of the int8 tile it expands to in
+          // IOVA, so the old blob*2.1 (calibrated on an int8 pack: 7B = 6.08 GiB blob -> 12.26 GiB resident
+          // = 2.02x) UNDER-sized int4 packs ~2x: the 35B Q4_K pack is 1.4 GiB blob -> 5.31 GiB resident (3.8x)
+          // -> nd computed as 1 -> the single domain overflowed at ~2.7 GiB and every import PRIME-failed
+          // (loaded 0 from disk). resident per weight = the int8 tile (K*N) PLUS a full-K Bf rebuild (another
+          // K*N for K<=4096, i.e. nearly all weights). This matches the int8 measurement AND fixes int4.
+          // FUSION adds NO volume: the fused per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1.
+          size_t inflated = 0;
+          for (const auto & kv : ctx->persist_idx) {
+              size_t tile = (size_t) kv.second.K * kv.second.N;   // int8 resident tile (dtype-agnostic)
+              inflated += tile + (kv.second.K <= 4096 ? tile : 0);  // + full-K Bf rebuild
           }
+          // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
+          // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
+          // (~2.7 GiB observed) — keep each domain's byte-balanced fill well clear of that edge.
+          const size_t cap = (size_t) 2500 * 1024 * 1024;
+          long nd = (long) ((inflated + cap - 1) / cap);
+          ctx->n_domains = nd < 1 ? 1 : (nd > 16 ? 16 : (int) nd);
+          if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
           if (getenv("ORK_VERBOSE"))
-              fprintf(stderr, "[ORK] auto n_domains=%d (domain_layers=%d) from .orkpack footprint %.2f GiB int8 (x2.1 Bb+Bf; EVEN fill %.2f GiB/domain)\n",
-                      ctx->n_domains, ctx->domain_layers,
-                      total / (1024.0 * 1024.0 * 1024.0), ctx->domain_fill_cap / (1024.0 * 1024.0 * 1024.0));
+              fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom, byte-balanced) from %.2f GiB resident footprint\n",
+                      ctx->n_domains, ctx->domain_fill_cap / (1024.0*1024.0*1024.0),
+                      inflated / (1024.0 * 1024.0 * 1024.0));
       } else {
           // No .orkpack index (live-pack / write mode): footprint unknown up front (weights arrive one matmul
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
           ctx->n_domains = 8;
       }
-      const char * dl = getenv("ORK_DOMAIN_LAYERS"); ctx->domain_layers = dl ? atoi(dl) : 0; }
+      // ORK_DOMAIN_LAYERS: explicit override ONLY. domain_layers stays 0 (its default) unless set — the auto
+      // branch above sizes domains by byte-balanced fill (ork_weight_domain), NOT layer-alignment, so there is
+      // no computed value to preserve. Guard on `dl` (don't `= dl ? atoi(dl) : 0`) so an unset var can't clobber
+      // an explicit ORK_DOMAIN_LAYERS that a caller set for per-domain fusion experiments.
+      const char * dl = getenv("ORK_DOMAIN_LAYERS"); if (dl) ctx->domain_layers = atoi(dl); }
     // Residency = ork-driver's MULTI-DOMAIN mechanism (weights resident across up to 16 IOMMU domains,
     // each its own ~4 GiB IOVA window; dom_activate zero-copy-swaps the active domain per submit). This
     // resides up to ~64 GiB with no streaming — every practical model. The stream pool (RAM-hold + dma-buf
