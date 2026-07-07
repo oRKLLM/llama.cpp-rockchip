@@ -368,6 +368,11 @@ struct ggml_backend_ork_context {
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
+    // PER-DOMAIN FUSION (>4GiB): the fused per-tensor gate (fc.wg) is NOT a separate/extra weight — it REPLACES
+    // the per-channel gate 1:1 (same K×N, same Bb+Bf, differs only in scale), so in fused mode the per-channel
+    // gate is never packed and fc.wg takes its place in the SAME layer's domain via ork_weight_domain(). It is
+    // packed as an IMPORT (like every other weight) so it doesn't fragment the domain's 32-bit IOVA with a
+    // native-alloc outlier. No dedicated fc.wg domains, no extra volume, no per-layer domain-switch thrashing.
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
@@ -411,7 +416,7 @@ static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int l
     // start (measured: fill domain 0 to EFAULT → domain 1 dies on its first tile). domain_probe shows the
     // real per-domain limit is ~4.16 GiB; cap at 3.0 GiB to leave margin for the full-K Bf inflation and a
     // one-weight overshoot — so no domain ever EFAULTs and the hand-off to the next domain is clean.
-    const size_t cap = ctx->domain_fill_cap;   // EVEN target (inflated_total/n_domains), <= 3.0 GiB hard ceiling
+    const size_t cap = ctx->domain_fill_cap;   // EVEN target (inflated/n_domains), <= 3.0 GiB hard ceiling
     int d = ctx->domain_cursor;
     if (d < ctx->n_domains - 1 && ctx->domain_bytes[d] + bytes > cap) d = ++ctx->domain_cursor;
     return d;
@@ -794,27 +799,41 @@ static void ork_expert_dequant_quant(const struct ggml_tensor * src0, int e, int
                                       float * f32, int8_t * bi, float * bscale) {
     const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
     const size_t nb01 = src0->nb[1];
-    int nthr = (int) sysconf(_SC_NPROCESSORS_ONLN); if (nthr < 1) nthr = 1;
-    if (nthr > N) nthr = (int) N;
-    auto worker = [&](int n0, int n1) {
-        ork_unpin_current_thread();
-        for (int n = n0; n < n1; n++) {
+    // Parallel across the N output channels (each independent → no locking) via the PERSISTENT OpenMP pool
+    // — NOT a per-slice std::thread spawn/join, which is what capped a MoE convert at ~1 core (thousands of
+    // expert slices × pool-teardown). Inner loops are NEON: the max-scan and the quantize both vectorize
+    // over K. vcvtnq_s32_f32 rounds ties-to-even, matching lrintf's default rounding → bit-identical output.
+    #pragma omp parallel
+    {
+        ork_unpin_current_thread();                 // each pool thread: spread off the big-core inference pin
+        #pragma omp for schedule(dynamic, 16)
+        for (int n = 0; n < N; n++) {
             float * frow = f32 + (size_t) n * K;
             if (type == GGML_TYPE_F32) memcpy(frow, x + n*nb01, (size_t) K*sizeof(float));
             else                        to_float(x + n*nb01, frow, K);
-            float mx = 1e-9f;
-            for (int k = 0; k < K; k++) { float v = fabsf(frow[k]); if (v > mx) mx = v; }
-            float scale_val = mx / 127.0f; bscale[n] = scale_val;
-            for (int k = 0; k < K; k++) {
-                int q = (int) lrintf(frow[k] / scale_val);
-                bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+            // max |frow[k]| over k (NEON)
+            float32x4_t vmax = vdupq_n_f32(1e-9f);
+            int k = 0;
+            for (; k + 4 <= K; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(frow + k)));
+            float mx = vmaxvq_f32(vmax);
+            for (; k < K; k++) { float a = fabsf(frow[k]); if (a > mx) mx = a; }
+            const float scale_val = mx / 127.0f, inv = 127.0f / mx;
+            bscale[n] = scale_val;
+            // quantize q=round(frow*inv), clamp [-127,127] (NEON compute; strided store bi[k*N+n])
+            const float32x4_t vinv = vdupq_n_f32(inv);
+            const int32x4_t   qlo = vdupq_n_s32(-127), qhi = vdupq_n_s32(127);
+            k = 0;
+            for (; k + 4 <= K; k += 4) {
+                int32x4_t q = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(frow + k), vinv));
+                q = vminq_s32(vmaxq_s32(q, qlo), qhi);
+                bi[(size_t)(k)  *N + n] = (int8_t) vgetq_lane_s32(q, 0);
+                bi[(size_t)(k+1)*N + n] = (int8_t) vgetq_lane_s32(q, 1);
+                bi[(size_t)(k+2)*N + n] = (int8_t) vgetq_lane_s32(q, 2);
+                bi[(size_t)(k+3)*N + n] = (int8_t) vgetq_lane_s32(q, 3);
             }
+            for (; k < K; k++) { int q = (int) lrintf(frow[k] * inv); bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); }
         }
-    };
-    if (nthr <= 1) { worker(0, (int) N); return; }
-    std::vector<std::thread> th; int chunk = ((int) N + nthr - 1) / nthr;
-    for (int t = 0; t < nthr; t++) { int a = t*chunk, b = std::min((int) N, a+chunk); if (a < b) th.emplace_back(worker, a, b); }
-    for (auto & t : th) t.join();
+    }
 }
 
 static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
@@ -834,31 +853,75 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     // thread runs the serial NPU pack/dump of expert i, a helper thread dequant+quants expert i+1 (all
     // cores) into the other buffer. Producer touches no NPU/ctx state → safe alongside the consumer.
     // Consumed strictly in `todo` order, so the .orkpack is bit-identical to the serial version.
-    struct Stage { std::vector<float> f32; std::vector<int8_t> bi; std::vector<float> bscale; };
-    Stage buf[2];
-    for (auto & s : buf) { s.f32.resize((size_t) N * K); s.bi.resize((size_t) K * N); s.bscale.resize(N); }
-
-    auto consume = [&](Stage & s, int e) {
-        const std::string key = ork_expert_key(src0->name, e);
-        ork_weight ow; ow.bscale = s.bscale;
-        // HYBRID gate: experts are persistence-only (not used in the convert forward pass), so tile
-        // them on the NPU packer ONLY when the device is idle; while it's serving, tile on the CPU
-        // (ork_persist_write's int8 CPU path from s.bi) — no bcreate, no contention with inference.
-        if (!ork_orkpack_cpu_only() && !ork_npu_busy(ctx->npu)) ow.w = ork_mm_pack_i8(ctx->npu, K, N, s.bi.data());
-        ork_persist_write(ctx, key.c_str(), K, N, ow, s.f32.data(), type, s.bi.data());
-        if (ow.w) ork_mm_free(ctx->npu, ow.w);   // resident ~0: free before the next slice
-    };
-
-    ork_expert_dequant_quant(src0, todo[0], K, N, type, to_float, buf[0].f32.data(), buf[0].bi.data(), buf[0].bscale.data());
-    for (size_t i = 0; i < todo.size(); i++) {
-        std::thread prod;
-        if (i + 1 < todo.size()) {
-            Stage & ns = buf[(i + 1) & 1];
-            prod = std::thread(ork_expert_dequant_quant, src0, todo[i + 1], K, N, type, to_float,
-                               ns.f32.data(), ns.bi.data(), ns.bscale.data());
+    // FLATTEN over experts: the true bottleneck was serialization (per-expert produce/tile barriers +
+    // the serial per-tile NPU bcreate) leaving cores idle — nothing was resource-bound. So make it
+    // embarrassingly parallel: each core independently packs a WHOLE expert on the CPU (dequant → int4/int8
+    // pack, NO NPU/bcreate) and appends under a short critical section. No per-expert barrier, no serial NPU
+    // pack → saturates all cores AND frees the NPU. Byte-identical to the serial ork_persist_write path:
+    // ork_pack_i4a8_cpu_blob == ork_mm_pack_i4a8_im+dump (validated bit-exact), int8 CPU tile == NPU tile.
+    (void) ork_orkpack_tier(src0->name, K, N, type);   // pre-warm tier static-init (avoid first-touch race)
+    (void) ork_imatrix_lookup(src0->name, K);          // pre-warm imatrix map (thread-safe reads afterward)
+    const size_t nb2 = src0->nb[2], nb01 = src0->nb[1];
+    #pragma omp parallel
+    {
+        // NOTE: do NOT un-pin here. Spreading pack workers across all 8 cores is a net LOSS on RK3588 —
+        // the 4 little A55s are ~half-speed and drag the tail (measured: OMP=8 1821 KB/s vs OMP=4-big 2023).
+        // Keep threads on whatever affinity the caller set (pin the convert to the big cluster, taskset 4-7).
+        std::vector<float> f32((size_t) N * K);
+        std::vector<int8_t> bi; std::vector<float> bs; std::vector<char> blob;
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t idx = 0; idx < todo.size(); idx++) {
+            const int e = todo[idx];
+            const char * x = (const char *) src0->data + (size_t) e * nb2;
+            for (int n = 0; n < N; n++) {                          // dequant this expert → f32 [N][K]
+                float * fr = f32.data() + (size_t) n * K;
+                if (type == GGML_TYPE_F32) memcpy(fr, x + n*nb01, (size_t) K * sizeof(float));
+                else                        to_float(x + n*nb01, fr, K);
+            }
+            const std::string key = ork_expert_key(src0->name, e);
+            const int tier = ork_orkpack_tier(src0->name, K, N, type);
+            orkpack_entry ent; ent.K = K; ent.N = N;
+            if (tier == 4) {
+                const float * im = ork_imatrix_lookup(src0->name, K);
+                size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nullptr, 0);
+                blob.resize(tb); ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, blob.data(), tb);
+                ent.dtype = ORKPACK_DT_I4; ent.bscale_n = 0; ent.blob_size = tb; ent.bscale_off = 0;
+                #pragma omp critical (ork_persist_flat)
+                if (ctx->persist_dumped.insert(key).second) {
+                    ent.blob_off = ctx->persist_off;
+                    fwrite(blob.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+                    ctx->persist_built.emplace_back(key, ent);
+                }
+            } else {
+                bi.resize((size_t) K * N); bs.resize(N);
+                for (int n = 0; n < N; n++) {                      // per-channel int8 quant (NEON) — matches NPU path
+                    const float * fr = f32.data() + (size_t) n * K;
+                    float32x4_t vmax = vdupq_n_f32(1e-9f); int k = 0;
+                    for (; k + 4 <= K; k += 4) vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(fr + k)));
+                    float mx = vmaxvq_f32(vmax); for (; k < K; k++) { float a = fabsf(fr[k]); if (a > mx) mx = a; }
+                    const float scale = mx / 127.0f, inv = 127.0f / mx; bs[n] = scale;
+                    const float32x4_t vinv = vdupq_n_f32(inv); const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
+                    k = 0;
+                    for (; k + 4 <= K; k += 4) {
+                        int32x4_t q = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(fr + k), vinv)), lo), hi);
+                        bi[(size_t)(k)  *N+n]=(int8_t)vgetq_lane_s32(q,0); bi[(size_t)(k+1)*N+n]=(int8_t)vgetq_lane_s32(q,1);
+                        bi[(size_t)(k+2)*N+n]=(int8_t)vgetq_lane_s32(q,2); bi[(size_t)(k+3)*N+n]=(int8_t)vgetq_lane_s32(q,3);
+                    }
+                    for (; k < K; k++) { int q=(int)lrintf(fr[k]*inv); bi[(size_t)k*N+n]=(int8_t)(q>127?127:q<-127?-127:q); }
+                }
+                size_t tb = ork_w_dump_i8_cpu_st(ctx->npu, K, N, bi.data(), nullptr, 0);
+                blob.resize(tb); ork_w_dump_i8_cpu_st(ctx->npu, K, N, bi.data(), blob.data(), tb);
+                ent.dtype = ORKPACK_DT_I8; ent.bscale_n = (uint32_t) N; ent.blob_size = tb;
+                #pragma omp critical (ork_persist_flat)
+                if (ctx->persist_dumped.insert(key).second) {
+                    ent.blob_off = ctx->persist_off;
+                    fwrite(blob.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+                    ent.bscale_off = ctx->persist_off;
+                    fwrite(bs.data(), sizeof(float), N, ctx->persist_out); ctx->persist_off += (size_t) N * sizeof(float);
+                    ctx->persist_built.emplace_back(key, ent);
+                }
+            }
         }
-        consume(buf[i & 1], todo[i]);
-        if (prod.joinable()) prod.join();
     }
 }
 
@@ -3237,9 +3300,17 @@ static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32
     for (int n = 0; n < N; n++) { const float * r = f32 + (size_t) n * K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(r[k] * (s ? s[k] : 1.0f) * inv);
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
-    int dom = ork_weight_domain(ctx, (size_t) K * N, layer); ork_npu_set_pack_domain(ctx->npu, dom);
-    ork_w * w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
-    while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());
+    // fc.wg REPLACES this layer's per-channel gate (never packed in fused mode) — so it co-resides in the
+    // SAME layer's domain via the ordinary weight placement, and is packed as an IMPORT (uniform chunks, like
+    // every other weight) so it doesn't fragment the domain's 32-bit IOVA with a native-alloc outlier. No
+    // dedicated fc.wg domain, no extra volume, and gate/up/down land in one domain (no per-layer switch).
+    const size_t fcwg_bytes = (size_t) 2 * K * N;   // Bb + full-K Bf
+    int dom = ork_weight_domain(ctx, fcwg_bytes, layer); ork_npu_set_pack_domain(ctx->npu, dom);
+    ork_w * w = ork_mm_pack_i8_import(ctx->npu, K, N, bi.data());
+    while (!w && (dom = ork_domain_advance(ctx)) >= 0) { ork_npu_set_pack_domain(ctx->npu, dom);
+        w = ork_mm_pack_i8_import(ctx->npu, K, N, bi.data()); }
+    if (!w) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());   // last-resort native (single-domain / import unavailable)
+    if (w && dom >= 0 && dom < 16) ctx->domain_bytes[dom] += fcwg_bytes;
     if (w && out_scale) *out_scale = scale;
     return w;
 }
@@ -3265,21 +3336,12 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     // that RKNN itself does matmul per-channel requant on the host, not in the SDP regcmd. So prep only needs
     // the gate: SmoothQuant the gate input (x outliers -> gate weight), pack the smoothed gate per-tensor,
     // calibrate static s_x + s_silu, build the fused-SiLU LUT.
-    // PER-DOMAIN FUSION: the fused path uses a PER-TENSOR gate (fc.wg, packed below) and NEVER the per-channel
-    // gate — but the per-channel gate was loaded during the normal load phase into the SAME domain, doubling
-    // this layer's gate storage. Under multi-domain that overflows the domain (PRIME_FD_TO_HANDLE fails on a
-    // later import -> partial down-proj -> multi-core submit reads unmapped IOVA -> errno 110/22 -> soft-reset;
-    // the exact trace). Evict the per-channel gate now (reclaim its IOVA) BEFORE packing fc.wg, so the domain
-    // holds ONE gate, not two. Safe: the fused handler resolves only up/down per-channel, never the gate again.
-    // Skip stream-pool-backed entries (se != nullptr) — the spool manages their IOVA separately.
-    if (ctx->n_domains > 1) {
-        auto git = ctx->wcache.find(Wg->data);
-        if (git != ctx->wcache.end() && !git->second.se && git->second.w) {
-            ork_mm_free(ctx->npu, git->second.w);
-            ctx->wcache_bytes -= git->second.bytes;
-            ctx->wcache.erase(git);
-        }
-    }
+    // NOTE: do NOT evict the per-channel gate here. Freeing it mid-eval (ork_mm_free) churns the 32-bit
+    // domain's IOVA into <chunk-size holes -> a later 16MB chunk import fails to find a CONTIGUOUS range
+    // (PRIME_FD_TO_HANDLE ENOMEM at low domain fill, ~904MB/4GB, 24GB RAM free -> NOT memory, fragmentation)
+    // -> partial down-proj -> errno 110 -> wedge, intermittently. Instead the domains are sized for the FULL
+    // fused footprint (per-channel gate + up + down + per-tensor fc.wg) via the higher ORK_FFN_CHAIN inflation
+    // (see the n_domains auto-calc) so both gates coexist with NO eviction/churn -> deterministic fusion.
     std::vector<float> wgf;
     ork_deq_weight_f32(Wg, K, Nff, wgf);
     std::vector<float> cmax(K, 1e-9f), wmax(K, 1e-9f);
@@ -3374,6 +3436,11 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     if (K % 512 || K > 4096 || Nff % 512 || Nff % 32 || Kd % 16 || M < 1) {
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] shape-guard REJECT %s K=%d Nff=%d Kd=%d M=%d\n", Wg->name, K, Nff, Kd, M);
         return false; }
+    // ork_ffn_prep calibrates STATIC per-tensor scales (s_x, s_silu, SmoothQuant s[]) on the batch it FIRST
+    // sees and caches them (fc.ready). llama.cpp's warmup runs at M=2 (unrepresentative) -> the cached scales
+    // saturate/clip real activations -> garbage output (measured PPL 15.6k @1.7B / 1.2M @7B). Skip fusion for
+    // tiny M so prep calibrates on a representative prefill-sized batch; per-node handles small-M / decode.
+    if (M < 32) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] skip small M=%d (calibration guard)\n", M); return false; }
 
     const float * xf = (const float *) x->data;
     // one-time per-layer SmoothQuant prep (smoothing + smoothed-weight pack + static-scale calibration + LUT)
@@ -3402,19 +3469,11 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, ggml_get_type_traits(Wd->type)->to_float, true);
     if (itd == ctx->wcache.end()) return false;
     const ork_weight & owd = itd->second; const float * bsd = owd.bscale.data();
-    // PER-DOMAIN FUSION SAFETY (multi-domain): the three matmul weights (fused gate fc.wg, up owu.w, down
-    // owd.w) MUST reside in the SAME IOMMU domain — a fused submit binds buffers in one active domain, so a
-    // cross-domain weight would fault/soft-reset the NPU. Layer-aligned assignment (domain=layer/domain_layers)
-    // normally guarantees co-residence; verify at RUNTIME and fall back to the CPU recompute if it ever differs.
-    if (ctx->n_domains > 1) {
-        int dg = ork_w_domain(fc.wg), du = ork_w_domain(owu.w), dd = ork_w_domain(owd.w);
-        if (dg != du || du != dd) {
-            if (getenv("ORK_VERBOSE"))
-                fprintf(stderr, "[ORK FFN-CHAIN] %s: cross-domain weights (gate=%d up=%d down=%d) — per-node fallback\n",
-                        Wg->name, dg, du, dd);
-            return false;
-        }
-    }
+    // NOTE: gate/up/down do NOT need co-residence. Each is a SEPARATE ork_mm_run_* call that goes through
+    // run()->dom_activate(w->domain)->a SINGLE-domain submit, so they may live in different domains (the
+    // chain is a sequence of single-domain submits, dom_activate switching between; the host silu/glu
+    // intermediates are domain-independent). Forcing co-residence was what jammed fc.wg into a weight-packed
+    // domain and fragmented it. fc.wg now gets its OWN dedicated domain (ork_weight_domain fcwg path).
 
     const int RM = 0x4000, RS = 0x10; const uint32_t OB = 0, IO = 0xffffc000u, C4 = 0x56391300u;
     const int16_t * lut = fc.lut.data();
@@ -3637,14 +3696,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
     // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
     const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
-    // FUSED FFN chain requires ALL of a layer's FFN weights (gate/up/down) co-resident in ONE IOMMU domain:
-    // each ork_mm_run_* submit binds buffers in the active domain, and a submit touching a buffer reserved in
-    // a DIFFERENT domain faults the NPU (soft reset). Enabled when EITHER single-domain (n_domains<=1) OR
-    // LAYER-ALIGNED multi-domain (domain_layers>0), which places every layer's weights — including the lazily
-    // packed fused gate — in ONE domain (domain=layer/domain_layers). Even so, the handler makes a RUNTIME
-    // co-domain check (ork_w_domain of gate/up/down) and falls back to per-node if they ever differ, so a
-    // cross-domain fused submit can never fire (wedge-safe). PER-DOMAIN FUSION for >4GiB models.
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && (ctx->n_domains <= 1 || ctx->domain_layers > 0);
+    // FUSED FFN chain (gate+SiLU, up, GLU, down). The fused per-tensor gate (fc.wg) is packed as an import
+    // co-resident in its own layer's domain (ork_pack_pt_f32), so it works at ANY domain count — single
+    // domain (<=4GiB) or many (>4GiB), gate/up/down naturally sharing their layer's domain. Just needs int8.
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8;
+    if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
+        fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
+                ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
     if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
         bool has_ffn = false, has_glu = false;
         for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
@@ -3662,7 +3720,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         // (int8 intermediates never touch fp32). Consumes all 4 nodes; falls through to per-node on any miss.
         if (ffn_chain && node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor *g,*u,*gl,*dn; int last;
-            if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last)) {
+            int matched = ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last);
+            if (getenv("ORK_VERBOSE") && node->src[0] && strstr(node->src[0]->name, "ffn_gate"))
+                fprintf(stderr, "[FFN-CHAIN match] node %d %s -> matched=%d\n", i, node->src[0]->name, matched);
+            if (matched) {
                 if (!ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn)) return GGML_STATUS_FAILED;
                 i = last;      // skip past gate/up/GLU/down — all handled by the chain
                 continue;
@@ -4043,6 +4104,20 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const char * name = src0->name;
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG supports_op] name='%s' K=%ld N=%ld M=%ld\n", name, (long)K, (long)N, (long)M);
             fflush(stderr);
+            // q4/low-bit GGUF sources are UNSUPPORTED territory for the NPU path (this SoC's int4 MAC is
+            // symmetric W4A4 — no coherent int4-resident mode — and re-quantizing q4->int8 is lossy
+            // double-quant). Route any sub-5-bit source (Q4_*/Q3_K/Q2_K/IQ*) to CPU, and — since supports_op
+            // also gates the convert-time forward — this stops the .orkpack from ever packing a q4 model.
+            // Escape hatch: an explicit int4 RESEARCH mode (ORK_QUANT=4 / ORK_HADAMARD / ORK_HYBRID /
+            // ORK_ORKPACK_TIERMAP) still opts into the experimental int4 path.
+            {
+                static const int i4_research = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
+                    || getenv("ORK_HADAMARD") || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
+                if (!i4_research) {
+                    double sbits = ork_src_type_bits(src0->type);
+                    if (sbits >= 0.0 && sbits < 5.0) return false;   // q4/low-bit source -> CPU-only
+                }
+            }
             // N-cap: keep only the EXTREME vocab-projection (lm_head/output, N~152k, ~0.5 GiB resident,
             // once-per-token) on CPU — it's an IOVA-budget policy, NOT a matmul limit. Byte-exact sweep
             // (int8 K=3584, isolated, 2026-06-30): N=18944/32768/65536/131072/152064 ALL bit-exact, no
@@ -4087,7 +4162,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                                src0->type == GGML_TYPE_IQ4_NL ||
                                src0->type == GGML_TYPE_IQ4_XS) && !hadamard;
             int threshold = is_expert ? 1 : (is_grouped ? min_m : (min_m > 32 ? 32 : min_m));
-            if (target_qbits == 8) threshold = 1; // i8 chaining makes M=1 decode fast on NPU
+            // i8 M=1-on-NPU chaining is a win ONLY for single-domain (≤4GiB) models. For multi-domain (>4GiB)
+            // the M=1 decode submit faults on imported weights in a non-0 IOMMU domain (mcworker_dec_active
+            // errno 22) AND loses to CPU decode anyway — so keep the M threshold there, routing decode to CPU
+            // (the validated winning config; see decode-is-cpu-path). Single-domain keeps the fast M=1 NPU path.
+            // CONVERT/WRITE mode (persist_mode==2) MUST keep M=1 on the NPU: the .orkpack build is a single
+            // 1-token (M=1) forward that packs every weight, so declining M=1 there would pack ZERO weights
+            // and produce no .orkpack for >4GiB models. Only SERVING (read/off) routes multi-domain M=1 to CPU.
+            if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1 || g_ork_ctx->persist_mode == 2)) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
             // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
