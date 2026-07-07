@@ -731,8 +731,12 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
     if (tm == 4 || tm == 8) return tm;
 
     bool want_i4 = false;
-    // (A) source-type-driven default
-    if (from_src) {
+    // (A) source-type-driven default. SUPPRESSED under ORK_MIXED_DISPATCH: there the 4-bit tier COMPUTES
+    // W8A8, so store int8 by default to preserve quality — int4 STORAGE re-quantizes to ork's crude
+    // symmetric int4 (absmax/7), measured +36% PPL on wikitext (12.18 vs 9.23 for int8 storage, CPU 8.96).
+    // int4 storage stays available via the explicit overrides below (the RAM-constrained >4GB case), ideally
+    // with ORK_IMATRIX / NF4 to soften the loss.
+    if (from_src && !ork_mixed_dispatch_on()) {
         double bits = ork_src_type_bits(src_type);
         if (bits >= 0.0 && bits < 5.0) want_i4 = true;     // low-bit source → int4 tier; unknown/high-bit → int8
     }
