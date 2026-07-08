@@ -1847,6 +1847,81 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     return true;
 }
 
+// W4A4 group fusion — the int4 twin of mul_mat_group_i8. Concatenates ng independent same-input weights
+// along N into ONE packed int4 weight (per-channel scale + block-Hadamard rotation, as mul_mat_i4_hadamard),
+// quantizes AND rotates the shared activation ONCE (the extra win over i8: q/k/v redundantly re-rotate the
+// same input in the per-node path), runs ONE W4A4 submit, scatters per-channel-dequant into each dst.
+static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
+    if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_group_i4 ng=%d\n", ng); fflush(stderr);
+    const struct ggml_tensor * src1 = g[0]->src[1];
+    const int K = (int) g[0]->src[0]->ne[0];
+    const int M = (int) src1->ne[1];
+    const int b = K & (-K);                              // largest pow2 block dividing K (FWHT block)
+    int Ntot = 0, off[16];
+    for (int i = 0; i < ng; i++) { off[i] = Ntot; Ntot += (int) g[i]->src[0]->ne[1]; }
+
+    const void * key = g[0]->src[0]->data;
+    auto it = ctx->wcache.find(key);
+    if (it == ctx->wcache.end()) {                       // build + pack the fused int4 weight once (rotated, per-channel)
+        ork_weight ow; ow.gsize = 0; ow.bscale.resize(Ntot);
+        ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
+        for (int i = 0; i < ng; i++) {
+            const struct ggml_tensor * w = g[i]->src[0]; const int Ni = (int) w->ne[1];
+            const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
+            ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
+            const char * x = (const char *) w->data;
+            if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
+            else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
+            for (int n = 0; n < Ni; n++) {
+                float * col = f32 + (size_t) n*K;
+                for (int o2 = 0; o2 < K; o2 += b) ork_fwht_norm(col + o2, b);   // rotate weight column R·B
+                float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                float s = mx / 7.0f; ow.bscale[off[i]+n] = s;
+                for (int k = 0; k < K; k++) { int q = (int) lrintf(col[k] / s);
+                    bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
+            }
+        }
+        ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
+        if (!ow.w) return false;
+        it = ctx->wcache.emplace(key, std::move(ow)).first;
+    }
+    const ork_weight & ow = it->second;
+
+    const int M_padded = (M == 1) ? 1 : ((M + 31) / 32) * 32;
+    ctx->ai.resize((size_t) M_padded*K); ctx->as.resize(M_padded); ctx->ci.resize((size_t) M_padded*Ntot);
+    ctx->last_src1 = nullptr; ctx->last_type = 0;        // group overwrote ctx->ai — kill reuse cache
+    int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
+    const float * y = (const float *) src1->data;
+    #pragma omp parallel for if (M_padded >= 16)
+    for (int m = 0; m < M_padded; m++) {                 // rotate + int4-quant the shared activation ONCE
+        if (m < M) {
+            float arow[K]; memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+            for (int o2 = 0; o2 < K; o2 += b) ork_fwht_norm(arow + o2, b);
+            float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+            float s = mx / 7.0f; as[m] = s;
+            for (int k = 0; k < K; k++) { int q = (int) lrintf(arow[k] / s);
+                ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
+        } else { memset(ai + (size_t) m*K, 0, K); as[m] = 0.0f; }
+    }
+    const double t1 = ctx->profile ? ork_now_us() : 0;
+    if (ork_mm_run_i4(ctx->npu, ow.w, M_padded, ai, ci)) return false;    // ONE W4A4 submit for all ng
+    const double t2 = ctx->profile ? ork_now_us() : 0;
+
+    const float * bs = ow.bscale.data();
+    for (int i = 0; i < ng; i++) {
+        const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
+        float * dbase = (float *) g[i]->data;
+        #pragma omp parallel for if (M >= 16)
+        for (int m = 0; m < M; m++) {
+            const float rs = as[m]; const int32_t * cr = ci + (size_t) m*Ntot + o; float * dr = dbase + (size_t) m*Ni;
+            for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
+        }
+    }
+    if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
+        if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
+    return true;
+}
+
 // backend interface
 
 static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "ORK"; GGML_UNUSED(backend); }
@@ -3711,6 +3786,22 @@ static bool ggml_backend_ork_glu(ggml_backend_ork_context * ctx, struct ggml_ten
     return true;
 }
 
+// Compute-dtype tier (8=W8A8, 4=W4A4) a MUL_MAT node will run under the active dispatch policy —
+// used to gate same-tier group fusion (only i8-tier matmuls concatenate into mul_mat_group_i8).
+static int ork_node_qbits(const ggml_backend_ork_context * ctx, const struct ggml_tensor * node) {
+    if (ork_mixed_dispatch_on()) {
+        static const int w4a4 = env_enabled("ORK_MIXED_W4A4");
+        double b = ork_src_type_bits(node->src[0]->type);
+        return (w4a4 && b >= 0.0 && b < 5.0) ? 4 : 8;
+    }
+    if (ctx->hybrid) {
+        const char * nm = node->src[0]->name;
+        if (strstr(nm, "ffn_") || ork_is_expert(nm)) return 4;
+        if (strstr(nm, "attn_q") || strstr(nm, "attn_k") || strstr(nm, "attn_v") || strstr(nm, "attn_output")) return 8;
+    }
+    return ctx->qbits;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -3841,20 +3932,26 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     i += chain_nodes.size() - 1;
                 } else {
                     struct ggml_tensor * grp[16]; int ng = 1; grp[0] = node;
-                    // mixed dispatch: skip the i8 group-fusion so each tensor is dispatched by its own
-                    // source precision below (grouping would force the 4-bit members onto W8A8, losing the
-                    // W4A4 bandwidth win). Per-tier grouping is a later optimization.
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && !ork_mixed_dispatch_on()) {
+                    // Group-fuse consecutive independent same-input MUL_MATs (q/k/v, gate/up) into ONE
+                    // packed-weight submit — fewer round-trips. Members must share ONE compute tier: an
+                    // all-W8A8 group -> mul_mat_group_i8, an all-W4A4 group -> mul_mat_group_i4 (the W4A4 twin,
+                    // which also shares the FWHT rotation once). Default mixed path (q4->W8A8) => all-i8 groups;
+                    // ORK_MIXED_W4A4 => i4 groups for the 4-bit tier. Mixed-tier runs stay per-node.
+                    const int grp_tier = ork_node_qbits(ctx, node);   // group members must all share this tier (8=W8A8, 4=W4A4)
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1) {
                         while (i + ng < cgraph->n_nodes && ng < 16) {
                             struct ggml_tensor * nj = cgraph->nodes[i + ng];
                             if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
-                                nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1)
+                                nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1 &&
+                                ork_node_qbits(ctx, nj) == grp_tier)
                                 grp[ng++] = nj;
                             else break;
                         }
                     }
                     if (ng >= 2) {
-                        if (!ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng)) return GGML_STATUS_FAILED;
+                        bool grp_ok = (grp_tier == 4) ? ggml_backend_ork_mul_mat_group_i4(ctx, grp, ng)
+                                                      : ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng);
+                        if (!grp_ok) return GGML_STATUS_FAILED;
                         i += ng - 1;
                     } else {
                         const char * name = node->src[0]->name;
