@@ -1731,6 +1731,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
             }
             const ork_weight & ow = it->second;
+            double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
             if (!reuse) {
@@ -1781,8 +1782,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->t_quant += _t1 - _t0; ctx->t_run += _t2 - _t1; ctx->t_deq += _t3 - _t2; ctx->n_mm += 1;
                 if (M > 1) { ctx->t_run_pf += _t2 - _t1; ctx->n_pf++; ctx->m_pf += M; }
                 else       { ctx->t_run_dec += _t2 - _t1; ctx->n_dec++; }
-                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ork i4prof] W4A4-hadamard %s M=%d K=%d N=%d | quant %.1fms run %.1fms deq %.1fms\n",
-                    src0->name, M, K, N, (_t1-_t0)/1e3, (_t2-_t1)/1e3, (_t3-_t2)/1e3);
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ork i4prof] W4A4-hadamard %s M=%d K=%d N=%d | wload %.1fms actq %.1fms run %.1fms deq %.1fms\n",
+                    src0->name, M, K, N, (_tw-_t0)/1e3, (_t1-_tw)/1e3, (_t2-_t1)/1e3, (_t3-_t2)/1e3);
             }
         }
     }
