@@ -146,12 +146,19 @@ static bool env_enabled(const char * name) {
 //   dtype == ORKPACK_DT_I4 (4): blob = ork_w_dump_i4a8 bytes (self-describing 'O4N1': K,N,quant_kind +
 //                               bscale[N] + nibble store). bscale lives INSIDE the blob → bscale_n==0,
 //                               bscale_off unused. Loaded via ork_mm_load_i4a8, runs via ork_mm_run_i8.
+//   dtype == ORKPACK_DT_I4_NATIVE (5): blob = ork_w_dump bytes of a DT_I4 (native-W4A4) weight — the
+//                               FWHT-rotated, per-channel-int4-quantized, int4-TILED bytes — followed by
+//                               bscale_n bscale floats. Loaded via ork_mm_load_i4, runs W4A4 via
+//                               ork_mm_run_i4 (the mul_mat_i4_hadamard / group_i4 compute path). This is
+//                               the cold-pack fix: the expensive dequant->rotate->int4-quant->tile is done
+//                               ONCE at convert and reloaded as a plain DMA copy.
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
 #define ORKPACK_VERSION 3u   // v3 adds ork_fmt (ork-driver pack-compat token = its MAJOR ver) to the footer
-#define ORKPACK_DT_I8   1u
-#define ORKPACK_DT_I4   4u
+#define ORKPACK_DT_I8         1u
+#define ORKPACK_DT_I4         4u
+#define ORKPACK_DT_I4_NATIVE  5u
 struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
 // ork_fmt = ork_pack_format_version() at write time. A tile-layout / quant change bumps ork-driver's
 // MAJOR version, so a stored ork_fmt != this build's => the tiled bytes are incompatible; the file is
@@ -817,6 +824,43 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
     ctx->persist_built.emplace_back(std::string(name), e);
+}
+
+// Native-W4A4 persist (ORKPACK_DT_I4_NATIVE): dump the already-ROTATED, per-channel-int4-quantized, int4-
+// TILED DT_I4 weight (ork_w_dump, dtype-agnostic) + its per-channel bscale, so the mul_mat_i4_hadamard /
+// group_i4 cold pack (dequant->FWHT-rotate->int4->tile) is done ONCE at convert and reloaded as a plain DMA
+// copy (ork_mm_load_i4). The twin of the int8-tier dump above, for the W4A4 COMPUTE path.
+static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
+    if (ctx->persist_mode != 2 || !ctx->persist_out || !ow.w) return;
+    if (!ctx->persist_dumped.insert(name).second) return;   // already dumped (convert-decode re-pack)
+    size_t tb = ork_w_dump(ow.w, nullptr, 0);
+    if (!tb) return;
+    std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
+    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    e.blob_off = ctx->persist_off; e.blob_size = tb;
+    fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+    e.bscale_off = ctx->persist_off;
+    fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
+    ctx->persist_off += ow.bscale.size() * sizeof(float);
+    ctx->persist_built.emplace_back(std::string(name), e);
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native %s K=%d N=%d (%zu B + %u scales)\n", name, K, N, tb, e.bscale_n);
+}
+// Read a native-W4A4 weight by name (read mode): fills `ow` and returns true on a matching hit (skip the
+// cold rotate+pack), false to pack normally. Per-(K,N,dtype) re-checked so a stale .orkpack can't feed
+// wrong weights. Single/current pack-domain (native W4A4 is the <4GB compute path; multi-domain is later).
+static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, ork_weight & ow) {
+    if (ctx->persist_mode != 1 || !ctx->persist_map) return false;
+    auto pit = ctx->persist_idx.find(name);
+    if (pit == ctx->persist_idx.end() || pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N ||
+        pit->second.dtype != ORKPACK_DT_I4_NATIVE) return false;
+    const orkpack_entry & e = pit->second;
+    ow.w = ork_mm_load_i4(ctx->npu, K, N, (const char *) ctx->persist_map + e.blob_off, e.blob_size);
+    if (!ow.w) return false;
+    ow.gsize = 0; ow.bscale.resize(e.bscale_n);
+    if (e.bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + e.bscale_off, (size_t) e.bscale_n * sizeof(float));
+    ctx->persist_hits++;
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native LOAD %s K=%d N=%d\n", name, K, N);
+    return true;
 }
 
 // Persist ALL n_expert slices of a routed MoE `_exps` tensor (GGML_OP_MUL_MAT_ID src0) in convert/write
@@ -1660,27 +1704,30 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             double _t0 = ctx->profile ? ork_now_us() : 0.0;
             auto it = ctx->wcache.find(x);
             if (it == ctx->wcache.end()) {
-                if (type == GGML_TYPE_F32) {
-                    for (int64_t n = 0; n < N; n++) memcpy(f32 + n*K, x + n*nb01, (size_t) K*sizeof(float));
-                } else {
-                    for (int64_t n = 0; n < N; n++) to_float((const char *) x + n*nb01, f32 + n*K, K);
-                }
-                ork_weight ow; ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
-                for (int n = 0; n < N; n++) {
-                    float * col = f32 + (size_t) n*K;
-                    for (int off = 0; off < K; off += b) {
-                        ork_fwht_norm(col + off, b);                        // rotate weight column R·B
+                ork_weight ow;
+                if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
+                    ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
+                    // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
+                    // OpenMP iteration (each n is independent — disjoint f32/bi/bscale). This is the per-weight
+                    // one-time conversion cost; threading it over N cuts the user's wait ~ncore-fold.
+                    #pragma omp parallel for schedule(static)
+                    for (int n = 0; n < N; n++) {
+                        float * col = f32 + (size_t) n*K;
+                        if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
+                        else                       to_float((const char *) x + (size_t) n*nb01, col, K);
+                        for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);   // rotate weight column R·B
+                        float mx = 1e-9f;
+                        for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; ow.bscale[n] = s;
+                        for (int k = 0; k < K; k++) {
+                            int q = (int) lrintf(col[k] / s);
+                            bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
                     }
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                    float s = mx / 7.0f; ow.bscale[n] = s;
-                    for (int k = 0; k < K; k++) {
-                        int q = (int) lrintf(col[k] / s);
-                        bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                    }
+                    ow.w = ork_mm_pack_i4(ctx->npu, K, N, bi);
+                    if (!ow.w) return false;
+                    ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
                 }
-                ow.w = ork_mm_pack_i4(ctx->npu, K, N, bi);
-                if (!ow.w) return false;
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
             }
             const ork_weight & ow = it->second;
@@ -4061,7 +4108,11 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
-    ctx->hadamard = (ctx->qbits == 4) && getenv("ORK_HADAMARD") != nullptr;
+    // Hadamard engages under global int4 (ORK_QUANT=4) OR per-tensor mixed W4A4 (ORK_MIXED_DISPATCH +
+    // ORK_MIXED_W4A4): both route the 4-bit tier to mul_mat_i4_hadamard (per-channel, single submit, the
+    // persist-able native-W4A4 path) instead of mul_mat_i4 (grouped, no persist).
+    ctx->hadamard = getenv("ORK_HADAMARD") != nullptr &&
+                    (ctx->qbits == 4 || (ork_mixed_dispatch_on() && env_enabled("ORK_MIXED_W4A4")));
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
     // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
