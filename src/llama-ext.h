@@ -105,6 +105,10 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// dflash: set the target-context buffer injected into every draft layer's K/V for the next decode.
+// ctx_buf = [n_embd, ctx_len] fused encoder output (g_embd), ctx_pos = [ctx_len] RoPE positions.
+LLAMA_API void llama_set_dflash_context(struct llama_context * ctx, const float * ctx_buf, int32_t ctx_len, const int32_t * ctx_pos);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

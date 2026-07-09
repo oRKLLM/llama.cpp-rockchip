@@ -110,6 +110,15 @@ llama_context::llama_context(
         }
     }
 
+    if (model.arch == LLM_ARCH_DFLASH) {
+        if (model.tok_embd == nullptr || model.output == nullptr) {
+            if (params.ctx_other == nullptr) {
+                throw std::runtime_error("DFlash requires ctx_other to be set (this warning is normal during memory fitting)");
+            }
+            cparams.ctx_other = params.ctx_other;
+        }
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -1154,6 +1163,17 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+void llama_context::set_dflash_context(const float * ctx_buf, int32_t ctx_len, const int32_t * ctx_pos) {
+    // graph structure depends on ctx_len (per-layer context K/V of that length) — a change in length
+    // requires re-reserving the compute buffer, same as set_embeddings_layer_inp.
+    if (ctx_len != cparams.dflash_ctx_len) {
+        sched_need_reserve = true;
+    }
+    cparams.dflash_ctx     = ctx_buf;
+    cparams.dflash_ctx_len = ctx_len;
+    cparams.dflash_ctx_pos = ctx_pos;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3725,6 +3745,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_dflash_context(llama_context * ctx, const float * ctx_buf, int32_t ctx_len, const int32_t * ctx_pos) {
+    ctx->set_dflash_context(ctx_buf, ctx_len, ctx_pos);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
