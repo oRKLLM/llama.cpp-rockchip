@@ -14,6 +14,8 @@
 
 #include "../../src/llama-ext.h" // staging API: layer-inp extraction, embeddings_nextn, target_layer_ids, dflash ctx
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -132,85 +134,96 @@ int main(int argc, char ** argv) {
     if (!grab_features(n_prompt, 0))         { return 1; }
     if (!encode_append(feat.data(), n_prompt, 0)) { return 1; }
 
-    int32_t     n_dec   = n_prompt;
-    llama_token id_next = argmax(llama_get_logits_ith(ctx_tgt, n_prompt - 1)); // target token @ n_dec
+    // Skip-ahead speculative decode. State: ctx_g / target-KV cover positions [0..n_ctx_tok-1]; `anchor` is
+    // the token @ n_ctx_tok-1 (its target hidden is in ctx_g); `t0` is the target's greedy token for the
+    // next position n_ctx_tok (saved from the last target decode). The DFlash draft speculates the next B
+    // tokens; the target verifies all B in ONE forward (M=B, grouped -> NPU); we accept the longest matching
+    // prefix + the target's correction (bonus). This is the loop that ports into oRKLLM's addon run_dflash.
+    int32_t     n_ctx_tok = n_prompt;
+    llama_token anchor    = inp[n_prompt - 1];
+    llama_token t0        = argmax(llama_get_logits_ith(ctx_tgt, n_prompt - 1)); // target token @ n_ctx_tok
 
     const int n_predict = params.n_predict > 0 ? params.n_predict : 128;
-    int64_t n_blocks = 0, tau_sum = 0, n_gen = 0;
+    int64_t n_cycles = 0, acc_sum = 0, n_gen = 0, target_forwards = 0;
 
     llama_batch blk = llama_batch_init(block_size + 1, 0, 1); // anchor + block_size mask tokens
-    llama_batch tb  = llama_batch_init(1, 0, 1);          // single target token
+    llama_batch vb  = llama_batch_init(block_size, 0, 1);     // verify batch (B draft tokens, one forward)
+    std::vector<uint8_t> ckpt;                               // target-state checkpoint for spec rollback
 
     LOG("\n");
     for (auto id : inp) { LOG("%s", common_token_to_piece(ctx_tgt, id).c_str()); }
 
-    while (n_gen < n_predict) {
-        // 1) commit the anchor (id_next = target token @ n_dec) on the TARGET so its hidden enters the
-        //    context. This gives the block BOTH the anchor's target hidden (context) and its token (below).
-        common_batch_clear(tb);
-        common_batch_add(tb, id_next, n_dec, { 0 }, true);
-        if (llama_decode(ctx_tgt, tb) != 0) { LOG_ERR("%s: target decode failed\n", __func__); break; }
-        feat.assign((size_t) n_embd_enc, 0.0f);
-        if (!grab_features(1, 0)) { return 1; }
-        if (!encode_append(feat.data(), 1, n_dec)) { break; } // context now covers [0..n_dec]
-        LOG("%s", common_token_to_piece(ctx_tgt, id_next).c_str());
-        n_gen++;
-        const llama_token anchor = id_next;
-        const bool anchor_eog = llama_vocab_is_eog(vocab, anchor);
-        n_dec++;                                                // context = [0..n_dec-1]; anchor @ n_dec-1
-        id_next = argmax(llama_get_logits_ith(ctx_tgt, 0));     // target token @ n_dec
-        if (anchor_eog || n_gen >= n_predict) { break; }
-
-        // 2) DFlash draft: block = [anchor token @ n_dec-1, masks @ [n_dec .. n_dec+B-1]] predicting the next
-        //    B, conditioned on context [0..n_dec-1] (which now includes the anchor's target hidden @ n_dec-1).
-        //    Clear the draft's (unused, out-of-band-context) KV first so the anchor position doesn't conflict.
+    const auto t_start = std::chrono::steady_clock::now();
+    bool eog = false;
+    while (n_gen < n_predict && !eog) {
+        // 1) DFlash draft: [anchor @ n_ctx_tok-1, masks @ n_ctx_tok..n_ctx_tok+B-1] over context [0..n_ctx_tok-1]
+        //    (incl. the anchor's target hidden). draft[j] speculates position n_ctx_tok+j. Clear the draft's
+        //    (out-of-band-context) KV first so the reused anchor position doesn't conflict.
         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), 0, -1, -1);
         llama_set_dflash_context(ctx_dft.get(), ctx_g.data(), (int32_t) ctx_pos.size(), ctx_pos.data());
         common_batch_clear(blk);
-        common_batch_add(blk, anchor, n_dec - 1, { 0 }, true);
-        for (int j = 0; j < block_size; ++j) { common_batch_add(blk, mask_tok, n_dec + j, { 0 }, true); }
+        common_batch_add(blk, anchor, n_ctx_tok - 1, { 0 }, true);
+        for (int j = 0; j < block_size; ++j) { common_batch_add(blk, mask_tok, n_ctx_tok + j, { 0 }, true); }
         if (llama_decode(ctx_dft.get(), blk) != 0) { LOG_ERR("%s: draft decode failed\n", __func__); break; }
+        std::vector<llama_token> d(block_size);
+        for (int j = 0; j < block_size; ++j) { d[j] = argmax(llama_get_logits_ith(ctx_dft.get(), j + 1)); }
 
-        std::vector<llama_token> draft(block_size);
-        for (int j = 0; j < block_size; ++j) { draft[j] = argmax(llama_get_logits_ith(ctx_dft.get(), j + 1)); }
+        // 2) checkpoint the target, then VERIFY: one forward over the B drafts (M=B, grouped -> NPU).
+        //    logits[j] predict position n_ctx_tok+j+1. (M-RoPE KV can't partial-seq_rm, so we roll back via a
+        //    saved state checkpoint — the pattern speculative-simple uses when seq_rm isn't FULL.)
+        const size_t ck_sz = llama_state_seq_get_size(ctx_tgt, 0);
+        ckpt.resize(ck_sz);
+        llama_state_seq_get_data(ctx_tgt, ckpt.data(), ck_sz, 0);
 
-        // 3) advance the target greedily by up to B tokens [n_dec..], accumulating features, to compare
-        feat.assign((size_t) block_size * n_embd_enc, 0.0f);
-        std::vector<llama_token> tgt(block_size);
-        int stop = block_size;
-        for (int j = 0; j < block_size; ++j) {
-            tgt[j] = id_next;
-            LOG("%s", common_token_to_piece(ctx_tgt, id_next).c_str());
-            n_gen++;
-            common_batch_clear(tb);
-            common_batch_add(tb, id_next, n_dec + j, { 0 }, true);
-            if (llama_decode(ctx_tgt, tb) != 0) { LOG_ERR("%s: target decode failed\n", __func__); stop = j + 1; break; }
-            if (!grab_features(1, j)) { return 1; }
-            id_next = argmax(llama_get_logits_ith(ctx_tgt, 0));
-            if (llama_vocab_is_eog(vocab, tgt[j]) || n_gen >= n_predict) { stop = j + 1; break; }
+        common_batch_clear(vb);
+        for (int j = 0; j < block_size; ++j) { common_batch_add(vb, d[j], n_ctx_tok + j, { 0 }, true); }
+        if (llama_decode(ctx_tgt, vb) != 0) { LOG_ERR("%s: verify decode failed\n", __func__); break; }
+        target_forwards++;
+
+        // 3) accept longest prefix: d[j] iff == target greedy t[j] (t[0]=t0; t[j>=1]=argmax(verify logits[j-1])).
+        int acc = 0;
+        while (acc < block_size) {
+            const llama_token tj = (acc == 0) ? t0 : argmax(llama_get_logits_ith(ctx_tgt, acc - 1));
+            if (d[acc] != tj) { break; }
+            acc++;
         }
+        const llama_token bonus = (acc == 0) ? t0 : argmax(llama_get_logits_ith(ctx_tgt, acc - 1));
 
-        // 4) acceptance: draft[j] predicts token @ n_dec+j; compare to tgt[j] (longest prefix)
-        int acc = 0; while (acc < stop && draft[acc] == tgt[acc]) { acc++; }
-        tau_sum += acc; n_blocks++;
+        // 4) roll back the speculative verify (restore checkpoint) and commit [accepted..., bonus] cleanly
+        //    (M=acc+1) to set the KV + extract their target hiddens for the context.
+        llama_state_seq_set_data(ctx_tgt, ckpt.data(), ck_sz, 0);
+        common_batch_clear(blk); // reuse (cap block_size+1 >= acc+1)
+        for (int j = 0; j < acc; ++j) { common_batch_add(blk, d[j], n_ctx_tok + j, { 0 }, true); }
+        common_batch_add(blk, bonus, n_ctx_tok + acc, { 0 }, true);
+        if (llama_decode(ctx_tgt, blk) != 0) { LOG_ERR("%s: commit decode failed\n", __func__); break; }
+        target_forwards++;
+        feat.assign((size_t) (acc + 1) * n_embd_enc, 0.0f);
+        if (!grab_features(acc + 1, 0)) { return 1; }       // hiddens for [n_ctx_tok..n_ctx_tok+acc]
+        t0 = argmax(llama_get_logits_ith(ctx_tgt, acc));    // bonus @ index acc predicts n_ctx_tok+acc+1
 
-        // 5) grow the context with the `stop` decoded target tokens [n_dec .. n_dec+stop-1]
-        if (!encode_append(feat.data(), stop, n_dec)) { break; }
-        n_dec += stop;
+        // 5) emit accepted drafts + bonus; grow the context with their target hiddens.
+        for (int j = 0; j < acc; ++j) { LOG("%s", common_token_to_piece(ctx_tgt, d[j]).c_str()); }
+        LOG("%s", common_token_to_piece(ctx_tgt, bonus).c_str());
+        if (!encode_append(feat.data(), acc + 1, n_ctx_tok)) { break; }
 
-        if (llama_vocab_is_eog(vocab, tgt[stop - 1])) { break; }
+        n_gen += acc + 1; acc_sum += acc; n_cycles++;
+        for (int j = 0; j < acc; ++j) { if (llama_vocab_is_eog(vocab, d[j])) { eog = true; } }
+        if (llama_vocab_is_eog(vocab, bonus)) { eog = true; }
+        anchor = bonus; n_ctx_tok += acc + 1;
     }
 
+    const double dt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     LOG("\n\n");
-    const double mean_acc = n_blocks ? (double) tau_sum / n_blocks : 0.0;
-    LOG_INF("%s: blocks=%lld  mean drafts accepted=%.3f / %d (%.1f%%)  |  acceptance length (tokens/cycle, "
-            "incl. bonus) tau=%.3f  n_gen=%lld\n", __func__,
-            (long long) n_blocks, mean_acc, block_size,
-            n_blocks ? 100.0 * tau_sum / (n_blocks * block_size) : 0.0, mean_acc + 1.0, (long long) n_gen);
+    const double mean_acc = n_cycles ? (double) acc_sum / n_cycles : 0.0;
+    LOG_INF("%s: cycles=%lld  mean drafts accepted=%.3f / %d  |  acceptance length tau=%.3f tokens/cycle  |  "
+            "decode %lld tok in %.2fs = %.2f tok/s  (target forwards=%lld -> %.2f tokens/forward)\n", __func__,
+            (long long) n_cycles, mean_acc, block_size, mean_acc + 1.0,
+            (long long) n_gen, dt_s, dt_s > 0 ? n_gen / dt_s : 0.0,
+            (long long) target_forwards, target_forwards ? (double) n_gen / target_forwards : 0.0);
 
     llama_batch_free(pb);
     llama_batch_free(blk);
-    llama_batch_free(tb);
+    llama_batch_free(vb);
     llama_backend_free();
     return 0;
 }
