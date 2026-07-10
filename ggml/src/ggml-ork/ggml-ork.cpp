@@ -301,6 +301,11 @@ struct ggml_backend_ork_context {
         // fp16-path layer count is decoupled from the IOVA cap => gmax becomes a pure coherence dial. The
         // fp16 MAC then runs int8-precision weights x unquantized fp16 activations = emulated W8A16.
         bool f16_jit = false;                          // this layer prepped for the JIT-inflate all-fp16 path
+        // ORK_FFN_F16_CPUSILU: gate = PLAIN fp16 matmul (raw Wg) + EXACT CPU silu, instead of the fused per-
+        // tensor silu LUT (ork_mm_run_f16_silu). The fused-per-tensor LUT can't represent silu over a wide gate
+        // range (blk.2 gmax~132) -> deterministic garbage (PPL 9072/10554). Plain matmul + fp32 CPU silu is
+        // exact. Costs: no on-NPU silu fusion + no LUT-load submit (also removes a mode-switch surface).
+        bool f16_cpusilu = false;
         struct jit_w { std::vector<int8_t> i8; std::vector<float> bs; int N; };  // host int8 [K*N] + bscale[N]
         std::vector<jit_w> jg, ju;                     // gate(-S*Wg) / up chunks (K=fc K, N=cw)
         jit_w jd;                                      // down (K=Nff, N=Kd)
@@ -3645,6 +3650,8 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         fc.f16_out = os;
         // ORK_FFN_F16_JIT: keep weights host-side as int8+bscale (no resident fp16), inflate at run time.
         const bool jit = use_f16 && getenv("ORK_FFN_F16_JIT");
+        const bool cpusilu = use_f16 && getenv("ORK_FFN_F16_CPUSILU");   // gate = raw-Wg fp16 matmul + CPU silu
+        fc.f16_cpusilu = cpusilu;
         // N-chunk the fp16 gate: a single [K,Nff] fp16 buffer (Nff*K*2 = 24MB for Nff=6144,K=2048) fails
         // MEM_CREATE (failed to allocate IOVA:-12) when the domain's IOVA is fragmented by the resident
         // orkpack — only <=~12MB contiguous IOVA ranges survive (12.6MB int8 tiles allocate; 16MB+ fail).
@@ -3657,8 +3664,9 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             int cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
             if (cw % 16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] Nff=%d chunk unaligned at %d (cw=%d)\n", Nff, n0, cw); return false; }
             for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++)
-                wgh[(size_t) k*cw + n] = (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);
-            if (jit) {   // host int8 store of -S*Wg (no resident fp16); inflated into a shared scratch at run
+                wgh[(size_t) k*cw + n] = cpusilu ? (ork_f16) wgf[(size_t) (n0+n)*K + k]           // raw Wg (CPU silu)
+                                                 : (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);  // -S*Wg (fused LUT)
+            if (jit) {   // host int8 store (no resident fp16); inflated into a shared scratch at run
                 fc.jg.emplace_back(); auto & j = fc.jg.back(); j.N = cw;
                 ork_quant_f16_i8_perchan(wgh.data(), K, cw, j.i8, j.bs); continue; }
             int dom = ork_weight_domain(ctx, (size_t) K * cw * 2, ork_layer_of(Wg->name)); ork_npu_set_pack_domain(ctx->npu, dom);
@@ -3759,9 +3767,11 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         bool ok2 = true;
         for (size_t ci = 0; ci < fc.wg_f16.size() && ok2; ci++) {   // gate: fp16 matmul + fused SiLU
             int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
-            if (ork_mm_run_f16_silu(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
+            if (fc.f16_cpusilu ? ork_mm_run(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data())
+                               : ork_mm_run_f16_silu(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
             for (int m = 0; m < M; m++) { float * so = siluf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
-                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
+                if (fc.f16_cpusilu) for (int n = 0; n < cw; n++) { float g = cr[n]; so[n] = g / (1.0f + expf(-g)); }   // exact CPU silu on the raw fp16 gate
+                else                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
         }
         for (size_t ci = 0; ci < fc.wu_f16.size() && ok2; ci++) {   // up: fp16 matmul
             int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
@@ -3791,17 +3801,24 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         std::vector<ork_f16> xh((size_t) M * K); for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
         std::vector<float> siluf((size_t) M * Nff), upf((size_t) M * Nff), ctmp((size_t) M * cn);
         bool ok2 = true;
-        for (size_t ci = 0; ci < fc.jg.size() && ok2; ci++) {       // gate: inflate -> fp16 matmul + fused SiLU
+        // CPU-silu gate uses the PLAIN fp16 matmul (ork_mm_run), which would take the multi-core mcworker path
+        // and EINVAL when hit COLD (before fp16 mode is warmed). Force single-core for the gate (it's a tiny
+        // single-tile weight anyway); the single-core run warms fp16 mode so up/down can go multi-core after.
+        if (fc.f16_cpusilu) ork_npu_set_core_budget(ctx->npu, 1);
+        for (size_t ci = 0; ci < fc.jg.size() && ok2; ci++) {       // gate: inflate -> fp16 matmul + SiLU
             int n0 = (int) ci * cn, cw = fc.jg[ci].N;
             ork_w * sc = ork_get_f16_scratch(ctx, K, cw);
             double ta = tv ? (double) ggml_time_us() : 0;
             if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.jg[ci].i8.data(), fc.jg[ci].bs.data(), K, cw)) { ok2 = false; break; }
             double tb = tv ? (double) ggml_time_us() : 0; if (tv) t_infl += tb - ta;
-            if (ork_mm_run_f16_silu(ctx->npu, sc, M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
+            if (fc.f16_cpusilu ? ork_mm_run(ctx->npu, sc, M, xh.data(), ctmp.data())
+                               : ork_mm_run_f16_silu(ctx->npu, sc, M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
             if (tv) t_run += (double) ggml_time_us() - tb;
             for (int m = 0; m < M; m++) { float * so = siluf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
-                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
+                if (fc.f16_cpusilu) for (int n = 0; n < cw; n++) { float g = cr[n]; so[n] = g / (1.0f + expf(-g)); }   // exact CPU silu
+                else                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
         }
+        if (fc.f16_cpusilu) ork_npu_set_core_budget(ctx->npu, ork_npu_cores(ctx->npu));   // restore MC for up/down
         for (size_t ci = 0; ci < fc.ju.size() && ok2; ci++) {       // up: inflate -> fp16 matmul
             int n0 = (int) ci * cn, cw = fc.ju[ci].N;
             ork_w * sc = ork_get_f16_scratch(ctx, K, cw);           // same (K,cw) scratch the gate just used
