@@ -281,6 +281,12 @@ struct ggml_backend_ork_context {
         // <=wg_f16_cn-column chunks, each a single-tile ork_w (ork_mm_run_f16_silu requires Sn==1 per weight).
         std::vector<ork_w *> wg_f16;                   // gate weight packed fp16 as -S*Wg, one ork_w per N-chunk (empty => not gate-f16 path)
         int wg_f16_cn = 0;                             // columns per chunk (last chunk may be shorter)
+        // ORK_FFN_F16: ALL-fp16 FFN inner — up/down ALSO fp16 so NO int8 activation quant (fp32->fp16 cast
+        // only) and NO int32->fp32 per-channel dequant. up is N-chunked like the gate (24MB single tile fails
+        // MEM_CREATE under IOVA fragmentation); down packs as one weight (N=Kd=2048 => tiles <=~8MB, fit).
+        std::vector<ork_w *> wu_f16;                   // up weight, raw fp16, N-chunked (plain ork_mm_run per chunk)
+        ork_w * wd_f16 = nullptr;                      // down weight, raw fp16, single ork_mm_pack (K=Nff K-sliced)
+        bool f16_all = false;                          // this layer prepped for the all-fp16 path
         std::vector<int16_t> lut_f16;                  // universal fp16 silu LUT (calibrated once per layer's gate range)
         double f16_out = 0;                            // dequant: silu(gate) = C_out * f16_out
         // ORK_FFN_SILU_CPU_GMAX: per-layer precision policy. High-|gate| layers lose the most to int8 fused
@@ -3585,7 +3591,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     if (const char * t = getenv("ORK_FFN_SILU_CPU_GMAX")) fc.silu_cpu = (gmax_gate > atof(t));
     // ORK_FFN_GATE_F16: precise fp16 gate — build the fp16 SiLU LUT for this layer's gate range and pack the
     // gate weight as -S*Wg (fp16). silu output = C*f16_out at fp16 precision (no int8 activation quant).
-    if (getenv("ORK_FFN_GATE_F16")) {
+    if (getenv("ORK_FFN_GATE_F16") || getenv("ORK_FFN_F16")) {
         fc.lut_f16.resize(1030); double S = 0, R = 0, os = 0;
         if (ork_mm_build_f16_silu_lut(ctx->npu, gmax_gate, fc.lut_f16.data(), &S, &R, &os)) return false;
         fc.f16_out = os;
@@ -3609,7 +3615,29 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             fc.wg_f16.push_back(ch);
         }
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e chunks=%zu cn=%d\n", Wg->name, gmax_gate, S, os, fc.wg_f16.size(), cn);
-        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e\n", Wg->name, gmax_gate, S, os);
+        // ORK_FFN_F16: ALL-fp16 path — also pack up (N-chunked, same cn) + down (single) as RAW fp16 so the
+        // whole FFN inner runs fp16 with NO int8 activation quant and NO int32->fp32 dequant.
+        if (getenv("ORK_FFN_F16")) {
+            std::vector<float> wuf, wdf; ork_deq_weight_f32(Wu, K, Nff, wuf); ork_deq_weight_f32(Wd, Nff, Kd, wdf);
+            std::vector<ork_f16> h;
+            for (int n0 = 0; n0 < Nff; n0 += cn) {              // up: raw fp16 [K][cw] chunks (plain ork_mm_run)
+                int cw = (Nff - n0 < cn) ? (Nff - n0) : cn; h.resize((size_t) K * cw);
+                for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++) h[(size_t) k*cw + n] = (ork_f16) wuf[(size_t)(n0+n)*K + k];
+                int dom = ork_weight_domain(ctx, (size_t) K * cw * 2, ork_layer_of(Wu->name)); ork_npu_set_pack_domain(ctx->npu, dom);
+                ork_w * ch = ork_mm_pack(ctx->npu, K, cw, h.data());
+                while (!ch && (dom = ork_domain_advance(ctx)) >= 0) ch = ork_mm_pack(ctx->npu, K, cw, h.data());
+                if (!ch) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] up chunk pack FAIL n0=%d\n", n0); return false; }
+                fc.wu_f16.push_back(ch);
+            }
+            h.resize((size_t) Nff * Kd);                        // down: raw fp16 [K=Nff][N=Kd] (deq [Kd][Nff] transposed), K-sliced by pack
+            for (int k = 0; k < Nff; k++) for (int n = 0; n < Kd; n++) h[(size_t) k*Kd + n] = (ork_f16) wdf[(size_t) n*Nff + k];
+            { int dom = ork_weight_domain(ctx, (size_t) Nff * Kd * 2, ork_layer_of(Wd->name)); ork_npu_set_pack_domain(ctx->npu, dom);
+              fc.wd_f16 = ork_mm_pack(ctx->npu, Nff, Kd, h.data());
+              while (!fc.wd_f16 && (dom = ork_domain_advance(ctx)) >= 0) fc.wd_f16 = ork_mm_pack(ctx->npu, Nff, Kd, h.data());
+              if (!fc.wd_f16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] down pack FAIL\n"); return false; } }
+            fc.f16_all = true;
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] prep %s: all-fp16 up chunks=%zu + down ok\n", Wg->name, fc.wu_f16.size());
+        }
     } else {
         fc.lut.resize(1030);   // int8 fused-SiLU LUT for (in_g = s_x*s_Wg, s_silu)
         if (ork_mm_silu_build_lut(ctx->npu, fc.s_x * fc.sg, fc.s_silu, 0x4000, 0x10, 0x56391300u, fc.lut.data())) {
@@ -3654,12 +3682,45 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     // sees and caches them (fc.ready). llama.cpp's warmup runs at M=2 (unrepresentative) -> the cached scales
     // saturate/clip real activations -> garbage output (measured PPL 15.6k @1.7B / 1.2M @7B). Skip fusion for
     // tiny M so prep calibrates on a representative prefill-sized batch; per-node handles small-M / decode.
-    if (M < 32) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] skip small M=%d (calibration guard)\n", M); return false; }
+    // The M<32 skip guards the INT8 static-scale calibration (unrepresentative on a tiny warmup batch). The
+    // all-fp16 path (ORK_FFN_F16) has NO static int8 calibration, so it is exempt — it engages at any M
+    // (including decode M=1 and perplexity's M=2), which also lets perplexity actually measure its coherence.
+    if (M < 32 && !getenv("ORK_FFN_F16")) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] skip small M=%d (calibration guard)\n", M); return false; }
 
     const float * xf = (const float *) x->data;
     // one-time per-layer SmoothQuant prep (smoothing + smoothed-weight pack + static-scale calibration + LUT)
     auto & fc = ctx->ffncache[Wg->data];
     if (!fc.ready) { if (!ork_ffn_prep(ctx, fc, Wg, Wu, Wd, xf, M, K, Nff, Kd)) return false; }
+
+    // ---- ORK_FFN_F16: ALL-FP16 inner (no int8 quant, no int32 dequant, no int8 software-chain machinery).
+    // x -> fp16 cast (shared by gate+up); gate = fp16 matmul + fused SiLU (silu_f fp32); up = fp16 matmul (up_f
+    // fp32); glu = silu_f*up_f (fp32, cheap); down = fp16 matmul(glu->fp16) -> dst fp32. Each matmul is native
+    // fp16 (M-tile = the f16_mtile ceiling after the M-tile fix). Falls through to per-node on any error. ----
+    if (fc.f16_all) {
+        const int cn = fc.wg_f16_cn;
+        std::vector<ork_f16> xh((size_t) M * K); for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
+        std::vector<float> siluf((size_t) M * Nff), upf((size_t) M * Nff), ctmp((size_t) M * cn);
+        bool ok2 = true;
+        for (size_t ci = 0; ci < fc.wg_f16.size() && ok2; ci++) {   // gate: fp16 matmul + fused SiLU
+            int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
+            if (ork_mm_run_f16_silu(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
+            for (int m = 0; m < M; m++) { float * so = siluf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
+                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
+        }
+        for (size_t ci = 0; ci < fc.wu_f16.size() && ok2; ci++) {   // up: fp16 matmul
+            int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
+            if (ork_mm_run(ctx->npu, fc.wu_f16[ci], M, xh.data(), ctmp.data())) { ok2 = false; break; }
+            for (int m = 0; m < M; m++) { float * uo = upf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
+                for (int n = 0; n < cw; n++) uo[n] = cr[n]; }
+        }
+        if (ok2) {                                                  // glu = silu*up (fp32) -> fp16; down: fp16 matmul -> dst
+            std::vector<ork_f16> gluh((size_t) M * Nff);
+            for (size_t i = 0; i < (size_t) M*Nff; i++) gluh[i] = (ork_f16) (siluf[i] * upf[i]);
+            if (ork_mm_run(ctx->npu, fc.wd_f16, M, gluh.data(), (float *) down_n->data)) ok2 = false;
+        }
+        if (getenv("ORK_VERBOSE")) { static int o=0; if(!o++) fprintf(stderr,"[ORK FFN-F16] all-fp16 inner %s ok=%d M=%d\n", Wg->name, ok2, M); }
+        return ok2;   // false -> dispatch falls through to per-node (weights already packed; harmless)
+    }
 
     // ---- HYBRID: gate=fused-SiLU (per-tensor, silu FREE on-NPU); up/down = standard per-channel host-dequant
     // (near-baseline quality). Only silu_i8 is a per-tensor int8 intermediate; up/glu stay fp32. ----
