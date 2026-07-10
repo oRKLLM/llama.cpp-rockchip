@@ -51,7 +51,8 @@
 //                        share); cost = the park expert recomputes the NPU slots' rows (discarded).
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
-//   ORK_FUSE=1           EXPERIMENTAL. QKV / gate-up fusion (int8). Measured neutral; off.
+//   (QKV/gate-up group fusion is now DEFAULT-ON for prefill (M>=32): +17% prefill, bit-exact, decode
+//    untouched — see graph_compute. ORK_NO_FUSE disables it; ORK_FUSE forces fusion at ALL M incl. decode.)
 //   ORK_QUANT=4          EXPERIMENTAL. int4 W4A4 instead of int8 (incoherent; research only).
 //   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated int4 path (with ORK_QUANT=4).
 //   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
@@ -3927,11 +3928,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             ctx->last_graph_decode = is_decode;
         }
     }
-    // QKV/gate-up fusion: implemented + correct, but measured SLOWER on RK3588 (decode 9.4->6.4
-    // tok/s) — one wide multi-core matmul + strided scatter costs more than the 2 saved submits, i.e.
-    // the NPU per-matmul cost scales with work, it's not a fixed floor fusion can amortize. Off by
-    // default; opt in with ORK_FUSE=1 to experiment (may differ on larger models / tuned scatter).
-    const int fuse = (ctx->qbits == 8) && (getenv("ORK_FUSE") != nullptr);
+    // QKV/gate-up group fusion: fuses independent same-input matmuls (q/k/v, gate/up) into ONE packed
+    // submit — the crossing/submit reducer. VALIDATED bit-exact on qwen3-1.7B-Q8_0 (board .236, 0.6.73,
+    // 2026-07-10): PREFILL pp64 56.8->66.4 t/s (+17%), submits 588->504 (-14%), PPL 4.2005 unchanged;
+    // DECODE tg32 7.00->7.02 (neutral). It only pays off with enough work to amortize the wider
+    // matmul+scatter: at M=1 decode that cost exceeds the saved submits (prior measurement: decode
+    // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
+    // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
+    const bool fuse_force = getenv("ORK_FUSE") != nullptr;
+    const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE");
     // FUSED FFN chain (gate+SiLU, up, GLU, down). The fused per-tensor gate (fc.wg) is packed as an import
     // co-resident in its own layer's domain (ork_pack_pt_f32), so it works at ANY domain count — single
     // domain (<=4GiB) or many (>4GiB), gate/up/down naturally sharing their layer's domain. Just needs int8.
@@ -4022,7 +4027,9 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // which also shares the FWHT rotation once). Default mixed path (q4->W8A8) => all-i8 groups;
                     // ORK_MIXED_W4A4 => i4 groups for the 4-bit tier. Mixed-tier runs stay per-node.
                     const int grp_tier = ork_node_qbits(ctx, node);   // group members must all share this tier (8=W8A8, 4=W4A4)
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1) {
+                    // node->ne[1] = M (output rows). Prefill (M>=32) amortizes the fused wide-matmul;
+                    // decode (M=1) does not, so fuse only for M>=32 unless ORK_FUSE forces all M.
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= 32)) {
                         while (i + ng < cgraph->n_nodes && ng < 16) {
                             struct ggml_tensor * nj = cgraph->nodes[i + ng];
                             if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
