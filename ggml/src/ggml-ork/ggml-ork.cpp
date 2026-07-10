@@ -4419,12 +4419,23 @@ ggml_backend_t ggml_backend_ork_init(void) {
           //   W4A4 (qbits==4): native int4 tile K*N/2 (nibbles resident, DT_I4).
           // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). FUSION adds NO volume: the fused
           // per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1. MEASURED (int8): 7B = 12.26 GiB resident.
+          // ORK_FFN_F16: the FFN gate/up/down may run the fp16 route, whose buffers (resident fp16 tile =
+          // 2*K*N, no Bf; or the JIT shared scratch + per-mode-switch Cc realloc) are NOT part of the int8
+          // footprint below. Left unaccounted, they overflow near-full domains and a mid-forward alloc
+          // failure WEDGES the mixed fp16 path (blocker b, root-caused via tools/mode_switch_probe). Add the
+          // fp16 delta per FFN weight so auto-sizing leaves IOVA HEADROOM. gmax subset is unknown at init ->
+          // assume all FFN layers (worst case; JIT over-counts but that's safe slack).
+          const bool f16route = getenv("ORK_FFN_F16") != nullptr;
           size_t inflated = 0;
           for (const auto & kv : ctx->persist_idx) {
               const int K = (int) kv.second.K, N = (int) kv.second.N;
               size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
                                               : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
               inflated += tile + (K <= 4096 ? tile : 0);               // + full-K Bf rebuild
+              if (f16route && (kv.first.find("ffn_gate") != std::string::npos ||
+                               kv.first.find("ffn_up")   != std::string::npos ||
+                               kv.first.find("ffn_down") != std::string::npos))
+                  inflated += (size_t) 2 * K * N;                      // fp16 tile headroom (no Bf)
           }
           // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
           // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
