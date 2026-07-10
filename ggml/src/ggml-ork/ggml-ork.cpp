@@ -51,8 +51,8 @@
 //                        share); cost = the park expert recomputes the NPU slots' rows (discarded).
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
-//   (QKV/gate-up group fusion is now DEFAULT-ON for prefill (M>=32): +17% prefill, bit-exact, decode
-//    untouched — see graph_compute. ORK_NO_FUSE disables it; ORK_FUSE forces fusion at ALL M incl. decode.)
+//   (QKV/gate-up group fusion is DEFAULT-ON for M>=8 (ORK_FUSE_MINM): +8% @M8 .. +17% @M64, bit-exact,
+//    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
 //   ORK_QUANT=4          EXPERIMENTAL. int4 W4A4 instead of int8 (incoherent; research only).
 //   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated int4 path (with ORK_QUANT=4).
 //   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
@@ -276,7 +276,11 @@ struct ggml_backend_ork_context {
         int up_mult = 0, up_shift = 0;
         bool ready = false;
         // ORK_FFN_GATE_F16: fp16 gate matmul + fused fp16 SiLU (precise silu, no int8 quant of the activation).
-        ork_w * wg_f16 = nullptr;                      // gate weight packed fp16 as -S*Wg (negate: fp16 index spreads on neg acc)
+        // N-CHUNKED: one contiguous [K,Nff] fp16 buffer (e.g. 24MB) fails MEM_CREATE when the domain's 4GiB
+        // IOVA is fragmented by the resident orkpack (only <=~12MB contiguous IOVA ranges survive). Split into
+        // <=wg_f16_cn-column chunks, each a single-tile ork_w (ork_mm_run_f16_silu requires Sn==1 per weight).
+        std::vector<ork_w *> wg_f16;                   // gate weight packed fp16 as -S*Wg, one ork_w per N-chunk (empty => not gate-f16 path)
+        int wg_f16_cn = 0;                             // columns per chunk (last chunk may be shorter)
         std::vector<int16_t> lut_f16;                  // universal fp16 silu LUT (calibrated once per layer's gate range)
         double f16_out = 0;                            // dequant: silu(gate) = C_out * f16_out
         // ORK_FFN_SILU_CPU_GMAX: per-layer precision policy. High-|gate| layers lose the most to int8 fused
@@ -3543,8 +3547,14 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     fc.s.resize(K);   // SmoothQuant s[k] = sqrt(cmax)/sqrt(wmax); x'=x/s, Wg'=s*Wg (equivalent)
     for (int k = 0; k < K; k++) { double s = sqrt((double) cmax[k]) / sqrt((double) wmax[k]);
         if (!(s > 1e-4)) s = 1e-4; if (s > 1e4) s = 1e4; fc.s[k] = (float) s; }
-    fc.wg = ork_pack_pt_f32(ctx, wgf.data(), K, Nff, fc.s.data(), &fc.sg, ork_layer_of(Wg->name));
-    if (!fc.wg) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep FAIL %s: fc.wg pack (K=%d N=%d dom=%d)\n", Wg->name, K, Nff, ork_weight_domain(ctx,(size_t)K*Nff,ork_layer_of(Wg->name))); return false; }
+    // fc.wg (per-tensor int8 fused gate) feeds ONLY the normal int8-fused-silu handler branch. In GATE_F16
+    // mode the handler uses fc.wg_f16 and a chain failure falls through to per-node, so fc.wg is never read —
+    // skip packing it (saves ~12MB IOVA per layer, the difference between fitting 28 layers in one 4GiB domain
+    // or hitting the IOVA ceiling: fp16 gate + orkpack int8 gate + fc.wg was 3 resident gate copies per layer).
+    if (!getenv("ORK_FFN_GATE_F16")) {
+        fc.wg = ork_pack_pt_f32(ctx, wgf.data(), K, Nff, fc.s.data(), &fc.sg, ork_layer_of(Wg->name));
+        if (!fc.wg) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-CHAIN] prep FAIL %s: fc.wg pack (K=%d N=%d dom=%d)\n", Wg->name, K, Nff, ork_weight_domain(ctx,(size_t)K*Nff,ork_layer_of(Wg->name))); return false; }
+    }
     float xmx = 1e-9f;   // static s_x from smoothed activations x'=x/s
     for (int m = 0; m < M; m++) { const float * xr = xf + (size_t) m * K;
         for (int k = 0; k < K; k++) { float v = fabsf(xr[k] / fc.s[k]); if (v > xmx) xmx = v; } }
@@ -3579,13 +3589,26 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         fc.lut_f16.resize(1030); double S = 0, R = 0, os = 0;
         if (ork_mm_build_f16_silu_lut(ctx->npu, gmax_gate, fc.lut_f16.data(), &S, &R, &os)) return false;
         fc.f16_out = os;
-        std::vector<ork_f16> wgh((size_t) Nff * K);   // pack -S*Wg as fp16 in [K][N] layout (ork_mm_pack convention)
-        for (int n = 0; n < Nff; n++) for (int k = 0; k < K; k++)
-            wgh[(size_t) k*Nff + n] = (ork_f16) (-(double) S * wgf[(size_t) n*K + k]);
-        int dom = ork_weight_domain(ctx, (size_t) K * Nff * 2, ork_layer_of(Wg->name)); ork_npu_set_pack_domain(ctx->npu, dom);
-        fc.wg_f16 = ork_mm_pack(ctx->npu, K, Nff, wgh.data());
-        while (!fc.wg_f16 && (dom = ork_domain_advance(ctx)) >= 0) fc.wg_f16 = ork_mm_pack(ctx->npu, K, Nff, wgh.data());
-        if (!fc.wg_f16) return false;
+        // N-chunk the fp16 gate: a single [K,Nff] fp16 buffer (Nff*K*2 = 24MB for Nff=6144,K=2048) fails
+        // MEM_CREATE (failed to allocate IOVA:-12) when the domain's IOVA is fragmented by the resident
+        // orkpack — only <=~12MB contiguous IOVA ranges survive (12.6MB int8 tiles allocate; 16MB+ fail).
+        // Cap each chunk at wg_f16_cn cols so K*cn*2 <= ~12.6MB. Each chunk is its own single-tile ork_w.
+        int cn = 3072; if (const char * e = getenv("ORK_FFN_GATE_F16_CN")) { cn = atoi(e); }
+        cn -= cn % 16; if (cn < 16) cn = 16;                  // fp16 N must be a multiple of 16
+        fc.wg_f16_cn = cn;
+        std::vector<ork_f16> wgh((size_t) K * cn);            // reused per chunk: -S*Wg cols [n0:n0+cw] in [K][cw] layout
+        for (int n0 = 0; n0 < Nff; n0 += cn) {
+            int cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
+            if (cw % 16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] Nff=%d chunk unaligned at %d (cw=%d)\n", Nff, n0, cw); return false; }
+            for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++)
+                wgh[(size_t) k*cw + n] = (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);
+            int dom = ork_weight_domain(ctx, (size_t) K * cw * 2, ork_layer_of(Wg->name)); ork_npu_set_pack_domain(ctx->npu, dom);
+            ork_w * ch = ork_mm_pack(ctx->npu, K, cw, wgh.data());
+            while (!ch && (dom = ork_domain_advance(ctx)) >= 0) ch = ork_mm_pack(ctx->npu, K, cw, wgh.data());
+            if (!ch) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] chunk pack FAIL K=%d cw=%d n0=%d\n", K, cw, n0); return false; }
+            fc.wg_f16.push_back(ch);
+        }
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e chunks=%zu cn=%d\n", Wg->name, gmax_gate, S, os, fc.wg_f16.size(), cn);
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e\n", Wg->name, gmax_gate, S, os);
     } else {
         fc.lut.resize(1030);   // int8 fused-SiLU LUT for (in_g = s_x*s_Wg, s_silu)
@@ -3698,15 +3721,24 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                 for (int r = 0; r < mc; r++) { const int32_t * ar = acc_i32.data() + (size_t) r*Nff;
                     float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
                     for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } } } }
-    } else if (ok && fc.wg_f16 && ablate < 0) {
-        // ORK_FFN_GATE_F16: precise fp16 gate matmul + fused fp16 SiLU. x -> fp16 (cast), gate weight is -S*Wg
-        // (baked in prep), so acc = -S*gate spreads the fp16 LUT. silu(gate) = C_out * fc.f16_out (no int8 quant).
+    } else if (ok && !fc.wg_f16.empty() && ablate < 0) {
+        // ORK_FFN_GATE_F16: precise fp16 gate matmul + fused fp16 SiLU, N-CHUNKED. x -> fp16 (cast); each chunk's
+        // gate is -S*Wg (baked in prep) so acc = -S*gate spreads the fp16 LUT; silu = C_out * fc.f16_out. Each
+        // chunk runs as its own single-tile ork_mm_run_f16_silu (Sn==1 per weight) into its silu_f columns.
         std::vector<ork_f16> xh((size_t) M * K);
         for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
+        const int cn = fc.wg_f16_cn;
+        std::vector<float> ctmp((size_t) MT * cn);        // per-(M-tile,chunk) fp16-silu output [mc][cw], scattered into silu_f
         for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
-            if (ork_mm_run_f16_silu(ctx->npu, fc.wg_f16, mc, xh.data() + (size_t) m0*K, silu_f.data() + (size_t) m0*Nff,
-                                    0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok = false; break; } }
-        for (size_t i = 0; i < (size_t) M*Nff; i++) silu_f[i] *= (float) fc.f16_out;
+            for (size_t ci = 0; ci < fc.wg_f16.size() && ok; ci++) {
+                int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
+                if (ork_mm_run_f16_silu(ctx->npu, fc.wg_f16[ci], mc, xh.data() + (size_t) m0*K, ctmp.data(),
+                                        0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok = false; break; }
+                for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff + n0;
+                    const float * cr = ctmp.data() + (size_t) r*cw;
+                    for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
+            }
+        }
     } else if (ok && ablate < 0) {
         // normal fused path: silu on NPU -> int8 -> *s_silu
         std::vector<int8_t> silu_i8((size_t) M * Nff);
@@ -3965,9 +3997,16 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             if (getenv("ORK_VERBOSE") && node->src[0] && strstr(node->src[0]->name, "ffn_gate"))
                 fprintf(stderr, "[FFN-CHAIN match] node %d %s -> matched=%d\n", i, node->src[0]->name, matched);
             if (matched) {
-                if (!ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn)) return GGML_STATUS_FAILED;
-                i = last;      // skip past gate/up/GLU/down — all handled by the chain
-                continue;
+                if (ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn)) {
+                    i = last;  // fused OK: skip past gate/up/GLU/down — all handled by the chain
+                    continue;
+                }
+                // Chain failed (alloc/shape/calibration guard). The handler writes dst only at the very end
+                // and keeps intermediates in local buffers, so on failure the gate/up/GLU/down tensors are
+                // untouched — FALL THROUGH to per-node processing (gate here, up/GLU/down as later nodes)
+                // instead of aborting the graph. This never breaks the model AND avoids the leak-on-FAILED
+                // (returning GGML_STATUS_FAILED stranded already-allocated buffers and degraded the IOVA).
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN-CHAIN] fuse failed at node %d -> per-node fallback\n", i);
             }
         }
         switch (node->op) {
@@ -4027,9 +4066,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // which also shares the FWHT rotation once). Default mixed path (q4->W8A8) => all-i8 groups;
                     // ORK_MIXED_W4A4 => i4 groups for the 4-bit tier. Mixed-tier runs stay per-node.
                     const int grp_tier = ork_node_qbits(ctx, node);   // group members must all share this tier (8=W8A8, 4=W4A4)
-                    // node->ne[1] = M (output rows). Prefill (M>=32) amortizes the fused wide-matmul;
-                    // decode (M=1) does not, so fuse only for M>=32 unless ORK_FUSE forces all M.
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= 32)) {
+                    // node->ne[1] = M (output rows). M-sweep (qwen3-1.7B-Q8_0, 2026-07-10): fusion WINS from
+                    // M=8 (+8-9%) up through M=64 (+12-17%) but LOSES at M=1 decode (prior: 9.4->6.4). Break-even
+                    // is in (1,8), so the engage floor is M>=8 (was 32) — this also brings DFlash's M=block
+                    // batched-verify (block ~8-16) into the win region. ORK_FUSE_MINM overrides; ORK_FUSE forces all M.
+                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 8;
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= fuse_minm)) {
                         while (i + ng < cgraph->n_nodes && ng < 16) {
                             struct ggml_tensor * nj = cgraph->nodes[i + ng];
                             if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
