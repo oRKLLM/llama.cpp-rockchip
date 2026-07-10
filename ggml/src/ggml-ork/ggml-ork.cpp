@@ -3850,6 +3850,36 @@ static int ork_node_qbits(const ggml_backend_ork_context * ctx, const struct ggm
     return ctx->qbits;
 }
 
+// BATCHED / DYNAMIC MUL_MAT (attention QKᵀ·V, Gated-Delta-Net chunked matmuls) via ork_bmm_fp16. Unlike the
+// static-weight path, BOTH operands are computed activations (ne[2]/ne[3]>1, src0 dynamic), so this converts
+// each batch's src0/src1 slice to fp16 and calls the batched dynamic GEMM. src0 is the [K,N] "weight" side and
+// src1 the [K,M] activations — the same mapping the static mul_mat_i8 uses (ork_bmm packs src0, streams src1).
+// GQA/broadcast-aware (src0/src1 batch dims may be < dst's). Gated by ORK_ATTN. Result f32 into dst.
+static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const int K = (int) src0->ne[0], N = (int) src0->ne[1], M = (int) src1->ne[1];
+    const int64_t ne2 = dst->ne[2], ne3 = dst->ne[3];
+    const int64_t r2_0 = src0->ne[2] ? ne2 / src0->ne[2] : 1, r3_0 = src0->ne[3] ? ne3 / src0->ne[3] : 1;
+    const int64_t r2_1 = src1->ne[2] ? ne2 / src1->ne[2] : 1, r3_1 = src1->ne[3] ? ne3 / src1->ne[3] : 1;
+    std::vector<ork_f16> A((size_t) M * K), B((size_t) K * N);
+    std::vector<float>   C((size_t) M * N);
+    auto rd = [](const struct ggml_tensor * t, const char * base, size_t j) -> float {
+        return t->type == GGML_TYPE_F16 ? (float) ((const ork_f16 *) base)[j] : ((const float *) base)[j];
+    };
+    for (int64_t i3 = 0; i3 < ne3; i3++)
+    for (int64_t i2 = 0; i2 < ne2; i2++) {
+        const char * s0 = (const char *) src0->data + (i2 / r2_0) * src0->nb[2] + (i3 / r3_0) * src0->nb[3];
+        const char * s1 = (const char *) src1->data + (i2 / r2_1) * src1->nb[2] + (i3 / r3_1) * src1->nb[3];
+        float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rd(src0, s0, j);
+        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rd(src1, s1, j);
+        if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) return false;
+        for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -3937,6 +3967,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         }
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
+                // ORK_ATTN: batched/dynamic matmul (attention QKᵀ·V, GDN chunked) -> ork_bmm_fp16.
+                static const int ork_attn = getenv("ORK_ATTN") != nullptr;
+                if (ork_attn && (node->ne[2] > 1 || node->ne[3] > 1)) {
+                    if (!ggml_backend_ork_bmm_fp16(ctx, node)) return GGML_STATUS_FAILED;
+                    break;
+                }
                 std::vector<struct ggml_tensor *> chain_nodes;
                 ork_chain_type type = get_node_chain_type(ctx, node);
 
@@ -4335,6 +4371,20 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         case GGML_OP_MUL_MAT: {
             const int64_t K = src0->ne[0], N = op->ne[0], M = op->ne[1];
+            // ORK_ATTN: accept BATCHED / dynamic-operand matmul (attention QKᵀ·V, Gated-Delta-Net chunked
+            // matmuls) for the fp16 ork_bmm path — the static-weight gate below declines these (ne[2]/ne[3]>1,
+            // computed src0). Require contiguous f16/f32 operands + K%32, N%16 (fp16 tile). Gated (off by
+            // default) — this is the experimental attention/GDN offload; measure NPU% + coherence before
+            // enabling by default.
+            {
+                static const int ork_attn = getenv("ORK_ATTN") != nullptr;
+                if (ork_attn && (op->ne[2] > 1 || op->ne[3] > 1)) {
+                    return K % 32 == 0 && N % 16 == 0 && M >= 1
+                        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
+                        && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)
+                        && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+                }
+            }
             // Explicitly block output and lm_head (vocabulary projection) layers from offloading to NPU.
             // These layers are extremely wide (e.g. N=151936), causing massive DMA buffer allocation and
             // packing overhead, which can trigger NPU driver IOVA allocation failures and kernel hangs.
