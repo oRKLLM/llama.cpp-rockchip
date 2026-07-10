@@ -3589,9 +3589,17 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     // exact CPU fp32 silu (per-channel gate); the rest keep the fast int8 fused silu. Tune the ratio via the
     // threshold (lower = more layers exact = higher quality, lower speed).
     if (const char * t = getenv("ORK_FFN_SILU_CPU_GMAX")) fc.silu_cpu = (gmax_gate > atof(t));
+    // ORK_FFN_F16_GMAX: PER-LAYER all-fp16 selection. all-fp16 removes the CPU int8 quant/dequant but fp16
+    // weights are 2x int8 RAM — ALL layers fp16 overflows one 4GiB domain -> ORK_DOMAINS=2 -> per-submit
+    // overhead. Selecting only the MOST-SENSITIVE layers (gate gmax > threshold) keeps the fp16 footprint
+    // small enough to fit ONE domain: those layers get precise fp16 (each submit ~3x int8, acceptable) +
+    // coherence, the rest stay full-speed int8. ORK_FFN_F16 with no _GMAX = all layers (backward compat).
+    const bool f16_env = getenv("ORK_FFN_F16") != nullptr;
+    const bool use_f16 = f16_env && (!getenv("ORK_FFN_F16_GMAX") || gmax_gate > atof(getenv("ORK_FFN_F16_GMAX")));
+    if (getenv("ORK_VERBOSE") && f16_env) fprintf(stderr, "[ORK FFN-F16] layer %s gmax=%.2f -> %s\n", Wg->name, gmax_gate, use_f16 ? "FP16" : "int8");
     // ORK_FFN_GATE_F16: precise fp16 gate — build the fp16 SiLU LUT for this layer's gate range and pack the
     // gate weight as -S*Wg (fp16). silu output = C*f16_out at fp16 precision (no int8 activation quant).
-    if (getenv("ORK_FFN_GATE_F16") || getenv("ORK_FFN_F16")) {
+    if (getenv("ORK_FFN_GATE_F16") || use_f16) {
         fc.lut_f16.resize(1030); double S = 0, R = 0, os = 0;
         if (ork_mm_build_f16_silu_lut(ctx->npu, gmax_gate, fc.lut_f16.data(), &S, &R, &os)) return false;
         fc.f16_out = os;
@@ -3617,7 +3625,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] prep %s: gmax=%.2f S=%.2f out=%.3e chunks=%zu cn=%d\n", Wg->name, gmax_gate, S, os, fc.wg_f16.size(), cn);
         // ORK_FFN_F16: ALL-fp16 path — also pack up (N-chunked, same cn) + down (single) as RAW fp16 so the
         // whole FFN inner runs fp16 with NO int8 activation quant and NO int32->fp32 dequant.
-        if (getenv("ORK_FFN_F16")) {
+        if (use_f16) {
             std::vector<float> wuf, wdf; ork_deq_weight_f32(Wu, K, Nff, wuf); ork_deq_weight_f32(Wd, Nff, Kd, wdf);
             std::vector<ork_f16> h;
             for (int n0 = 0; n0 < Nff; n0 += cn) {              // up: raw fp16 [K][cw] chunks (plain ork_mm_run)
