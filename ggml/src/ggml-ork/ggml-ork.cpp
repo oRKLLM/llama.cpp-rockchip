@@ -3783,22 +3783,33 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     // scratches reused across every JIT layer, so gmax layer count is decoupled from the 4GiB domain. ----
     if (fc.f16_jit) {
         const int cn = fc.wg_f16_cn;
+        // ORK_VERBOSE timing split: accumulate CPU inflate-us vs NPU run-us (+ other=cast/scatter) across ALL
+        // handler calls, to find where the fp16 route spends time (is it the JIT inflate, or the fp16 matmuls?).
+        const bool tv = getenv("ORK_VERBOSE") != nullptr;
+        static double t_infl = 0, t_run = 0; static long t_calls = 0;
+        double t_h0 = tv ? (double) ggml_time_us() : 0;
         std::vector<ork_f16> xh((size_t) M * K); for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
         std::vector<float> siluf((size_t) M * Nff), upf((size_t) M * Nff), ctmp((size_t) M * cn);
         bool ok2 = true;
         for (size_t ci = 0; ci < fc.jg.size() && ok2; ci++) {       // gate: inflate -> fp16 matmul + fused SiLU
             int n0 = (int) ci * cn, cw = fc.jg[ci].N;
             ork_w * sc = ork_get_f16_scratch(ctx, K, cw);
+            double ta = tv ? (double) ggml_time_us() : 0;
             if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.jg[ci].i8.data(), fc.jg[ci].bs.data(), K, cw)) { ok2 = false; break; }
+            double tb = tv ? (double) ggml_time_us() : 0; if (tv) t_infl += tb - ta;
             if (ork_mm_run_f16_silu(ctx->npu, sc, M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
+            if (tv) t_run += (double) ggml_time_us() - tb;
             for (int m = 0; m < M; m++) { float * so = siluf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
                 for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
         }
         for (size_t ci = 0; ci < fc.ju.size() && ok2; ci++) {       // up: inflate -> fp16 matmul
             int n0 = (int) ci * cn, cw = fc.ju[ci].N;
             ork_w * sc = ork_get_f16_scratch(ctx, K, cw);           // same (K,cw) scratch the gate just used
+            double ta = tv ? (double) ggml_time_us() : 0;
             if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.ju[ci].i8.data(), fc.ju[ci].bs.data(), K, cw)) { ok2 = false; break; }
+            double tb = tv ? (double) ggml_time_us() : 0; if (tv) t_infl += tb - ta;
             if (ork_mm_run(ctx->npu, sc, M, xh.data(), ctmp.data())) { ok2 = false; break; }
+            if (tv) t_run += (double) ggml_time_us() - tb;
             for (int m = 0; m < M; m++) { float * uo = upf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
                 for (int n = 0; n < cw; n++) uo[n] = cr[n]; }
         }
@@ -3806,10 +3817,18 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
             std::vector<ork_f16> gluh((size_t) M * Nff);
             for (size_t i = 0; i < (size_t) M*Nff; i++) gluh[i] = (ork_f16) (siluf[i] * upf[i]);
             ork_w * sc = ork_get_f16_scratch(ctx, Nff, Kd);
+            double ta = tv ? (double) ggml_time_us() : 0;
             if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.jd.i8.data(), fc.jd.bs.data(), Nff, Kd)) ok2 = false;
-            else if (ork_mm_run(ctx->npu, sc, M, gluh.data(), (float *) down_n->data)) ok2 = false;
+            else { double tb = tv ? (double) ggml_time_us() : 0; if (tv) t_infl += tb - ta;
+                   if (ork_mm_run(ctx->npu, sc, M, gluh.data(), (float *) down_n->data)) ok2 = false;
+                   if (tv) t_run += (double) ggml_time_us() - tb; }
         }
-        if (getenv("ORK_VERBOSE")) { static int o=0; if(!o++) fprintf(stderr,"[ORK FFN-F16] JIT-inflate inner %s ok=%d M=%d scratches=%zu\n", Wg->name, ok2, M, ctx->f16_scratch.size()); }
+        if (tv) { double t_tot = (double) ggml_time_us() - t_h0; t_calls++;
+            if (t_calls == 1 || (t_calls % 56) == 0)   // ~every 2 forwards for a 28-layer model
+                fprintf(stderr, "[ORK FFN-F16 JIT-PROF] %s M=%d scratches=%zu | this-call %.2fms | CUMULATIVE inflate=%.1fms run=%.1fms (inflate=%.0f%%) over %ld calls\n",
+                        Wg->name, M, ctx->f16_scratch.size(), t_tot/1000.0, t_infl/1000.0, t_run/1000.0,
+                        100.0*t_infl/(t_infl+t_run+1e-9), t_calls);
+        }
         return ok2;   // false -> dispatch falls through to per-node
     }
 
