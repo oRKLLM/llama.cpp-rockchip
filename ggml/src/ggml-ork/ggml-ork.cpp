@@ -3765,7 +3765,8 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         std::vector<ork_f16> xh((size_t) M * K); for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
         std::vector<float> siluf((size_t) M * Nff), upf((size_t) M * Nff), ctmp((size_t) M * cn);
         bool ok2 = true;
-        for (size_t ci = 0; ci < fc.wg_f16.size() && ok2; ci++) {   // gate: fp16 matmul + fused SiLU
+        if (fc.f16_cpusilu) ork_npu_set_core_budget(ctx->npu, 1);   // single-core gate: plain fp16 EINVALs cold multi-core (see f16_jit)
+        for (size_t ci = 0; ci < fc.wg_f16.size() && ok2; ci++) {   // gate: fp16 matmul + SiLU
             int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
             if (fc.f16_cpusilu ? ork_mm_run(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data())
                                : ork_mm_run_f16_silu(ctx->npu, fc.wg_f16[ci], M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
@@ -3773,6 +3774,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                 if (fc.f16_cpusilu) for (int n = 0; n < cw; n++) { float g = cr[n]; so[n] = g / (1.0f + expf(-g)); }   // exact CPU silu on the raw fp16 gate
                 else                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
         }
+        if (fc.f16_cpusilu) ork_npu_set_core_budget(ctx->npu, ork_npu_cores(ctx->npu));   // restore MC for up/down
         for (size_t ci = 0; ci < fc.wu_f16.size() && ok2; ci++) {   // up: fp16 matmul
             int n0 = (int) ci * cn, cw = (Nff - n0 < cn) ? (Nff - n0) : cn;
             if (ork_mm_run(ctx->npu, fc.wu_f16[ci], M, xh.data(), ctmp.data())) { ok2 = false; break; }
