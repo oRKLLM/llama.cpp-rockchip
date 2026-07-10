@@ -294,8 +294,19 @@ struct ggml_backend_ork_context {
         // per-channel gate matmul on-NPU + fp32 silu on CPU (baseline quality, ~2.3x the fused-silu gate cost).
         bool silu_cpu = false;
         double gmax = 0;                               // this layer's calibrated max|gate| (the sensitivity signal)
+        // ORK_FFN_F16_JIT: IOVA-headroom variant of the all-fp16 path. Instead of RESIDING fp16 gate/up/down
+        // (2x IOVA -> only ~5 layers fit a 4GiB domain), keep each weight host-side as compact int8 +
+        // per-channel bscale and inflate it into ONE shared fp16 scratch (ctx->f16_scratch, reused across all
+        // JIT layers) right before each matmul. Resident IOVA = a handful of shared scratches, so the
+        // fp16-path layer count is decoupled from the IOVA cap => gmax becomes a pure coherence dial. The
+        // fp16 MAC then runs int8-precision weights x unquantized fp16 activations = emulated W8A16.
+        bool f16_jit = false;                          // this layer prepped for the JIT-inflate all-fp16 path
+        struct jit_w { std::vector<int8_t> i8; std::vector<float> bs; int N; };  // host int8 [K*N] + bscale[N]
+        std::vector<jit_w> jg, ju;                     // gate(-S*Wg) / up chunks (K=fc K, N=cw)
+        jit_w jd;                                      // down (K=Nff, N=Kd)
     };
     std::unordered_map<const void *, ork_ffn_smooth>   ffncache;       // gate ptr -> smoothed layer state
+    std::unordered_map<uint64_t, ork_w *> f16_scratch;                 // (K<<32|N) -> reusable fp16 scratch (ORK_FFN_F16_JIT)
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
     // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
     ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
@@ -2107,6 +2118,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
+    for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
@@ -3529,6 +3541,34 @@ static void ork_deq_weight_f32(const struct ggml_tensor * W, int K, int N, std::
 // ORK_FFN_CHAIN one-time per-layer prep: SmoothQuant smoothing (migrate x's per-channel outliers into the
 // gate/up weights), pack smoothed per-tensor weights, calibrate STATIC per-tensor scales (s_x, s_silu, s_up
 // via int32 matmuls on the calibration batch), build the fused-SiLU LUT. Fills fc. Returns false on failure.
+// ORK_FFN_F16_JIT helpers ------------------------------------------------------------------------
+// Per-output-channel symmetric int8 quant of a row-major [K][N] fp16 weight -> int8[K*N] + bscale[N],
+// matching ork_mm_inflate_i8_to_f16 (wf16[k,n] ~= i8[k*N+n]*bscale[n]). Same convention as pack_i8_f32.
+static void ork_quant_f16_i8_perchan(const ork_f16 * w, int K, int N,
+                                      std::vector<int8_t> & i8, std::vector<float> & bs) {
+    i8.resize((size_t) K * N); bs.resize(N);
+    for (int n = 0; n < N; n++) {
+        float mx = 1e-9f;
+        for (int k = 0; k < K; k++) { float v = fabsf((float) w[(size_t) k*N + n]); if (v > mx) mx = v; }
+        float scale = mx / 127.0f, inv = 127.0f / mx; bs[n] = scale;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf((float) w[(size_t) k*N + n] * inv);
+            i8[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); }
+    }
+}
+// Fetch (allocate once, then reuse) a shared fp16 scratch weight of shape (K,N). Allocated in a weight
+// domain like the resident packs; cached on ctx keyed by (K<<32|N). Returns NULL if every domain is full.
+static ork_w * ork_get_f16_scratch(ggml_backend_ork_context * ctx, int K, int N) {
+    uint64_t key = ((uint64_t) (uint32_t) K << 32) | (uint32_t) N;
+    auto it = ctx->f16_scratch.find(key);
+    if (it != ctx->f16_scratch.end()) return it->second;
+    int dom = ork_weight_domain(ctx, (size_t) K * N * 2, -1); ork_npu_set_pack_domain(ctx->npu, dom);
+    ork_w * s = ork_mm_f16_scratch(ctx->npu, K, N);
+    while (!s && (dom = ork_domain_advance(ctx)) >= 0) s = ork_mm_f16_scratch(ctx->npu, K, N);
+    ctx->f16_scratch[key] = s;   // cache even NULL is fine? no — cache only success so a later domain-free retries
+    if (!s) ctx->f16_scratch.erase(key);
+    return s;
+}
+
 static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_context::ork_ffn_smooth & fc,
         const struct ggml_tensor * Wg, const struct ggml_tensor * Wu, const struct ggml_tensor * Wd,
         const float * xf, int M, int K, int Nff, int Kd) {
@@ -3603,6 +3643,8 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
         fc.lut_f16.resize(1030); double S = 0, R = 0, os = 0;
         if (ork_mm_build_f16_silu_lut(ctx->npu, gmax_gate, fc.lut_f16.data(), &S, &R, &os)) return false;
         fc.f16_out = os;
+        // ORK_FFN_F16_JIT: keep weights host-side as int8+bscale (no resident fp16), inflate at run time.
+        const bool jit = use_f16 && getenv("ORK_FFN_F16_JIT");
         // N-chunk the fp16 gate: a single [K,Nff] fp16 buffer (Nff*K*2 = 24MB for Nff=6144,K=2048) fails
         // MEM_CREATE (failed to allocate IOVA:-12) when the domain's IOVA is fragmented by the resident
         // orkpack — only <=~12MB contiguous IOVA ranges survive (12.6MB int8 tiles allocate; 16MB+ fail).
@@ -3616,6 +3658,9 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             if (cw % 16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] Nff=%d chunk unaligned at %d (cw=%d)\n", Nff, n0, cw); return false; }
             for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++)
                 wgh[(size_t) k*cw + n] = (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);
+            if (jit) {   // host int8 store of -S*Wg (no resident fp16); inflated into a shared scratch at run
+                fc.jg.emplace_back(); auto & j = fc.jg.back(); j.N = cw;
+                ork_quant_f16_i8_perchan(wgh.data(), K, cw, j.i8, j.bs); continue; }
             int dom = ork_weight_domain(ctx, (size_t) K * cw * 2, ork_layer_of(Wg->name)); ork_npu_set_pack_domain(ctx->npu, dom);
             ork_w * ch = ork_mm_pack(ctx->npu, K, cw, wgh.data());
             while (!ch && (dom = ork_domain_advance(ctx)) >= 0) ch = ork_mm_pack(ctx->npu, K, cw, wgh.data());
@@ -3631,6 +3676,8 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             for (int n0 = 0; n0 < Nff; n0 += cn) {              // up: raw fp16 [K][cw] chunks (plain ork_mm_run)
                 int cw = (Nff - n0 < cn) ? (Nff - n0) : cn; h.resize((size_t) K * cw);
                 for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++) h[(size_t) k*cw + n] = (ork_f16) wuf[(size_t)(n0+n)*K + k];
+                if (jit) { fc.ju.emplace_back(); auto & j = fc.ju.back(); j.N = cw;
+                    ork_quant_f16_i8_perchan(h.data(), K, cw, j.i8, j.bs); continue; }
                 int dom = ork_weight_domain(ctx, (size_t) K * cw * 2, ork_layer_of(Wu->name)); ork_npu_set_pack_domain(ctx->npu, dom);
                 ork_w * ch = ork_mm_pack(ctx->npu, K, cw, h.data());
                 while (!ch && (dom = ork_domain_advance(ctx)) >= 0) ch = ork_mm_pack(ctx->npu, K, cw, h.data());
@@ -3639,12 +3686,13 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             }
             h.resize((size_t) Nff * Kd);                        // down: raw fp16 [K=Nff][N=Kd] (deq [Kd][Nff] transposed), K-sliced by pack
             for (int k = 0; k < Nff; k++) for (int n = 0; n < Kd; n++) h[(size_t) k*Kd + n] = (ork_f16) wdf[(size_t) n*Nff + k];
-            { int dom = ork_weight_domain(ctx, (size_t) Nff * Kd * 2, ork_layer_of(Wd->name)); ork_npu_set_pack_domain(ctx->npu, dom);
+            if (jit) { fc.jd.N = Kd; ork_quant_f16_i8_perchan(h.data(), Nff, Kd, fc.jd.i8, fc.jd.bs); }
+            else { int dom = ork_weight_domain(ctx, (size_t) Nff * Kd * 2, ork_layer_of(Wd->name)); ork_npu_set_pack_domain(ctx->npu, dom);
               fc.wd_f16 = ork_mm_pack(ctx->npu, Nff, Kd, h.data());
               while (!fc.wd_f16 && (dom = ork_domain_advance(ctx)) >= 0) fc.wd_f16 = ork_mm_pack(ctx->npu, Nff, Kd, h.data());
               if (!fc.wd_f16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] down pack FAIL\n"); return false; } }
-            fc.f16_all = true;
-            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] prep %s: all-fp16 up chunks=%zu + down ok\n", Wg->name, fc.wu_f16.size());
+            fc.f16_all = !jit; fc.f16_jit = jit;
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-F16] prep %s: %s up chunks=%zu + down ok\n", Wg->name, jit?"JIT-inflate":"all-fp16", jit?fc.ju.size():fc.wu_f16.size());
         }
     } else {
         fc.lut.resize(1030);   // int8 fused-SiLU LUT for (in_g = s_x*s_Wg, s_silu)
@@ -3728,6 +3776,41 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         }
         if (getenv("ORK_VERBOSE")) { static int o=0; if(!o++) fprintf(stderr,"[ORK FFN-F16] all-fp16 inner %s ok=%d M=%d\n", Wg->name, ok2, M); }
         return ok2;   // false -> dispatch falls through to per-node (weights already packed; harmless)
+    }
+
+    // ---- ORK_FFN_F16_JIT: same fp16 inner as f16_all, but each weight is inflated from a host int8 store
+    // into a SHARED fp16 scratch right before its matmul (no resident fp16). IOVA cost = a few shared
+    // scratches reused across every JIT layer, so gmax layer count is decoupled from the 4GiB domain. ----
+    if (fc.f16_jit) {
+        const int cn = fc.wg_f16_cn;
+        std::vector<ork_f16> xh((size_t) M * K); for (size_t i = 0; i < (size_t) M*K; i++) xh[i] = (ork_f16) xf[i];
+        std::vector<float> siluf((size_t) M * Nff), upf((size_t) M * Nff), ctmp((size_t) M * cn);
+        bool ok2 = true;
+        for (size_t ci = 0; ci < fc.jg.size() && ok2; ci++) {       // gate: inflate -> fp16 matmul + fused SiLU
+            int n0 = (int) ci * cn, cw = fc.jg[ci].N;
+            ork_w * sc = ork_get_f16_scratch(ctx, K, cw);
+            if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.jg[ci].i8.data(), fc.jg[ci].bs.data(), K, cw)) { ok2 = false; break; }
+            if (ork_mm_run_f16_silu(ctx->npu, sc, M, xh.data(), ctmp.data(), 0, 0xffffc000u, 0x56391100u, fc.lut_f16.data(), 1030)) { ok2 = false; break; }
+            for (int m = 0; m < M; m++) { float * so = siluf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
+                for (int n = 0; n < cw; n++) so[n] = cr[n] * (float) fc.f16_out; }
+        }
+        for (size_t ci = 0; ci < fc.ju.size() && ok2; ci++) {       // up: inflate -> fp16 matmul
+            int n0 = (int) ci * cn, cw = fc.ju[ci].N;
+            ork_w * sc = ork_get_f16_scratch(ctx, K, cw);           // same (K,cw) scratch the gate just used
+            if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.ju[ci].i8.data(), fc.ju[ci].bs.data(), K, cw)) { ok2 = false; break; }
+            if (ork_mm_run(ctx->npu, sc, M, xh.data(), ctmp.data())) { ok2 = false; break; }
+            for (int m = 0; m < M; m++) { float * uo = upf.data() + (size_t) m*Nff + n0; const float * cr = ctmp.data() + (size_t) m*cw;
+                for (int n = 0; n < cw; n++) uo[n] = cr[n]; }
+        }
+        if (ok2) {                                                  // glu = silu*up -> fp16; down: inflate -> matmul
+            std::vector<ork_f16> gluh((size_t) M * Nff);
+            for (size_t i = 0; i < (size_t) M*Nff; i++) gluh[i] = (ork_f16) (siluf[i] * upf[i]);
+            ork_w * sc = ork_get_f16_scratch(ctx, Nff, Kd);
+            if (!sc || ork_mm_inflate_i8_to_f16(ctx->npu, sc, fc.jd.i8.data(), fc.jd.bs.data(), Nff, Kd)) ok2 = false;
+            else if (ork_mm_run(ctx->npu, sc, M, gluh.data(), (float *) down_n->data)) ok2 = false;
+        }
+        if (getenv("ORK_VERBOSE")) { static int o=0; if(!o++) fprintf(stderr,"[ORK FFN-F16] JIT-inflate inner %s ok=%d M=%d scratches=%zu\n", Wg->name, ok2, M, ctx->f16_scratch.size()); }
+        return ok2;   // false -> dispatch falls through to per-node
     }
 
     // ---- HYBRID: gate=fused-SiLU (per-tensor, silu FREE on-NPU); up/down = standard per-channel host-dequant
