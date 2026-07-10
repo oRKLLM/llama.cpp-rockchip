@@ -51,7 +51,7 @@
 //                        share); cost = the park expert recomputes the NPU slots' rows (discarded).
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
-//   (QKV/gate-up group fusion is DEFAULT-ON for M>=8 (ORK_FUSE_MINM): +8% @M8 .. +17% @M64, bit-exact,
+//   (QKV/gate-up group fusion is DEFAULT-ON for M>=2 (ORK_FUSE_MINM): +11% @M2 .. +17% @M64, bit-exact,
 //    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
 //   ORK_QUANT=4          EXPERIMENTAL. int4 W4A4 instead of int8 (incoherent; research only).
 //   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated int4 path (with ORK_QUANT=4).
@@ -4066,11 +4066,11 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // which also shares the FWHT rotation once). Default mixed path (q4->W8A8) => all-i8 groups;
                     // ORK_MIXED_W4A4 => i4 groups for the 4-bit tier. Mixed-tier runs stay per-node.
                     const int grp_tier = ork_node_qbits(ctx, node);   // group members must all share this tier (8=W8A8, 4=W4A4)
-                    // node->ne[1] = M (output rows). M-sweep (qwen3-1.7B-Q8_0, 2026-07-10): fusion WINS from
-                    // M=8 (+8-9%) up through M=64 (+12-17%) but LOSES at M=1 decode (prior: 9.4->6.4). Break-even
-                    // is in (1,8), so the engage floor is M>=8 (was 32) — this also brings DFlash's M=block
-                    // batched-verify (block ~8-16) into the win region. ORK_FUSE_MINM overrides; ORK_FUSE forces all M.
-                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 8;
+                    // node->ne[1] = M (output rows). M-sweep (qwen3-1.7B-Q8_0, 2026-07-10, warm -r3): fusion WINS
+                    // at EVERY M>=2 — pp2 +10.8%, pp4 +10.5%, pp8 +8-9%, pp64 +12-17%. At M=1: pp1 is +1% but
+                    // autoregressive tg-decode REGRESSES (prior: 9.4->6.4), so the floor is M>=2 (decode M=1 stays
+                    // unfused). Covers all prefill + DFlash's M=block batched-verify. ORK_FUSE_MINM overrides.
+                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 2;
                     if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= fuse_minm)) {
                         while (i + ng < cgraph->n_nodes && ng < 16) {
                             struct ggml_tensor * nj = cgraph->nodes[i + ng];
