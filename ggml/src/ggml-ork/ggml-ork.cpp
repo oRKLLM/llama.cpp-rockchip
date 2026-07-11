@@ -439,7 +439,8 @@ static bool g_ork_hybrid_loading = false;
 // ---- Load-time product config (the two user-facing options; see ggml-ork.h) ----
 static bool g_ork_cfg_set          = false;   // has ggml_backend_ork_set_load_config been called this process?
 static bool g_ork_cfg_dflash       = false;   // enable the speculative block-diffusion drafter
-static bool g_ork_cfg_silu_int8cpu = false;   // false = int16 all-NPU silu (default); true = int8 gate + CPU silu
+static bool g_ork_cfg_silu_int8fused = false; // false = int16 coherent (unfused standalone NPU silu, default);
+                                              // true = int8 fully-fused through-and-through (SiLU fused into gate matmul)
 static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // MULTI-DOMAIN RESIDENCE: place each weight in an IOMMU domain, filled SELF-CALIBRATING + sequential.
@@ -1301,8 +1302,8 @@ void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
 }
 
-void ggml_backend_ork_set_load_config(bool dflash, bool silu_int8_cpu) {
-    g_ork_cfg_set = true; g_ork_cfg_dflash = dflash; g_ork_cfg_silu_int8cpu = silu_int8_cpu;
+void ggml_backend_ork_set_load_config(bool dflash, bool silu_int8_fused) {
+    g_ork_cfg_set = true; g_ork_cfg_dflash = dflash; g_ork_cfg_silu_int8fused = silu_int8_fused;
 }
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
@@ -4483,14 +4484,19 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // ggml_backend_ork_set_load_config(); everything else is hardcoded to the validated values (not a knob).
     // If the config was never set, fall through to legacy env behavior (dev/debug), unchanged.
     if (g_ork_cfg_set) {
-        setenv("ORK_FFN_CHAIN", "1", 1);        // coherent on-NPU SwiGLU chain (both silu paths use it)
+        setenv("ORK_FFN_CHAIN", "1", 1);        // round-trip-free on-NPU SwiGLU chain (both paths use it)
         setenv("ORK_MIXED_NOTHRASH", "1", 1);   // no int8<->int4/mode re-warm thrash
         setenv("ORK_NO_BF", "1", 1);            // compact footprint -> fits one IOMMU domain (dodges #36 dom>0)
-        if (g_ork_cfg_silu_int8cpu) { setenv("ORK_FFN_SILU_CPU_GMAX", "0", 1); unsetenv("ORK_FFN_SILU_I16"); }  // int8 gate + CPU silu (18.4)
-        else                        { setenv("ORK_FFN_SILU_I16", "1", 1);      unsetenv("ORK_FFN_SILU_CPU_GMAX"); } // DEFAULT: all-NPU int16 silu (19.0)
+        if (g_ork_cfg_silu_int8fused) {         // int8 FULLY FUSED through-and-through: SiLU fused into the gate
+            setenv("ORK_FFN_FUSED_SILU", "1", 1);                                        // matmul, all-NPU (fast, ~PPL 22)
+            unsetenv("ORK_FFN_SILU_I16"); unsetenv("ORK_FFN_SILU_CPU_GMAX");
+        } else {                                // DEFAULT: int16 coherent — SiLU is the UNFUSED standalone NPU op (~PPL 19)
+            setenv("ORK_FFN_SILU_I16", "1", 1);
+            unsetenv("ORK_FFN_FUSED_SILU"); unsetenv("ORK_FFN_SILU_CPU_GMAX");
+        }
         if (g_ork_cfg_dflash) setenv("ORK_DFLASH", "1", 1); else unsetenv("ORK_DFLASH");   // drafter gate (read by the dflash path)
         GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
-                      g_ork_cfg_silu_int8cpu ? "int8-cpu" : "int16-allNPU", g_ork_cfg_dflash ? "on" : "off");
+                      g_ork_cfg_silu_int8fused ? "int8-fused(through)" : "int16-coherent", g_ork_cfg_dflash ? "on" : "off");
     }
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
