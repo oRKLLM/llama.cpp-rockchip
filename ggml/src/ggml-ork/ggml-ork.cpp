@@ -315,6 +315,12 @@ struct ggml_backend_ork_context {
         jit_w jd;                                      // down (K=Nff, N=Kd)
     };
     std::unordered_map<const void *, ork_ffn_smooth>   ffncache;       // gate ptr -> smoothed layer state
+    // (a) runtime-adaptive gmax: auto-captured per-FFN-layer gate range (name, gmax) as prep sees each
+    // layer. The model-specific "tuning data" — reported at free, and the source (b) persists into the
+    // orkpack. NOTE: the gmax gate cannot rescue the fused int8 silu (its int8 OUTPUT is coarse -> broadly
+    // inaccurate at ALL gmax, PPL 55; that's why all-CPU-silu is the shipped default). gmax gating only
+    // pays off for a FUTURE all-NPU selective path (int16-silu, int16 output) — currently blocked (#35).
+    std::vector<std::pair<std::string, float>> gmax_profile;
     std::unordered_map<uint64_t, ork_w *> f16_scratch;                 // (K<<32|N) -> reusable fp16 scratch (ORK_FFN_F16_JIT)
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
     // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
@@ -2090,6 +2096,24 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
     ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
     if (ctx->persist_mode) fprintf(stderr, "[ORK PERSIST] this run: loaded %ld from disk, packed %ld\n", ctx->persist_hits, ctx->persist_misses);
+    // (a) gmax profile report: the auto-captured, model-specific gate-range distribution + an adaptive
+    // cutoff (median + 3*MAD = the outlier layers). The fused int8 silu can't be rescued by gmax gating
+    // (its int8 OUTPUT is coarse at ALL gmax -> PPL 55), so the SHIPPED policy stays all-CPU-silu; this
+    // profile is the tuning DATA that (b) persists into the orkpack and a FUTURE all-NPU selective int16
+    // gate (#35) would apply. Printed under ORK_VERBOSE or ORK_FFN_GMAX_REPORT.
+    if (!ctx->gmax_profile.empty() && (getenv("ORK_VERBOSE") || getenv("ORK_FFN_GMAX_REPORT"))) {
+        std::vector<std::pair<std::string, float>> g = ctx->gmax_profile;
+        std::sort(g.begin(), g.end(), [](const std::pair<std::string,float>&a, const std::pair<std::string,float>&b){ return a.second > b.second; });
+        std::vector<float> s; for (auto & p : g) s.push_back(p.second); std::sort(s.begin(), s.end());
+        float med = s[s.size()/2];
+        std::vector<float> dev; for (float v : s) dev.push_back(fabsf(v - med)); std::sort(dev.begin(), dev.end());
+        float mad = dev.empty() ? 0.0f : dev[dev.size()/2]; float cut = med + 3.0f * (mad > 1e-6f ? mad : 1.0f);
+        int nout = 0; for (auto & p : g) if (p.second > cut) nout++;
+        fprintf(stderr, "[ORK FFN-GMAX] %zu FFN layers | median=%.1f MAD=%.1f | adaptive cutoff(med+3MAD)=%.1f -> %d outlier layer(s)\n",
+                g.size(), med, mad, cut, nout);
+        for (auto & p : g)
+            fprintf(stderr, "[ORK FFN-GMAX]   %-28s gmax=%8.2f%s\n", p.first.c_str(), p.second, p.second > cut ? "  <-- outlier" : "");
+    }
     if (ctx->moe_hot_hits || ctx->moe_cold_cpu) {
         long tot = ctx->moe_hot_hits + ctx->moe_cold_cpu;
         fprintf(stderr, "[ORK MOE PARTITION] hot-K=%s peak-resident=%.3f GiB | expert-calls: NPU(hot)=%ld CPU(cold)=%ld | hit-rate=%.1f%%\n",
@@ -3634,6 +3658,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
           std::nth_element(sabs.begin(), sabs.begin()+idx, sabs.end()); sref = sabs[idx]; if (sref < 1e-9) sref = smax; }
       fc.s_silu = sref * 1.15 / 127.0; if (!(fc.s_silu > 0)) fc.s_silu = 1e-6; gmax_gate = gm * 1.2; }
     fc.gmax = gmax_gate;
+    ctx->gmax_profile.emplace_back(Wg->name, (float) gmax_gate);   // (a) auto-capture the model's gmax profile
     // DEFAULT (shipped 2026-07-11): CPU fp32 silu for ALL layers. The int8 FUSED silu LUT is broadly
     // incoherent (PPL 55.45 vs 18.39 all-CPU-silu on Qwen3-1.7B; even fixing only the gmax=131 outlier
     // layer recovers 55->24), and CPU silu is ~FREE — prefill is matmul-bound (flat ~90 tok/s from 0 to 9+
