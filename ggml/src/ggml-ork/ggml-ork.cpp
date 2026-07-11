@@ -4442,6 +4442,13 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->hadamard = getenv("ORK_HADAMARD") != nullptr &&
                     (ctx->qbits == 4 || (ork_mixed_dispatch_on() && env_enabled("ORK_MIXED_W4A4")));
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
+    // SHIP HARDENING (2026-07-11): the FFN chain ships with a COMPACT resident footprint — default ORK_NO_BF
+    // when ORK_FFN_CHAIN is on. The full-K Bf decode-copies ~double the footprint (~1.9->3.6 GiB on 1.7B),
+    // which pushes the auto-domain sizer to n_domains>1, where the imported dom>0 submits INTERMITTENTLY
+    // WEDGE (#36: errno=110 on dom=1 weights). Decode uses the per-node path (not the chain), so shedding
+    // Bf costs the chain nothing. Set BEFORE the domain sizing below (which now honors NO_BF). Opt out with
+    // ORK_KEEP_BF=1; an explicit ORK_NO_BF (either value) also wins.
+    if (ork_ffn_chain_on() && !getenv("ORK_KEEP_BF") && !getenv("ORK_NO_BF")) setenv("ORK_NO_BF", "1", 1);
     // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
     // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
     // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
@@ -4480,12 +4487,13 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // fp16 delta per FFN weight so auto-sizing leaves IOVA HEADROOM. gmax subset is unknown at init ->
           // assume all FFN layers (worst case; JIT over-counts but that's safe slack).
           const bool f16route = getenv("ORK_FFN_F16") != nullptr;
+          const bool no_bf = getenv("ORK_NO_BF") != nullptr;   // NO_BF sheds the full-K Bf rebuild -> don't size for it
           size_t inflated = 0;
           for (const auto & kv : ctx->persist_idx) {
               const int K = (int) kv.second.K, N = (int) kv.second.N;
               size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
                                               : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
-              inflated += tile + (K <= 4096 ? tile : 0);               // + full-K Bf rebuild
+              inflated += tile + ((K <= 4096 && !no_bf) ? tile : 0);   // + full-K Bf rebuild (unless NO_BF sheds it)
               if (f16route && (kv.first.find("ffn_gate") != std::string::npos ||
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
