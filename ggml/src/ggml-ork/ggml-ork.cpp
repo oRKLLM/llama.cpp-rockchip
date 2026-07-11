@@ -436,6 +436,10 @@ struct ggml_backend_ork_context {
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
+// ---- Load-time product config (the two user-facing options; see ggml-ork.h) ----
+static bool g_ork_cfg_set          = false;   // has ggml_backend_ork_set_load_config been called this process?
+static bool g_ork_cfg_dflash       = false;   // enable the speculative block-diffusion drafter
+static bool g_ork_cfg_silu_int8cpu = false;   // false = int16 all-NPU silu (default); true = int8 gate + CPU silu
 static inline double ork_now_us_e(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
 // MULTI-DOMAIN RESIDENCE: place each weight in an IOMMU domain, filled SELF-CALIBRATING + sequential.
@@ -1295,6 +1299,10 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
 
 void ggml_backend_ork_set_hybrid(bool use_hybrid) {
     g_ork_hybrid_loading = use_hybrid;
+}
+
+void ggml_backend_ork_set_load_config(bool dflash, bool silu_int8_cpu) {
+    g_ork_cfg_set = true; g_ork_cfg_dflash = dflash; g_ork_cfg_silu_int8cpu = silu_int8_cpu;
 }
 static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1e6 + t.tv_nsec*1e-3; }
 
@@ -3689,9 +3697,14 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     fc.silu_cpu = !(getenv("ORK_FFN_GATE_F16") || getenv("ORK_FFN_F16"));
     if (const char * t = getenv("ORK_FFN_SILU_CPU_GMAX")) fc.silu_cpu = (gmax_gate > atof(t));
     if (getenv("ORK_FFN_FUSED_SILU")) fc.silu_cpu = false;
-    // ORK_FFN_SILU_I16[_GMAX]: route the gate silu to the on-NPU int16 op (via the silu_cpu int8-gate path).
+    // ORK_FFN_SILU_I16[_GMAX]: MIXED-PRECISION gmax gate. With a threshold, high-gmax OUTLIER layers get the
+    // on-NPU int16 silu (coherent, all-NPU) and the rest get the int8 FUSED silu (1 submit, fast) — int8
+    // mostly + int16 on the worst offenders. Without a threshold, ALL layers -> int16. The int8-fused silu
+    // is broadly lossy (PPL 55 all-fused), but the OUTLIERS dominate (fixing blk.2 alone 55->24; top-9
+    // ->19.5), so the threshold buys most of the coherence while keeping most layers on the fast fused path.
     if (getenv("ORK_FFN_SILU_I16")) { const char * t = getenv("ORK_FFN_SILU_I16_GMAX");
-        if (!t || gmax_gate > atof(t)) { fc.silu_cpu = true; fc.silu_i16 = true; } }
+        if (!t || gmax_gate > atof(t)) { fc.silu_cpu = true; fc.silu_i16 = true; }   // outlier -> int16 (all-NPU, coherent)
+        else { fc.silu_cpu = false; fc.silu_i16 = false; } }                          // low-gmax -> int8 FUSED silu (fast)
     // ORK_FFN_F16_GMAX: PER-LAYER all-fp16 selection. all-fp16 removes the CPU int8 quant/dequant but fp16
     // weights are 2x int8 RAM — ALL layers fp16 overflows one 4GiB domain -> ORK_DOMAINS=2 -> per-submit
     // overhead. Selecting only the MOST-SENSITIVE layers (gate gmax > threshold) keeps the fp16 footprint
@@ -4465,6 +4478,20 @@ static ggml_guid_t ggml_backend_ork_guid(void) {
 }
 
 ggml_backend_t ggml_backend_ork_init(void) {
+    // PRODUCT CONFIG (2 load-time options -> internal validated defaults; see ggml-ork.h). Translated to the
+    // internal mechanisms ONCE here, before any of them is read below. The user sets only the 2 options via
+    // ggml_backend_ork_set_load_config(); everything else is hardcoded to the validated values (not a knob).
+    // If the config was never set, fall through to legacy env behavior (dev/debug), unchanged.
+    if (g_ork_cfg_set) {
+        setenv("ORK_FFN_CHAIN", "1", 1);        // coherent on-NPU SwiGLU chain (both silu paths use it)
+        setenv("ORK_MIXED_NOTHRASH", "1", 1);   // no int8<->int4/mode re-warm thrash
+        setenv("ORK_NO_BF", "1", 1);            // compact footprint -> fits one IOMMU domain (dodges #36 dom>0)
+        if (g_ork_cfg_silu_int8cpu) { setenv("ORK_FFN_SILU_CPU_GMAX", "0", 1); unsetenv("ORK_FFN_SILU_I16"); }  // int8 gate + CPU silu (18.4)
+        else                        { setenv("ORK_FFN_SILU_I16", "1", 1);      unsetenv("ORK_FFN_SILU_CPU_GMAX"); } // DEFAULT: all-NPU int16 silu (19.0)
+        if (g_ork_cfg_dflash) setenv("ORK_DFLASH", "1", 1); else unsetenv("ORK_DFLASH");   // drafter gate (read by the dflash path)
+        GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
+                      g_ork_cfg_silu_int8cpu ? "int8-cpu" : "int16-allNPU", g_ork_cfg_dflash ? "on" : "off");
+    }
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
