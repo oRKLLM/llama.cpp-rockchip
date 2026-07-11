@@ -321,6 +321,12 @@ struct ggml_backend_ork_context {
     // inaccurate at ALL gmax, PPL 55; that's why all-CPU-silu is the shipped default). gmax gating only
     // pays off for a FUTURE all-NPU selective path (int16-silu, int16 output) — currently blocked (#35).
     std::vector<std::pair<std::string, float>> gmax_profile;
+    // (b) persisted gmax tuning: loaded at init from the <orkpack>.gmax sidecar (written at free). A model
+    // whose profile is already on disk skips the first-pass recompute AND can set per-layer policy at LOAD.
+    // Sidecar (not embedded in the orkpack blob) because the in-blob write needs the chain-convert path,
+    // which currently heap-corrupts (deep bug, separate). No active consumer yet (shipped policy is
+    // all-CPU-silu); it's the foundation for a future all-NPU selective int16-silu gate (#35).
+    std::unordered_map<std::string, float> gmax_loaded;
     std::unordered_map<uint64_t, ork_w *> f16_scratch;                 // (K<<32|N) -> reusable fp16 scratch (ORK_FFN_F16_JIT)
     uint64_t wcache_tick  = 0;   // monotonic clock for LRU last_use
     // STREAM-POOL tier (ORK_STREAM_POOL=1): RAM-resident inflated-int8 cache w/ cheap map/unmap.
@@ -2113,6 +2119,18 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
                 g.size(), med, mad, cut, nout);
         for (auto & p : g)
             fprintf(stderr, "[ORK FFN-GMAX]   %-28s gmax=%8.2f%s\n", p.first.c_str(), p.second, p.second > cut ? "  <-- outlier" : "");
+    }
+    // (b) persist the gmax profile to the <ORK_PERSIST>.gmax sidecar (name<TAB>gmax/line) so a later run
+    // loads it. Written whenever we captured a profile and have a persist path — independent of ORK_VERBOSE.
+    if (!ctx->gmax_profile.empty()) {
+        const char * pp = getenv("ORK_PERSIST");
+        if (pp && pp[0]) {
+            std::string sp = std::string(pp) + ".gmax";
+            FILE * gf = fopen(sp.c_str(), "w");
+            if (gf) { for (auto & p : ctx->gmax_profile) fprintf(gf, "%s\t%.6g\n", p.first.c_str(), p.second);
+                fclose(gf);
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-GMAX] wrote %zu-layer gmax profile -> %s\n", ctx->gmax_profile.size(), sp.c_str()); }
+        }
     }
     if (ctx->moe_hot_hits || ctx->moe_cold_cpu) {
         long tot = ctx->moe_hot_hits + ctx->moe_cold_cpu;
@@ -4454,6 +4472,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->npu = npu;
     g_ork_ctx = ctx;
     ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
+    // (b) load the persisted gmax sidecar (<ORK_PERSIST>.gmax) if present: a known model's per-layer gate
+    // ranges available at LOAD (before prep recomputes them) — foundation for a load-time selective policy.
+    { const char * pp = getenv("ORK_PERSIST");
+      if (pp && pp[0]) { std::string sp = std::string(pp) + ".gmax"; FILE * gf = fopen(sp.c_str(), "r");
+          if (gf) { char nm[256]; float gv;
+              while (fscanf(gf, "%255s %f", nm, &gv) == 2) ctx->gmax_loaded[nm] = gv;
+              fclose(gf);
+              if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-GMAX] loaded %zu-layer gmax profile from %s\n", ctx->gmax_loaded.size(), sp.c_str()); } } }
     const char * q = getenv("ORK_QUANT");
     ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
