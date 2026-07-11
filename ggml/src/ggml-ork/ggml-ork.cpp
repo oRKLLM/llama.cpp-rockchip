@@ -3968,11 +3968,10 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg == ctx->wcache.end()) { ok = false; }
         else { const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
-            // silu_i16 submits a single-core NPU activation op right after each gate matmul. The op is
-            // bit-accurate standalone at this exact shape (M=128,N=6144, i16_shape_probe), but in-chain it
-            // soft-resets the NPU because the gate matmul runs MULTI-core and the silu submit is single-core
-            // -> the multi->single-core transition wedges. Pin the whole gate to single-core to avoid it.
-            if (fc.silu_i16) ork_npu_set_core_budget(ctx->npu, 1);
+            // NOTE: an earlier single-core pin here (ork_npu_set_core_budget 1) collides with (c)'s NO_BF
+            // default — it forces the gate matmul onto the single-core run_loop path which needs the full-K
+            // Bf (NULL under NO_BF) -> run_loop wedges (errno 110). Keep the gate MULTI-core (mcworker/Bb).
+            // The int16 silu op is single-core; the multi->single transition is handled inside the op.
             for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
                 if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
                 if (fc.silu_i16) {
@@ -3993,7 +3992,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                         float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
                         for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } }
                 } }
-            if (fc.silu_i16) ork_npu_set_core_budget(ctx->npu, ork_npu_cores(ctx->npu)); }
+            }
     } else if (ok && !fc.wg_f16.empty() && ablate < 0) {
         // ORK_FFN_GATE_F16: precise fp16 gate matmul + fused fp16 SiLU, N-CHUNKED. x -> fp16 (cast); each chunk's
         // gate is -S*Wg (baked in prep) so acc = -S*gate spreads the fp16 LUT; silu = C_out * fc.f16_out. Each
