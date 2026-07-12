@@ -4846,7 +4846,12 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             {
                 static const int ork_attn = getenv("ORK_ATTN") != nullptr;
                 if (ork_attn && (op->ne[2] > 1 || op->ne[3] > 1)) {
-                    return K % 32 == 0 && N % 16 == 0 && M >= 1
+                    // DEDICATED ATTENTION DISPATCH: claim batched/dynamic matmuls ONLY for M>1 (prefill).
+                    // M=1 (decode) is DECLINED here so ggml keeps it on the CPU backend — never letting a
+                    // dynamic KV-cache operand fall into the int8 static-weight resolve path (which packs it
+                    // as a weight -> "not in orkpack" slow live-convert) NOR into the M=1 in-graph A·V wedge.
+                    // Decode attention is a CPU path anyway (decode-is-cpu-path); the parity target is prefill.
+                    return M > 1 && K % 32 == 0 && N % 16 == 0
                         && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
                         && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)
                         && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
