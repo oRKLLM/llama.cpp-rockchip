@@ -4332,6 +4332,34 @@ static bool ggml_backend_ork_soft_max(ggml_backend_ork_context * ctx, struct ggm
 // for the layer-level heterogeneous-chain assembler. Correctness comes from ggml's own CPU kernels; the
 // on-NPU-native + chained version is the follow-up. Returns false on failure -> caller aborts (never claimed
 // unless supports_op allowed it, so shapes are safe).
+// ORK_OPS_NPU: run a claimed RoPE on the NPU (ork_npu_rope_neox_f16) instead of CPU-delegate, so Q/K
+// rotation stays on the NPU data path. Only the Qwen3 case (NEOX mode, n_dims==head_dim, int32 positions,
+// fp32 in/out, contiguous); anything else returns false -> caller CPU-delegates. src0=[hd, n_head, n_tok],
+// src1=positions[n_tok]; row (head h, token t) -> pos = positions[t].
+static bool ggml_backend_ork_rope_npu(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
+    const struct ggml_tensor * x = node->src[0];
+    const struct ggml_tensor * p = node->src[1];
+    if (!x || !p || x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || p->type != GGML_TYPE_I32) return false;
+    if (!ggml_is_contiguous(x)) return false;
+    const int n_dims = ((const int32_t *) node->op_params)[0];
+    const int mode   = ((const int32_t *) node->op_params)[1];
+    float freq_base = 10000.0f; memcpy(&freq_base, (const char *) node->op_params + 3*sizeof(int32_t), sizeof(float));
+    const int hd = (int) x->ne[0], nh = (int) x->ne[1], nt = (int) x->ne[2];
+    if (!(mode & 2) || n_dims != hd || (hd & 7) || x->ne[3] != 1) return false;   // NEOX, full-dim only
+    const int nrow = nh * nt;
+    const int32_t * pos = (const int32_t *) p->data;
+    std::vector<ork_f16> xh((size_t) nrow*hd), oh((size_t) nrow*hd);
+    std::vector<int>     rp((size_t) nrow);
+    const float * xf = (const float *) x->data;
+    for (int64_t t = 0; t < nt; t++) for (int64_t h = 0; h < nh; h++) { int64_t r = t*nh + h;
+        for (int d = 0; d < hd; d++) xh[(size_t) r*hd + d] = (ork_f16) xf[(size_t)(t*nh + h)*hd + d];
+        rp[r] = pos[t]; }
+    if (ork_npu_rope_neox_f16(ctx->npu, xh.data(), hd, nrow, rp.data(), (double) freq_base, oh.data())) return false;
+    float * of = (float *) node->data;
+    for (int64_t r = 0; r < nrow; r++) for (int d = 0; d < hd; d++) of[(size_t) r*hd + d] = (float) oh[(size_t) r*hd + d];
+    return true;
+}
+
 static bool ork_cpu_delegate_node(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
     if (!ctx->cpu_backend) { ctx->cpu_backend = ggml_backend_cpu_init(); if (ctx->cpu_backend) ggml_backend_cpu_set_n_threads(ctx->cpu_backend, 4); }
     if (!ctx->cpu_backend) return false;
@@ -4673,9 +4701,11 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 break;
             }
             case GGML_OP_RMS_NORM:
-            case GGML_OP_ROPE: {   // #1: claimed boundary op -> CPU-delegate (keeps the layer one ork subgraph;
-                                   // residual ADD / norm-weight MUL are claimed via the existing ORK_PPU_ADD/ORK_PPU_OPS)
-                if (!ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+            case GGML_OP_ROPE: {   // #1: claimed boundary op. ORK_OPS_NPU -> run RoPE on the NPU
+                                   // (ork_npu_rope_neox_f16); else CPU-delegate (keeps the layer one ork subgraph).
+                bool done = false;
+                if (getenv("ORK_OPS_NPU") && node->op == GGML_OP_ROPE) done = ggml_backend_ork_rope_npu(ctx, node);
+                if (!done && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
