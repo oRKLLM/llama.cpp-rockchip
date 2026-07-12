@@ -4325,6 +4325,36 @@ static bool ggml_backend_ork_soft_max(ggml_backend_ork_context * ctx, struct ggm
     return true;
 }
 
+// ORK_CLAIM_OPS (#1 toward the static graph): compute ONE claimed boundary op (RMSNorm/RoPE/residual-add)
+// on the cached CPU backend, treating its srcs as already-computed leaves (no ancestor recompute). Claiming
+// these ops keeps them inside ork's subgraph -> ggml hands ork the WHOLE layer contiguously, the prerequisite
+// for the layer-level heterogeneous-chain assembler. Correctness comes from ggml's own CPU kernels; the
+// on-NPU-native + chained version is the follow-up. Returns false on failure -> caller aborts (never claimed
+// unless supports_op allowed it, so shapes are safe).
+static bool ork_cpu_delegate_node(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
+    if (!ctx->cpu_backend) { ctx->cpu_backend = ggml_backend_cpu_init(); if (ctx->cpu_backend) ggml_backend_cpu_set_n_threads(ctx->cpu_backend, 4); }
+    if (!ctx->cpu_backend) return false;
+    const size_t mo = ggml_tensor_overhead() * (GGML_MAX_SRC + 2) + ggml_graph_overhead();
+    struct ggml_init_params ip = { mo, nullptr, /*no_alloc=*/true };
+    struct ggml_context * g = ggml_init(ip); if (!g) return false;
+    struct ggml_tensor * op = ggml_new_tensor(g, node->type, GGML_MAX_DIMS, node->ne);
+    op->op = node->op; memcpy(op->op_params, node->op_params, sizeof(op->op_params));
+    for (int i = 0; i < GGML_MAX_DIMS; i++) op->nb[i] = node->nb[i];
+    op->data = node->data; op->buffer = node->buffer;
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
+        struct ggml_tensor * sr = node->src[s]; if (!sr) { op->src[s] = nullptr; continue; }
+        struct ggml_tensor * lf = ggml_new_tensor(g, sr->type, GGML_MAX_DIMS, sr->ne);
+        for (int i = 0; i < GGML_MAX_DIMS; i++) lf->nb[i] = sr->nb[i];
+        lf->data = sr->data; lf->buffer = sr->buffer; lf->op = GGML_OP_NONE;
+        op->src[s] = lf;
+    }
+    struct ggml_cgraph * gf = ggml_new_graph(g);
+    ggml_build_forward_expand(gf, op);
+    enum ggml_status st = ggml_backend_graph_compute(ctx->cpu_backend, gf);
+    ggml_free(g);
+    return st == GGML_STATUS_SUCCESS;
+}
+
 // ORK_SEG_TIME: per-op-category wall-time accounting for the segment-map table (measured, not estimated).
 enum { SEG_QKV, SEG_QKT, SEG_SM, SEG_AV, SEG_O, SEG_FFN, SEG_OTH, SEG_N };
 static double g_seg_us[SEG_N]; static long g_seg_n[SEG_N]; static int g_segtime = -1;
@@ -4561,12 +4591,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (!ggml_backend_ork_mul_mat_id_i8(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
-            case GGML_OP_MUL: {
-                if (!ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
+            case GGML_OP_MUL: {   // ORK_CLAIM_OPS -> CPU-delegate (handles broadcast norm-weight); else the NPU ewmul
+                if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
-            case GGML_OP_ADD: {
-                if (!ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
+            case GGML_OP_ADD: {   // ORK_CLAIM_OPS -> CPU-delegate (residual); else the NPU add
+                if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_UNARY: {
@@ -4582,6 +4612,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 double _t = ork_seg_t0();
                 if (!ggml_backend_ork_soft_max(ctx, node)) return GGML_STATUS_FAILED;
                 ork_seg_add(SEG_SM, _t);
+                break;
+            }
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_ROPE: {   // #1: claimed boundary op -> CPU-delegate (keeps the layer one ork subgraph;
+                                   // residual ADD / norm-weight MUL are claimed via the existing ORK_PPU_ADD/ORK_PPU_OPS)
+                if (!ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -5048,6 +5084,15 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return ork_attn && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
                 && op->ne[1] > 1 && op->ne[0] % 32 == 0 && mb == 0.0f;
         }
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_ROPE: {
+            // #1 static-graph prerequisite: claim the movable boundary ops RMSNorm + RoPE so a whole layer
+            // arrives as ONE ork subgraph. Computed via ork_cpu_delegate_node (ggml's own CPU kernel —
+            // coherent) for now; the on-NPU-native + chained versions land with the assembler. Gated
+            // ORK_CLAIM_OPS (off by default). Residual ADD / norm-weight MUL are the existing ORK_PPU_ADD/OPS.
+            static const int claim = getenv("ORK_CLAIM_OPS") != nullptr;
+            return claim;
+        }
         case GGML_OP_MUL_MAT_ID: {
             // MoE expert offload to the NPU (hot-expert partition: conforming-K experts go NPU-resident
             // via the async round-robin stream, the rest stay on the threaded CPU GEMV). EXPERIMENTAL and
@@ -5097,6 +5142,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // default-off. MUL under ORK_PPU_OPS (bit-exact fp16); ADD needs ORK_PPU_ADD (fp16
             // residual accumulation caveat). Only the same-shape contiguous f32 case (SwiGLU
             // gate*up, residual x+y); broadcast MUL (norm-weight, RoPE) stays on CPU.
+            // #1 static-graph contiguity: ORK_CLAIM_OPS claims ANY MUL/ADD (incl the broadcast norm-weight
+            // MUL and the residual ADD) via CPU-delegate, so the whole layer is one ork subgraph.
+            if (getenv("ORK_CLAIM_OPS")) return true;
             const bool on = (op->op == GGML_OP_MUL) ? ork_ppu_ops_on() : ork_ppu_add_on();
             if (!on) return false;
             if (!src0 || !src1) return false;
