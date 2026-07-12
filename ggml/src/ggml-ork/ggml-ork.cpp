@@ -4362,8 +4362,42 @@ static const char * g_seg_name[SEG_N] = { "QKV proj", "QK^T scores", "softmax", 
 static inline double ork_seg_t0(void) { return g_segtime > 0 ? (double) ggml_time_us() : 0.0; }
 static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_us[cat] += (double) ggml_time_us() - t0; g_seg_n[cat]++; } }
 
+// ORK_STATIC_GRAPH (assembler, step 1 — the planner). Recognize a contiguous ork layer subgraph (only
+// possible once ORK_CLAIM_OPS pulls RMSNorm/RoPE/MUL/ADD into ork's hands) and classify each node into the
+// static execution plan: HW-CHAIN groups of independent same-input matmuls (q/k/v, gate/up), SINGLE matmuls
+// (O, down), and CPU-delegate steps (norm/rope/residual) between them. This is the front-end the executor +
+// regcmd-precompile build on; here it just emits the plan (diagnostic, no execution change) so the segment
+// structure is verified on real graphs before the executor rewrites how they run.
+static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
+    fprintf(stderr, "[ORK STATIC-PLAN] %d-node subgraph:\n", cgraph->n_nodes);
+    int seg = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * n = cgraph->nodes[i];
+        const char * nm = n->src[0] ? n->src[0]->name : "";
+        if (n->op == GGML_OP_MUL_MAT) {
+            // look ahead for independent same-input siblings (the HW-chain group)
+            int grp = 1;
+            while (i + grp < cgraph->n_nodes) {
+                struct ggml_tensor * nj = cgraph->nodes[i + grp];
+                if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == n->src[1] && nj->src[0]->ne[0] == n->src[0]->ne[0]) grp++;
+                else break;
+            }
+            fprintf(stderr, "  S%-2d  %-9s x%d  %-26s K=%ld N=%ld M=%ld  [%s]\n", seg++,
+                    grp > 1 ? "HW-CHAIN" : "matmul", grp, nm,
+                    (long) n->src[0]->ne[0], (long) n->ne[0], (long) n->ne[1],
+                    grp > 1 ? "run_chain_i8" : "run_i8");
+            i += grp - 1;
+        } else if (n->op == GGML_OP_SOFT_MAX) {
+            fprintf(stderr, "  S%-2d  softmax   (exp on NPU)\n", seg++);
+        } else {
+            fprintf(stderr, "  --   %-9s %-26s  [CPU-delegate]\n", ggml_op_name(n->op), nm);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
+    if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
