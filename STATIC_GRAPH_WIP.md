@@ -18,6 +18,18 @@ Foundation already landed (fork feat/ork-static-graph):
 3. [ ] Regcmd precompile + replay: extend the pcrc cache to fixed-M prefill (build regcmd once, replay).
 4. [ ] Measure: coherence (bit-identical / PPL) + prefill vs 97 baseline.
 
+## Claimed-ops -> NPU primitives (2026-07-12, all gated: ORK_OPS_NPU)
+- **RoPE**: NEW primitive `ork_npu_rope_neox_f16` (ork-driver 7579461) — NEOX as x⊙COS+rot(x)⊙SIN via 2
+  ewmul+1 add; validated vs CPU (err 0.0025); wired (1a191581), coherent in-model ('Toby Steele').
+- **RMSNorm** (ork_npu_rmsnorm_f16 norm-only) + **MUL** (ork_npu_ewmul_f16, broadcast norm-weight): wired
+  on NPU (4ee02e98), coherent.
+- **residual ADD**: fp16 BREAKS coherence (accumulates over 28 layers -> garbage). Kept fp32 (CPU); opt-in
+  ORK_OPS_NPU_ADD. It's a boundary op (no chaining benefit) so fp32 is fine.
+- RESULT: RoPE+RMSNorm+MUL on NPU = coherent; the attention/FFN data path is now largely on-NPU (residual
+  the one fp32/CPU boundary). Per-node still pays round-trips; the heterogeneous-chain assembler amortizes.
+- NEXT: the chain assembler (chain the now-on-NPU segments into single submits) + the mul_mat_group_i8
+  variable-N fix (q/k/v scan-ahead) + the 3-graph/gmax selection design.
+
 ## Rules
 - Everything gated (ORK_STATIC_GRAPH etc.) — never break the default path.
 - Coherence-gate every step (bit-identical output vs baseline, or ork_ppl). No coherence = back off + gate off.
