@@ -1918,11 +1918,12 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     const float * bs = ow.bscale.data();                 // scatter+dequant into each dst
     for (int i = 0; i < ng; i++) {
         const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
-        float * dbase = (float *) g[i]->data;
+        char * dbase = (char *) g[i]->data;
+        const size_t drow = g[i]->nb[1];   // actual dst row stride (bytes) — q/k/v outputs may be strided, not m*Ni
         for (int m = 0; m < M; m++) {
             const float rs = as[m];
             const int32_t * cr = ci + (size_t) m*Ntot + o;
-            float * dr = dbase + (size_t) m*Ni;
+            float * dr = (float *) (dbase + (size_t) m*drow);
 #if defined(__ARM_NEON)
             float32x4_t v_rs = vdupq_n_f32(rs);
             int n = 0;
@@ -4471,8 +4472,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 fprintf(stderr, "  [%2d] %-12s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op),
                         n->src[0]?n->src[0]->name:"-", n->src[1]?n->src[1]->name:"-", (long)n->ne[0], (long)n->ne[1]);
             } fflush(stderr); } }
+    // Step 1 (ORK_SCAN_AHEAD): gather INDEPENDENT same-input matmuls that graph order interleaves with movable
+    // ops (q/k/v, split by RoPE/norm) into one HW-chain group, computing them early and marking them done so
+    // the loop skips them when reached. Safe because a grouped matmul reads only its weight leaf + the shared
+    // src[1] (already computed) -> independent of everything between.
+    static const int scan_ahead = getenv("ORK_SCAN_AHEAD") != nullptr;
+    std::unordered_set<const struct ggml_tensor *> sa_done;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        if (scan_ahead && !sa_done.empty() && sa_done.count(node)) continue;   // computed early by a scan-ahead group
         // ORK_FFN_CHAIN: recognize the fused-SwiGLU FFN inner and run it as ONE round-trip-free int8 chain
         // (int8 intermediates never touch fp32). Consumes all 4 nodes; falls through to per-node on any miss.
         if (ffn_chain && node->op == GGML_OP_MUL_MAT) {
@@ -4567,20 +4575,36 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // unfused). Covers all prefill + DFlash's M=block batched-verify. ORK_FUSE_MINM overrides.
                     static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 2;
                     if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= fuse_minm)) {
-                        while (i + ng < cgraph->n_nodes && ng < 16) {
-                            struct ggml_tensor * nj = cgraph->nodes[i + ng];
-                            if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
-                                nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1 &&
-                                ork_node_qbits(ctx, nj) == grp_tier)
-                                grp[ng++] = nj;
-                            else break;
+                        if (scan_ahead) {
+                            // Step 1: scan the WHOLE remaining subgraph for INDEPENDENT same-input matmuls,
+                            // skipping past the movable ops (RoPE/reshape/norm) that interleave q/k/v in graph
+                            // order. src[1]==node->src[1] guarantees independence (reads only the shared input +
+                            // a weight leaf), so computing them early is safe. Grouped-ahead nodes -> sa_done.
+                            for (int j = i + 1; j < cgraph->n_nodes && ng < 16; j++) {
+                                struct ggml_tensor * nj = cgraph->nodes[j];
+                                if (sa_done.count(nj)) continue;
+                                if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
+                                    nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1 &&
+                                    ork_node_qbits(ctx, nj) == grp_tier)
+                                    grp[ng++] = nj;   // else: skip (keep scanning past movable ops)
+                            }
+                        } else {
+                            while (i + ng < cgraph->n_nodes && ng < 16) {
+                                struct ggml_tensor * nj = cgraph->nodes[i + ng];
+                                if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == node->src[1] &&
+                                    nj->src[0]->ne[0] == node->src[0]->ne[0] && nj->ne[2] == 1 && nj->ne[3] == 1 &&
+                                    ork_node_qbits(ctx, nj) == grp_tier)
+                                    grp[ng++] = nj;
+                                else break;
+                            }
                         }
                     }
                     if (ng >= 2) {
                         bool grp_ok = (grp_tier == 4) ? ggml_backend_ork_mul_mat_group_i4(ctx, grp, ng)
                                                       : ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng);
                         if (!grp_ok) return GGML_STATUS_FAILED;
-                        i += ng - 1;
+                        if (scan_ahead) { for (int k = 1; k < ng; k++) sa_done.insert(grp[k]); }   // skip when reached
+                        else i += ng - 1;   // consecutive group -> advance past it
                     } else {
                         const char * name = node->src[0]->name;
                         bool is_ffn = strstr(name, "ffn_") || ork_is_expert(name);
