@@ -4280,6 +4280,51 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
     return true;
 }
 
+// 2b: attention softmax on the NPU. ggml GGML_OP_SOFT_MAX is soft_max_ext = softmax(scale*x + mask) per
+// row over ne[0]. We apply scale+mask on the CPU (cheap) into an fp16 buffer, then ork_npu_softmax_f16
+// runs exp() on the NPU (int16 SDP act-LUT) with max/sum/divide on CPU. Masked entries (causal -inf)
+// are floored to -64 (exp(-64)~0) so the primitive's int16 quant stays finite. supports_op guarantees
+// fp32 in/out, ne[1]>1, ne[0]%32==0, max_bias==0 — so this always completes.
+static bool ggml_backend_ork_soft_max(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src  = dst->src[0];
+    const struct ggml_tensor * mask = dst->src[1];
+    float scale = 1.0f; memcpy(&scale, (const char *) dst->op_params, sizeof(float));
+    const int      ne0 = (int) src->ne[0];
+    const int64_t  ne1 = src->ne[1], ne2 = src->ne[2], ne3 = src->ne[3];
+    const int64_t  nrow = ne1 * ne2 * ne3;
+    std::vector<ork_f16> xin((size_t) nrow * ne0), xout((size_t) nrow * ne0);
+    for (int64_t i3 = 0; i3 < ne3; i3++)
+    for (int64_t i2 = 0; i2 < ne2; i2++)
+    for (int64_t i1 = 0; i1 < ne1; i1++) {
+        const int64_t r = (i3 * ne2 + i2) * ne1 + i1;
+        const float * s = (const float *) ((const char *) src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
+        ork_f16 * xo = xin.data() + (size_t) r * ne0;
+        const char * mrow = nullptr; int mf16 = 0;
+        if (mask) {                                   // mask broadcast over heads (ne2); indexed by token i1 (and batch i3)
+            const int64_t mi1 = i1 % mask->ne[1];
+            const int64_t mi3 = mask->ne[3] > 1 ? (i3 % mask->ne[3]) : 0;
+            mrow = (const char *) mask->data + mi1*mask->nb[1] + mi3*mask->nb[3];
+            mf16 = (mask->type == GGML_TYPE_F16);
+        }
+        for (int j = 0; j < ne0; j++) {
+            float v = scale * s[j];
+            if (mrow) v += mf16 ? (float) ((const ork_f16 *) mrow)[j] : ((const float *) mrow)[j];
+            if (!(v > -64.0f)) v = -64.0f;            // causal -inf (and NaN) -> large negative (exp~0)
+            xo[j] = (ork_f16) v;
+        }
+    }
+    if (ork_npu_softmax_f16(ctx->npu, (int) nrow, ne0, xin.data(), xout.data())) return false;
+    for (int64_t i3 = 0; i3 < ne3; i3++)
+    for (int64_t i2 = 0; i2 < ne2; i2++)
+    for (int64_t i1 = 0; i1 < ne1; i1++) {
+        const int64_t r = (i3 * ne2 + i2) * ne1 + i1;
+        float * d = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+        const ork_f16 * xo = xout.data() + (size_t) r * ne0;
+        for (int j = 0; j < ne0; j++) d[j] = (float) xo[j];
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -4512,6 +4557,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             }
             case GGML_OP_GLU: {
                 if (!ggml_backend_ork_glu(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_SOFT_MAX: {   // 2b: attention softmax — exp on the NPU (supports_op gates the claimed cases)
+                if (!ggml_backend_ork_soft_max(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -4960,6 +5009,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if (getenv("ORK_VERBOSE") && name && strstr(name, "attn_output"))
                 fprintf(stderr, "[ORK LEVERD attn_output] M=%ld contigSrc0=%d contigSrc1=%d pass_m=%d -> ACCEPT=%d\n", (long)M, (int)ggml_is_contiguous(src0), (int)ggml_is_contiguous(src1), (int)pass_m_threshold, (int)ork_accept);
             return ork_accept;
+        }
+        case GGML_OP_SOFT_MAX: {
+            // 2b: attention softmax on the NPU (exp via the int16 SDP act-LUT; max/sum/divide stay CPU).
+            // Claim only what the handler runs on the NPU and always completes: prefill rows (ne[1]>1),
+            // fp32 scores, softmax width ne[0]%32==0 (the ork_npu_exp_i16 tile), and NO ALiBi slope
+            // (max_bias==0 — op_params[1]). Everything else stays on the CPU backend. Part of the
+            // attention block, gated with ORK_ATTN.
+            static const int ork_attn = getenv("ORK_ATTN") != nullptr;
+            float mb = 0.0f; memcpy(&mb, (const char *) op->op_params + sizeof(float), sizeof(float));
+            return ork_attn && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
+                && op->ne[1] > 1 && op->ne[0] % 32 == 0 && mb == 0.0f;
         }
         case GGML_OP_MUL_MAT_ID: {
             // MoE expert offload to the NPU (hot-expert partition: conforming-K experts go NPU-resident
