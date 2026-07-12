@@ -3968,14 +3968,54 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     std::vector<int32_t> acc_i32((size_t) M * Nff);   // reused (Nff >= Kd)
     std::vector<float>   up_f((size_t) M * Nff), silu_f((size_t) M * Nff), glu_f((size_t) M * Nff), as_g(M);
     bool ok = true;
-    // Phase 1: up (per-channel, per-row) -> up_f fp32
-    for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+    bool gu_done = false;
+    // STATIC-GRAPH submit reduction (ORK_GU_CHAIN): HW-chain up+gate into ONE run_chain_i8 submit per
+    // M-tile — both read xr_i8 and are independent, so the hardware walks them as task_number=2 in a single
+    // ioctl (collapses 2 tiled matmul submits -> 1 for the int16/cpu-silu path). run_chain_i8 is single-core;
+    // K=hidden %512==0 && <=4096 and Nff single-slice satisfy its envelope. Falls back to the separate
+    // per-op path on ANY failure (cok), so output is always valid. A/B on the same binary via the env.
+    if (getenv("ORK_GU_CHAIN") && fc.silu_cpu && ablate < 0) {
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg != ctx->wcache.end()) {
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            std::vector<int32_t> up_acc((size_t) MT*Nff), gate_acc((size_t) MT*Nff);
+            bool cok = true;
+            for (int m0 = 0; m0 < M && cok; m0 += MT) { int mc = std::min(MT, M - m0);
+                ork_mm_task_i8 t2[2] = {
+                    { owu.w, mc, xr_i8.data() + (size_t) m0*K, up_acc.data() },
+                    { owg.w, mc, xr_i8.data() + (size_t) m0*K, gate_acc.data() } };
+                if (ork_mm_run_chain_i8(ctx->npu, 2, t2)) { cok = false; break; }
+                for (int r = 0; r < mc; r++) { const int32_t * ur = up_acc.data() + (size_t) r*Nff;      // dequant up
+                    float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
+                    for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; }
+                if (fc.silu_i16) {                                                                        // on-NPU int16 SiLU on gate
+                    std::vector<float> gr((size_t) mc*Nff); float gmx = 1e-9f;
+                    for (int r = 0; r < mc; r++) { const int32_t * ar = gate_acc.data() + (size_t) r*Nff; const float rs = as_x[m0+r];
+                        for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; gr[(size_t) r*Nff+n] = g; float a = fabsf(g); if (a > gmx) gmx = a; } }
+                    double is = gmx/32000.0, os = gmx/32000.0; if (is<=0) is=1e-9; if (os<=0) os=1e-9;
+                    std::vector<int16_t> in16((size_t) mc*Nff), out16((size_t) mc*Nff);
+                    for (size_t i = 0; i < (size_t) mc*Nff; i++) { long q = lround(gr[i]/is); if (q>32767) q=32767; if (q<-32768) q=-32768; in16[i] = (int16_t) q; }
+                    double us = 0;
+                    if (ork_npu_silu_i16(ctx->npu, in16.data(), mc, Nff, is, os, out16.data(), &us)) { cok = false; break; }
+                    for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff;
+                        for (int n = 0; n < Nff; n++) so[n] = (float) out16[(size_t) r*Nff+n] * os; }
+                } else {                                                                                  // fp32 CPU SiLU on gate
+                    for (int r = 0; r < mc; r++) { const int32_t * ar = gate_acc.data() + (size_t) r*Nff;
+                        float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
+                        for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } }
+                }
+            }
+            gu_done = cok;
+        }
+    }
+    // Phase 1: up (per-channel, per-row) -> up_f fp32  [skipped if the chained fast-path already did up+gate]
+    for (int m0 = 0; !gu_done && m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
         if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
         for (int r = 0; r < mc; r++) { const int32_t * ur = acc_i32.data() + (size_t) r*Nff;
             float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
             for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } }
     // Phase 2: silu_f fp32
-    if (ok && fc.silu_cpu && ablate < 0) {
+    if (ok && !gu_done && fc.silu_cpu && ablate < 0) {
         // EXACT gate (strategic high-gmax layer): per-channel gate matmul on-NPU + fp32 silu on CPU. Same recipe
         // as the up projection (per-channel weight, per-row x), so quality matches baseline; only the fused-silu
         // stage is skipped for this layer. Reuses xr_i8 + as_x (per-row original x, already computed above).
