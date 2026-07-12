@@ -4325,7 +4325,15 @@ static bool ggml_backend_ork_soft_max(ggml_backend_ork_context * ctx, struct ggm
     return true;
 }
 
+// ORK_SEG_TIME: per-op-category wall-time accounting for the segment-map table (measured, not estimated).
+enum { SEG_QKV, SEG_QKT, SEG_SM, SEG_AV, SEG_O, SEG_FFN, SEG_OTH, SEG_N };
+static double g_seg_us[SEG_N]; static long g_seg_n[SEG_N]; static int g_segtime = -1;
+static const char * g_seg_name[SEG_N] = { "QKV proj", "QK^T scores", "softmax", "A.V", "O proj", "FFN gate/up/GLU/down", "other mul_mat" };
+static inline double ork_seg_t0(void) { return g_segtime > 0 ? (double) ggml_time_us() : 0.0; }
+static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_us[cat] += (double) ggml_time_us() - t0; g_seg_n[cat]++; } }
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START graph_compute, %d nodes\n", cgraph->n_nodes); fflush(stderr);
@@ -4409,7 +4417,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             if (getenv("ORK_VERBOSE") && node->src[0] && strstr(node->src[0]->name, "ffn_gate"))
                 fprintf(stderr, "[FFN-CHAIN match] node %d %s -> matched=%d\n", i, node->src[0]->name, matched);
             if (matched) {
-                if (ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn)) {
+                double _tf = ork_seg_t0();
+                bool _fok = ggml_backend_ork_ffn_swiglu_chain(ctx, g, u, gl, dn);
+                ork_seg_add(SEG_FFN, _tf);
+                if (_fok) {
                     i = last;  // fused OK: skip past gate/up/GLU/down — all handled by the chain
                     continue;
                 }
@@ -4431,7 +4442,9 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 // where the batched attention matmuls run clean on the NPU.
                 static const int ork_attn = getenv("ORK_ATTN") != nullptr;
                 if (ork_attn && (node->ne[2] > 1 || node->ne[3] > 1) && node->ne[1] > 1) {
+                    double _t = ork_seg_t0();
                     if (!ggml_backend_ork_bmm_fp16(ctx, node)) return GGML_STATUS_FAILED;
+                    ork_seg_add((node->src[0]->name && strstr(node->src[0]->name, "cache_v")) ? SEG_AV : SEG_QKT, _t);
                     break;
                 }
                 std::vector<struct ggml_tensor *> chain_nodes;
@@ -4466,6 +4479,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     }
                 }
 
+                double _tg = ork_seg_t0();
                 if (chain_nodes.size() >= 2) {
                     bool chain_ok = false;
                     if (type == ORK_CHAIN_I8) {
@@ -4536,6 +4550,11 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         }
                     }
                 }
+                { const char * nm = node->src[0] ? node->src[0]->name : "";
+                  int cat = (strstr(nm,"attn_q")||strstr(nm,"attn_k")||strstr(nm,"attn_v")) ? SEG_QKV
+                          : strstr(nm,"attn_output") ? SEG_O
+                          : strstr(nm,"ffn_") ? SEG_FFN : SEG_OTH;
+                  ork_seg_add(cat, _tg); }
                 break;
             }
             case GGML_OP_MUL_MAT_ID: {
@@ -4560,7 +4579,9 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 break;
             }
             case GGML_OP_SOFT_MAX: {   // 2b: attention softmax — exp on the NPU (supports_op gates the claimed cases)
+                double _t = ork_seg_t0();
                 if (!ggml_backend_ork_soft_max(ctx, node)) return GGML_STATUS_FAILED;
+                ork_seg_add(SEG_SM, _t);
                 break;
             }
             case GGML_OP_NONE:
@@ -4573,6 +4594,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
+    if (g_segtime > 0) { static long _c = 0; if (++_c % 40 == 0) {
+        double tot = 0; for (int k = 0; k < SEG_N; k++) tot += g_seg_us[k];
+        fprintf(stderr, "[ORK SEG-TIME] cumulative NPU-op wall over %ld graphs (warmup+prefill dominate):\n", _c);
+        for (int k = 0; k < SEG_N; k++) if (g_seg_n[k])
+            fprintf(stderr, "  %-24s %8.1f ms (%5.1f%%) n=%ld\n", g_seg_name[k], g_seg_us[k]/1000.0, 100.0*g_seg_us[k]/(tot+1e-9), g_seg_n[k]);
+    } }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
 }
