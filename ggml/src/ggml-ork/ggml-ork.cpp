@@ -4270,7 +4270,11 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
         float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
         for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rd(src0, s0, j);
         for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rd(src1, s1, j);
-        if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) return false;
+        if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] %s x %s  M=%d K=%d N=%d  head(%lld,%lld)/(%lld,%lld) s0t=%d s1t=%d\n",
+                src0->name, src1->name, M, K, N, (long long)i2,(long long)i3,(long long)ne2,(long long)ne3, src0->type, src1->type);
+        if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) {
+            if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ WEDGED on the above call\n");
+            return false; }
         for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
     }
     return true;
@@ -4375,8 +4379,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
                 // ORK_ATTN: batched/dynamic matmul (attention QKᵀ·V, GDN chunked) -> ork_bmm_fp16.
+                // PREFILL-ONLY (M = dst->ne[1] > 1): the M=1 DECODE A·V wedges in-graph after prefill (a
+                // post-prefill IOVA/state issue — the fp16 bmm is bit-correct at M=1 in isolation, confirmed
+                // by tools/bmm_probe; only the in-graph decode call faults). Decode attention stays on CPU
+                // (it's the CPU path anyway — see decode-is-cpu-path). The parity target is prefill (M>1),
+                // where the batched attention matmuls run clean on the NPU.
                 static const int ork_attn = getenv("ORK_ATTN") != nullptr;
-                if (ork_attn && (node->ne[2] > 1 || node->ne[3] > 1)) {
+                if (ork_attn && (node->ne[2] > 1 || node->ne[3] > 1) && node->ne[1] > 1) {
                     if (!ggml_backend_ork_bmm_fp16(ctx, node)) return GGML_STATUS_FAILED;
                     break;
                 }
