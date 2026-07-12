@@ -4360,6 +4360,52 @@ static bool ggml_backend_ork_rope_npu(ggml_backend_ork_context * ctx, struct ggm
     return true;
 }
 
+// ORK_OPS_NPU: RMSNorm on the NPU (ork_npu_rmsnorm_f16, norm-only — ggml's RMS_NORM has no weight; the
+// weight is a separate MUL). fp32 in/out, contiguous, ne[0] a multiple of 8.
+static bool ggml_backend_ork_rmsnorm_npu(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
+    const struct ggml_tensor * x = node->src[0];
+    if (!x || x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
+    const int n = (int) x->ne[0]; const int64_t M = ggml_nrows(x);
+    if (n < 8 || (n & 7)) return false;
+    float eps = 1e-6f; memcpy(&eps, node->op_params, sizeof(float));
+    std::vector<ork_f16> xh((size_t) M*n), oh((size_t) M*n), w((size_t) n, (ork_f16) 1.0f);
+    const float * xf = (const float *) x->data;
+    for (size_t j = 0; j < (size_t) M*n; j++) xh[j] = (ork_f16) xf[j];
+    if (ork_npu_rmsnorm_f16(ctx->npu, (int) M, n, xh.data(), w.data(), eps, oh.data())) return false;
+    float * of = (float *) node->data;
+    for (size_t j = 0; j < (size_t) M*n; j++) of[j] = (float) oh[j];
+    return true;
+}
+
+// ORK_OPS_NPU: elementwise MUL (norm-weight, broadcast-aware) / ADD (residual) on the NPU. src1 may broadcast
+// over src0 (norm-weight w[n]); ggml modulo-broadcast into the fp16 operand. fp32 in/out, ne[0] mult of 8.
+static bool ggml_backend_ork_binop_npu(ggml_backend_ork_context * ctx, struct ggml_tensor * node, bool is_add) {
+    const struct ggml_tensor * a = node->src[0]; const struct ggml_tensor * b = node->src[1];
+    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(node)) return false;
+    const int n = (int) node->ne[0]; const int64_t M = ggml_nrows(node); const size_t ne = (size_t) M*n;
+    if (n < 8 || (n & 7)) return false;
+    std::vector<ork_f16> ah(ne), bh(ne), oh(ne);
+    const float * af = (const float *) a->data;
+    for (size_t j = 0; j < ne; j++) ah[j] = (ork_f16) af[j];
+    if (ggml_are_same_shape(a, b) && ggml_is_contiguous(b)) {
+        const float * bf = (const float *) b->data; for (size_t j = 0; j < ne; j++) bh[j] = (ork_f16) bf[j];
+    } else {   // modulo-broadcast b over node's shape
+        for (int64_t i3 = 0; i3 < node->ne[3]; i3++) for (int64_t i2 = 0; i2 < node->ne[2]; i2++)
+        for (int64_t i1 = 0; i1 < node->ne[1]; i1++) for (int64_t i0 = 0; i0 < node->ne[0]; i0++) {
+            const size_t oi = (((size_t) i3*node->ne[2] + i2)*node->ne[1] + i1)*node->ne[0] + i0;
+            const float * bp = (const float *) ((const char *) b->data + (i3 % b->ne[3])*b->nb[3]
+                + (i2 % b->ne[2])*b->nb[2] + (i1 % b->ne[1])*b->nb[1] + (i0 % b->ne[0])*b->nb[0]);
+            bh[oi] = (ork_f16) *bp;
+        }
+    }
+    int rc = is_add ? ork_npu_add_f16(ctx->npu, ah.data(), bh.data(), (int) M, n, oh.data(), NULL)
+                    : ork_npu_ewmul_f16(ctx->npu, ah.data(), bh.data(), (int) M, n, oh.data(), NULL);
+    if (rc) return false;
+    float * of = (float *) node->data; for (size_t j = 0; j < ne; j++) of[j] = (float) oh[j];
+    return true;
+}
+
 static bool ork_cpu_delegate_node(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
     if (!ctx->cpu_backend) { ctx->cpu_backend = ggml_backend_cpu_init(); if (ctx->cpu_backend) ggml_backend_cpu_set_n_threads(ctx->cpu_backend, 4); }
     if (!ctx->cpu_backend) return false;
@@ -4677,11 +4723,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (!ggml_backend_ork_mul_mat_id_i8(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
-            case GGML_OP_MUL: {   // ORK_CLAIM_OPS -> CPU-delegate (handles broadcast norm-weight); else the NPU ewmul
+            case GGML_OP_MUL: {   // ORK_OPS_NPU -> NPU ewmul (broadcast-aware); ORK_CLAIM_OPS -> CPU-delegate; else NPU ewmul
+                if (getenv("ORK_OPS_NPU") && ggml_backend_ork_binop_npu(ctx, node, false)) break;
                 if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
-            case GGML_OP_ADD: {   // ORK_CLAIM_OPS -> CPU-delegate (residual); else the NPU add
+            case GGML_OP_ADD: {   // residual add: fp16 accumulates error over layers -> OPT-IN only (ORK_OPS_NPU_ADD);
+                                  // default keeps it fp32 (delegate). ORK_CLAIM_OPS -> CPU-delegate; else NPU add.
+                if (getenv("ORK_OPS_NPU_ADD") && ggml_backend_ork_binop_npu(ctx, node, true)) break;
                 if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
@@ -4704,7 +4753,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             case GGML_OP_ROPE: {   // #1: claimed boundary op. ORK_OPS_NPU -> run RoPE on the NPU
                                    // (ork_npu_rope_neox_f16); else CPU-delegate (keeps the layer one ork subgraph).
                 bool done = false;
-                if (getenv("ORK_OPS_NPU") && node->op == GGML_OP_ROPE) done = ggml_backend_ork_rope_npu(ctx, node);
+                if (getenv("ORK_OPS_NPU")) done = (node->op == GGML_OP_ROPE) ? ggml_backend_ork_rope_npu(ctx, node)
+                                                                              : ggml_backend_ork_rmsnorm_npu(ctx, node);
                 if (!done && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
