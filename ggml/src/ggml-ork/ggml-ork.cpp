@@ -253,6 +253,12 @@ struct ggml_backend_ork_context {
     std::vector<float>    as;    // per-row activation scale [M]
     std::vector<int32_t>  ci;    // int32 matmul result [M*N] before dequant
     std::vector<float>    arot;  // rotated activation row [K] scratch (Hadamard int4 path)
+    // Static-graph DMA scratch (ORK_GU_CHAIN): NPU-coherent, alloc-once/grow buffers for the FFN segment's
+    // shared int8 input + the gate/up int32 outputs. Passing these to run_chain_i8 makes dma_find HIT, so it
+    // skips the per-task bcreate/memcpy/bsync/bdestroy (the ioctl bulk) and dedups the shared-input sync.
+    void * dma_in = nullptr;  size_t dma_in_sz = 0;
+    void * dma_up = nullptr;  size_t dma_up_sz = 0;
+    void * dma_gt = nullptr;  size_t dma_gt_sz = 0;
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
@@ -2177,6 +2183,9 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
             ctx->spool_remaps, ctx->spool_iova_unmaps, ctx->spool_ram_evicts);
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
+    if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
+    if (ctx->dma_up) ork_dma_free(ctx->npu, ctx->dma_up);
+    if (ctx->dma_gt) ork_dma_free(ctx->npu, ctx->dma_gt);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
@@ -3797,6 +3806,16 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
 //   down:  ork_mm_run_i8      (down matmul, int8-in)                              -> down_i32[M,Kd]
 // then dequant down -> dst fp32. PER-TENSOR scales throughout (the fused SiLU stage's scalar R can't carry
 // per-row/per-channel). CPU fp32 fallback (recompute the whole inner) on ANY error, so output is always valid.
+// Grow a cached NPU-coherent DMA scratch buffer to at least `need` bytes (alloc-once / realloc-on-growth).
+// Returns the buffer (registered in ork-driver's zero-copy table so dma_find resolves it), or nullptr.
+static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need) {
+    if (*buf && *sz >= need) return *buf;
+    if (*buf) ork_dma_free(npu, *buf);
+    *buf = ork_dma_alloc(npu, need);
+    *sz  = *buf ? need : 0;
+    return *buf;
+}
+
 static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         struct ggml_tensor * gate_n, struct ggml_tensor * up_n,
         struct ggml_tensor * glu_n, struct ggml_tensor * down_n) {
@@ -3978,19 +3997,25 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg != ctx->wcache.end()) {
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
-            std::vector<int32_t> up_acc((size_t) MT*Nff), gate_acc((size_t) MT*Nff);
-            bool cok = true;
+            // Stage the shared int8 input + gate/up int32 outputs in cached NPU-coherent DMA scratch so
+            // run_chain_i8's dma_find HITS -> no per-task bcreate/memcpy/bsync/bdestroy, and the shared
+            // input syncs once (dedup). din = whole M*K input; dup/dgt = one M-tile of outputs (reused).
+            int8_t  * din = (int8_t  *) ork_dma_grow(ctx->npu, &ctx->dma_in, &ctx->dma_in_sz, (size_t) M*K);
+            int32_t * dup = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_up, &ctx->dma_up_sz, (size_t) MT*Nff*4);
+            int32_t * dgt = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_gt, &ctx->dma_gt_sz, (size_t) MT*Nff*4);
+            bool cok = (din && dup && dgt);
+            if (cok) memcpy(din, xr_i8.data(), (size_t) M*K);
             for (int m0 = 0; m0 < M && cok; m0 += MT) { int mc = std::min(MT, M - m0);
                 ork_mm_task_i8 t2[2] = {
-                    { owu.w, mc, xr_i8.data() + (size_t) m0*K, up_acc.data() },
-                    { owg.w, mc, xr_i8.data() + (size_t) m0*K, gate_acc.data() } };
+                    { owu.w, mc, din + (size_t) m0*K, dup },
+                    { owg.w, mc, din + (size_t) m0*K, dgt } };
                 if (ork_mm_run_chain_i8(ctx->npu, 2, t2)) { cok = false; break; }
-                for (int r = 0; r < mc; r++) { const int32_t * ur = up_acc.data() + (size_t) r*Nff;      // dequant up
+                for (int r = 0; r < mc; r++) { const int32_t * ur = dup + (size_t) r*Nff;                 // dequant up
                     float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
                     for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; }
                 if (fc.silu_i16) {                                                                        // on-NPU int16 SiLU on gate
                     std::vector<float> gr((size_t) mc*Nff); float gmx = 1e-9f;
-                    for (int r = 0; r < mc; r++) { const int32_t * ar = gate_acc.data() + (size_t) r*Nff; const float rs = as_x[m0+r];
+                    for (int r = 0; r < mc; r++) { const int32_t * ar = dgt + (size_t) r*Nff; const float rs = as_x[m0+r];
                         for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; gr[(size_t) r*Nff+n] = g; float a = fabsf(g); if (a > gmx) gmx = a; } }
                     double is = gmx/32000.0, os = gmx/32000.0; if (is<=0) is=1e-9; if (os<=0) os=1e-9;
                     std::vector<int16_t> in16((size_t) mc*Nff), out16((size_t) mc*Nff);
@@ -4000,7 +4025,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                     for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff;
                         for (int n = 0; n < Nff; n++) so[n] = (float) out16[(size_t) r*Nff+n] * os; }
                 } else {                                                                                  // fp32 CPU SiLU on gate
-                    for (int r = 0; r < mc; r++) { const int32_t * ar = gate_acc.data() + (size_t) r*Nff;
+                    for (int r = 0; r < mc; r++) { const int32_t * ar = dgt + (size_t) r*Nff;
                         float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
                         for (int n = 0; n < Nff; n++) { float g = (float) ar[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } }
                 }
