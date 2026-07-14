@@ -958,6 +958,20 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     if (getenv("ORK_SCHED_DBG") && tensor->op == GGML_OP_MUL_MAT_ID) fprintf(stderr,
         "[SCHED MMID] %s -> RETURN -1 (no WEIGHTS src matched)\n", tensor->name);
+
+    // Weightless-op offload: GGML_OP_GATED_DELTA_NET (Gated DeltaNet scan) has NO weights src — q/k/v/g/beta
+    // /state are all activations — so the weight-src loop above never routes it and it defaults to CPU. An
+    // ACCEL backend that positively claims it (supports_op && offload_op) still gets it, gated by op_offload.
+    // Scoped to this one op so no other weightless op's routing changes; supports_op is the safety (ork's
+    // GATED_DELTA_NET support is gated behind ORK_GDN_NPU + strict shape checks, so this is a no-op otherwise).
+    if (sched->op_offload && tensor->op == GGML_OP_GATED_DELTA_NET) {
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.woff");
+                return b;
+            }
+        }
+    }
     return -1;
 }
 

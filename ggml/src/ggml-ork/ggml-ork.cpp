@@ -4470,6 +4470,61 @@ static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
     }
 }
 
+// GGML_OP_SSM_SCAN (Mamba-2) -> ork_ssm_scan_f32 (chunked mode-5: NPU pooled 3-core matmul stream + CPU
+// elementwise). Thin marshaller: srcs are contiguous fp32 + ns==1 (guaranteed by supports_op); y + s_new
+// are written into the contiguous dst ([y | s_new] at s_off). Falls back to CPU on failure.
+static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *S=dst->src[0],*X=dst->src[1],*DT=dst->src[2],*A=dst->src[3],*B=dst->src[4],*C=dst->src[5];
+    const int nc=(int)S->ne[0], nr=(int)S->ne[1], nh=(int)X->ne[1], ng=(int)B->ne[1], nt=(int)X->ne[2], ns=(int)X->ne[3];
+    const size_t s_off=(size_t)ggml_nelements(X)*sizeof(float);
+    int rc=ork_ssm_scan_f32(ctx->npu, nc,nr,nh,ng,nt,ns,
+        (const float*)S->data,(const float*)X->data,(const float*)DT->data,(const float*)A->data,
+        (const float*)B->data,(const float*)C->data,
+        (float*)dst->data,(float*)((char*)dst->data+s_off));
+    return rc==0;
+}
+
+// densify a (possibly permuted/strided) ggml tensor into ne-major contiguous fp32 (ne3 outer .. ne0 inner).
+static void gdn_densify(const struct ggml_tensor * t, float * out) {
+    const int64_t n0=t->ne[0],n1=t->ne[1],n2=t->ne[2],n3=t->ne[3];
+    const size_t b0=t->nb[0],b1=t->nb[1],b2=t->nb[2],b3=t->nb[3];
+    const char * base=(const char*)t->data;
+    for(int64_t i3=0;i3<n3;i3++)for(int64_t i2=0;i2<n2;i2++)for(int64_t i1=0;i1<n1;i1++)for(int64_t i0=0;i0<n0;i0++)
+        out[(((i3*n2+i2)*n1+i1)*n0)+i0]=*(const float*)(base+i3*b3+i2*b2+i1*b1+i0*b0);
+}
+// GGML_OP_GATED_DELTA_NET (Gated DeltaNet: Qwen3-Next / Qwen3.5 / Ornith) -> ork_gdn_scan_f32 (chunked
+// delta-rule: 6 fp16 matmul stages on the NPU fused-multicore stream + CPU forward-subst UT-transform).
+// The in-graph prefill op feeds NON-contiguous (permuted-view) q/k/v/g/beta, so densify each to ne-major
+// contiguous ([ns,nt,H,d] = the kernel layout). Two more adapters: STATE is transposed (ggml s[val*d+key]
+// = s_out[j*Sv+i]=S[i][j]; kernel [key*d+val]) and GQA key heads (Hk<=Hv, value head hv uses key head
+// hv%Hk per the CPU op) are replicated to Hv. Output o matches the kernel layout -> written to dst->data.
+// v1: GDA scalar gate, K==1 (guaranteed by supports_op). Falls back to CPU on failure.
+static bool ggml_backend_ork_gated_delta_net(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*g=dst->src[3],*b=dst->src[4],*st=dst->src[5];
+    const int d=(int)v->ne[0], Hv=(int)v->ne[1], nt=(int)v->ne[2], ns=(int)v->ne[3], Hk=(int)q->ne[1];
+    if (Hk<1 || Hv%Hk) return false;
+    const int rep=Hv/Hk;
+    const size_t nqk=(size_t)ns*nt*Hk*d, nvv=(size_t)ns*nt*Hv*d, ngb=(size_t)ns*nt*Hv, nst=(size_t)ns*Hv*(size_t)d*d;
+    float *qc=(float*)malloc(nqk*4),*kc=(float*)malloc(nqk*4),*vc=(float*)malloc(nvv*4);
+    float *gc=(float*)malloc(ngb*4),*bc=(float*)malloc(ngb*4),*sr=(float*)malloc(nst*4);
+    float *s0t=(float*)malloc(nst*4),*snt=(float*)malloc(nst*4);
+    float *qe=(rep>1)?(float*)malloc(nvv*4):qc, *ke=(rep>1)?(float*)malloc(nvv*4):kc;
+    if(!qc||!kc||!vc||!gc||!bc||!sr||!s0t||!snt||!qe||!ke){
+        free(qc);free(kc);free(vc);free(gc);free(bc);free(sr);free(s0t);free(snt); if(rep>1){free(qe);free(ke);} return false; }
+    gdn_densify(q,qc); gdn_densify(k,kc); gdn_densify(v,vc); gdn_densify(g,gc); gdn_densify(b,bc); gdn_densify(st,sr);
+    if(rep>1){ for(int s=0;s<ns;s++)for(int t=0;t<nt;t++)for(int hv=0;hv<Hv;hv++){ int hk=hv%Hk;
+        memcpy(qe+(((size_t)s*nt+t)*Hv+hv)*d, qc+(((size_t)s*nt+t)*Hk+hk)*d, (size_t)d*4);
+        memcpy(ke+(((size_t)s*nt+t)*Hv+hv)*d, kc+(((size_t)s*nt+t)*Hk+hk)*d, (size_t)d*4); } }
+    for(int s=0;s<ns;s++)for(int h=0;h<Hv;h++)for(int key=0;key<d;key++)for(int val=0;val<d;val++)   // s0 transpose
+        s0t[((size_t)(s*Hv+h)*d+key)*d+val]=sr[((size_t)(s*Hv+h)*d+val)*d+key];
+    int rc=ork_gdn_scan_f32(ctx->npu, d, Hv, nt, ns, s0t, qe, ke, vc, gc, bc, (float*)dst->data, snt);
+    if(rc==0){ float *so=(float*)dst->data+(size_t)d*Hv*nt*ns;   // state_out_base; transpose s_new back
+        for(int s=0;s<ns;s++)for(int h=0;h<Hv;h++)for(int key=0;key<d;key++)for(int val=0;val<d;val++)
+            so[((size_t)(s*Hv+h)*d+val)*d+key]=snt[((size_t)(s*Hv+h)*d+key)*d+val]; }
+    free(qc);free(kc);free(vc);free(gc);free(bc);free(sr);free(s0t);free(snt); if(rep>1){free(qe);free(ke);}
+    return rc==0;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
@@ -4756,6 +4811,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (getenv("ORK_OPS_NPU")) done = (node->op == GGML_OP_ROPE) ? ggml_backend_ork_rope_npu(ctx, node)
                                                                               : ggml_backend_ork_rmsnorm_npu(ctx, node);
                 if (!done && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_SSM_SCAN: {
+                if (!ggml_backend_ork_ssm_scan(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_GATED_DELTA_NET: {
+                if (!ggml_backend_ork_gated_delta_net(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -5321,6 +5384,38 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
             if (ork_ffn_chain_on()) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
+        }
+        case GGML_OP_SSM_SCAN: {
+            // Mode-5 on-NPU Mamba-2 scan. SIZE-GATED default (2026-07-13): wins ~2x at Q8 2.7B+ but LOSES on
+            // small Mamba-2 (130m/nh=24) & decode, so auto-enable ONLY for large models (nh>=64 ≈ >=1.5B;
+            // head_dim/d_state are fixed in the family so nh is the size proxy). ORK_SSM_NPU=1 forces on at
+            // any size (A/B), =0 forces off. Unset = auto.
+            const char *ssm_env = getenv("ORK_SSM_NPU");
+            const int ssm_force = ssm_env ? atoi(ssm_env) : -1;
+            if (ssm_force == 0) return false;
+            const struct ggml_tensor *S=op->src[0],*X=op->src[1],*A=op->src[3],*B=op->src[4];
+            if (!S||!X||!A||!B) return false;
+            const int nc=(int)S->ne[0], nr=(int)S->ne[1], nh=(int)X->ne[1], ng=(int)B->ne[1], nt=(int)X->ne[2], ns=(int)X->ne[3];
+            if (A->ne[0] != 1) return false;        // Mamba-2 scalar decay only
+            if (nt < 64 || ns != 1) return false;   // prefill single-seq (chunking worthwhile); decode/multi-seq -> CPU
+            if (nc%32 || nr%16 || nh%ng) return false;
+            if (ssm_force < 0 && nh < 64) return false;   // AUTO: small Mamba-2 (nh<64 ≈ <1.5B) stays on CPU
+            for (int k=0;k<6;k++) if (op->src[k] && !ggml_is_contiguous(op->src[k])) return false;
+            return true;
+        }
+        case GGML_OP_GATED_DELTA_NET: {
+            // Chunked Gated-DeltaNet scan (Qwen3-Next/Ornith). Opt-in (ORK_GDN_NPU) for A/B vs the CPU scan.
+            if (getenv("ORK_GDN_NPU") == nullptr) return false;
+            const struct ggml_tensor *q=op->src[0],*v=op->src[2],*g=op->src[3];
+            if (!q||!v||!g) return false;
+            const int d=(int)v->ne[0], Hv=(int)v->ne[1], nt=(int)v->ne[2], Hk=(int)q->ne[1];
+            if (ggml_get_op_params_i32(op,0) != 1) return false;   // K==1 (single state snapshot)
+            if (g->ne[0] != 1) return false;                       // GDA scalar gate (KDA vector gate -> CPU)
+            if (Hk < 1 || Hv % Hk) return false;                   // GQA groups must divide
+            if (d % 16) return false;                              // kernel N%16 constraint
+            if (nt < 64) return false;                             // prefill (chunking worthwhile); decode -> CPU
+            // srcs may be permuted views (prefill) — the marshaller densifies them; dst is always contiguous.
+            return true;
         }
         default:
             return false;
