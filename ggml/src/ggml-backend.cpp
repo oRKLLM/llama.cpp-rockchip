@@ -911,24 +911,53 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         if (src == NULL) {
             continue;
         }
+        if (getenv("ORK_SCHED_DBG") && tensor->op == GGML_OP_MUL_MAT_ID) fprintf(stderr,
+            "[SCHED MMID] %s src%d=%s buf=%p usage=%d host=%d isWEIGHTS=%d\n", tensor->name, i, src->name,
+            (void*)src->buffer, src->buffer?(int)src->buffer->usage:-1,
+            src->buffer?(int)ggml_backend_buffer_is_host(src->buffer):-1,
+            (src->buffer && src->buffer->usage==GGML_BACKEND_BUFFER_USAGE_WEIGHTS)?1:0);
         // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
         // not an ideal solution
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+            const bool offdbg = getenv("ORK_OFFDBG") && tensor->op == GGML_OP_MUL_MAT;
+            if (getenv("ORK_SCHED_DBG") && tensor->op == GGML_OP_MUL_MAT_ID) fprintf(stderr,
+                "[SCHED MMID] %s WEIGHTS src%d -> from_buffer=%d (op_offload=%d cpu_id=%d)\n",
+                tensor->name, i, src_backend_id, (int)sched->op_offload, sched->n_backends-1);
+            if (offdbg) fprintf(stderr, "[OFFDBG] %s wsrc=%s op_offload=%d src_bid=%d cpu_id=%d host=%d\n",
+                tensor->name, src->name, (int)sched->op_offload, src_backend_id, sched->n_backends-1,
+                (int)ggml_backend_buffer_is_host(src->buffer));
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                    const bool so = ggml_backend_supports_op(sched->backends[b], tensor);
+                    const bool oo = ggml_backend_offload_op(sched->backends[b], tensor);
+                    if (offdbg) fprintf(stderr, "[OFFDBG]   try b=%d(%s) supports=%d offload=%d\n",
+                        b, ggml_backend_name(sched->backends[b]), (int)so, (int)oo);
+                    if (so && oo) {
                         SET_CAUSE(tensor, "1.off");
+                        if (offdbg) fprintf(stderr, "[OFFDBG]   -> OFFLOAD to b=%d\n", b);
                         return b;
                     }
                 }
+            }
+            if (offdbg) fprintf(stderr, "[OFFDBG]   -> return src_bid=%d (1.wgt, no offload)\n", src_backend_id);
+            // Don't pin an op to its weight's backend if that backend can't actually run the op.
+            // Normal GPU backends always support the ops whose weights they hold, so this is a no-op
+            // for them. But a matmul-only ACCEL backend (ggml-ork) can *hold* weights it cannot
+            // compute on — e.g. RMSNorm weights, or wide matmuls it rejected in supports_op — and
+            // without this guard those ops get force-assigned to it and graph_compute fails (-1).
+            if (!ggml_backend_supports_op(sched->backends[src_backend_id], tensor)) {
+                if (offdbg) fprintf(stderr, "[OFFDBG]   -> SKIP wgt-pin (backend %d can't run this op), fall through\n", src_backend_id);
+                continue;
             }
             SET_CAUSE(tensor, "1.wgt%d", i);
             return src_backend_id;
         }
     }
 
+    if (getenv("ORK_SCHED_DBG") && tensor->op == GGML_OP_MUL_MAT_ID) fprintf(stderr,
+        "[SCHED MMID] %s -> RETURN -1 (no WEIGHTS src matched)\n", tensor->name);
     return -1;
 }
 
