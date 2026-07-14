@@ -4494,6 +4494,88 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
     return rc==0;
 }
 
+// GGML_OP_FLASH_ATTN_EXT -> fused attention on the NPU. Batched QK^T + A·V via the fused-multicore fp16
+// stream (ONE submit each for all heads — slashes the per-op submit floor that sank the per-op path),
+// softmax on CPU (scale+mask). Persistent scratch pool (no per-op bcreate/import -> no IOVA OOM). GQA-aware.
+// Materializes scores (mathematically == the online CPU flash form). nkv padded to %32 (pad cols masked out).
+// v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
+// the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
+struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav;
+    ork_f16 *Qf, *KT, *Vf, *Pf; float *scores, *outf; ork_mm_task_f16 *tk; };
+static struct ork_attn_pool g_attnp = {0,0,0,0,0,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+static void attn_pool_free(ork_npu * c) {
+    struct ork_attn_pool * P = &g_attnp;
+    if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); }
+    free(P->wqk); free(P->wav); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->scores); free(P->outf); free(P->tk);
+    *P = (struct ork_attn_pool){0,0,0,0,0,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+}
+static int attn_pool_ensure(ork_npu * c, int DK, int DV, int N, int nkvp, int H) {
+    struct ork_attn_pool * P = &g_attnp;
+    if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return 0;   // warm reuse
+    attn_pool_free(c);
+    P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*));
+    if (!P->wqk || !P->wav) { attn_pool_free(c); return -1; }
+    for (int h=0; h<H; h++) { P->wqk[h] = ork_mm_f16_scratch(c, DK, nkvp); P->wav[h] = ork_mm_f16_scratch(c, nkvp, DV);
+        if (!P->wqk[h] || !P->wav[h]) { P->H=H; attn_pool_free(c); return -1; } }
+    P->Qf = (ork_f16*)malloc((size_t)H*N*DK*2); P->KT = (ork_f16*)malloc((size_t)H*DK*nkvp*2);
+    P->Vf = (ork_f16*)malloc((size_t)H*nkvp*DV*2); P->Pf = (ork_f16*)malloc((size_t)H*N*nkvp*2);
+    P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*N*DV*4);
+    P->tk = (ork_mm_task_f16*)malloc((size_t)H*sizeof(ork_mm_task_f16));
+    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->scores||!P->outf||!P->tk) { P->H=H; attn_pool_free(c); return -1; }
+    P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
+}
+static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
+    const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Bt=(int)q->ne[3];
+    const int nkv=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    float scale=1.0f,max_bias=0.0f,softcap=0.0f;
+    memcpy(&scale,(char*)dst->op_params+0,4); memcpy(&max_bias,(char*)dst->op_params+4,4); memcpy(&softcap,(char*)dst->op_params+8,4);
+    if (max_bias!=0.0f || softcap!=0.0f) return false;                 // v1: no ALiBi / softcap
+    if (Hkv<1 || H%Hkv) return false;
+    const int rk2 = H/Hkv;
+    const int nkvp = (nkv+31)&~31;                                     // pad KV to %32 for the fp16 stream (K%32/N%16)
+    if (DK%32 || DV%16) return false;
+    if (attn_pool_ensure(ctx->npu, DK, DV, N, nkvp, H)) return false;
+    struct ork_attn_pool * P = &g_attnp;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    for (int b=0; b<Bt; b++) {
+        // (1) densify per-head fp16 operands + QK^T weights (K^T), batched submit -> scores_h[N,nkvp] f32
+        for (int h=0; h<H; h++) { int hkv=h/rk2;
+            ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp;
+            for (int m=0;m<N;m++)  for (int e=0;e<DK;e++) Qh[(size_t)m*DK+e]=(ork_f16)rdf(q,e,m,h,b);
+            for (int e=0;e<DK;e++) for (int j=0;j<nkvp;j++) KTh[(size_t)e*nkvp+j]=(j<nkv)?(ork_f16)rdf(k,e,j,hkv,b):(ork_f16)0.0f;
+            if (ork_mm_repack_f16(ctx->npu,P->wqk[h],DK,nkvp,KTh)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wqk[h],N,Qh,P->scores+(size_t)h*N*nkvp}; }
+        if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        // (2) softmax on CPU: scale + mask, per row over real nkv; Pf pad cols = 0
+        for (int h=0; h<H; h++) {
+            const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
+            float *sc=P->scores+(size_t)h*N*nkvp; ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp;
+            for (int m=0;m<N;m++) {
+                const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
+                float mx=-INFINITY;
+                for (int j=0;j<nkv;j++){ float s=scale*sc[(size_t)m*nkvp+j] + (mp?(float)mp[j]:0.0f); sc[(size_t)m*nkvp+j]=s; if(s>mx)mx=s; }
+                float sm=0; for (int j=0;j<nkv;j++){ float e=expf(sc[(size_t)m*nkvp+j]-mx); sc[(size_t)m*nkvp+j]=e; sm+=e; }
+                float inv=(sm>0)?1.0f/sm:0.0f;
+                for (int j=0;j<nkv;j++)  Ph[(size_t)m*nkvp+j]=(ork_f16)(sc[(size_t)m*nkvp+j]*inv);
+                for (int j=nkv;j<nkvp;j++) Ph[(size_t)m*nkvp+j]=(ork_f16)0.0f;
+            }
+        }
+        // (3) A·V: densify V weights, batched submit -> out_h[N,DV] f32
+        for (int h=0; h<H; h++) { int hkv=h/rk2; ork_f16 *Vh=P->Vf+(size_t)h*nkvp*DV;
+            for (int j=0;j<nkvp;j++) for (int e=0;e<DV;e++) Vh[(size_t)j*DV+e]=(j<nkv)?(ork_f16)rdf(v,e,j,hkv,b):(ork_f16)0.0f;
+            if (ork_mm_repack_f16(ctx->npu,P->wav[h],nkvp,DV,Vh)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wav[h],N,P->Pf+(size_t)h*N*nkvp,P->outf+(size_t)h*N*DV}; }
+        if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
+        for (int h=0; h<H; h++) for (int m=0;m<N;m++) for (int e=0;e<DV;e++)
+            ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+e] = P->outf[(size_t)h*N*DV + (size_t)m*DV + e];
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
@@ -4784,6 +4866,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             }
             case GGML_OP_SSM_SCAN: {
                 if (!ggml_backend_ork_ssm_scan(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_FLASH_ATTN_EXT: {
+                if (!ggml_backend_ork_flash_attn_ext(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -5368,6 +5454,19 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if (nc%32 || nr%16 || nh%ng) return false;
             if (ssm_force < 0 && nh < 64) return false;   // AUTO: small Mamba-2 (nh<64 ≈ <1.5B) stays on CPU
             for (int k=0;k<6;k++) if (op->src[k] && !ggml_is_contiguous(op->src[k])) return false;
+            return true;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // Fused attention on the NPU (batched QK^T + A·V via fp16 stream, softmax on CPU). Opt-in ORK_ATTN.
+            if (getenv("ORK_ATTN") == nullptr) return false;
+            const struct ggml_tensor *q=op->src[0],*k=op->src[1],*v=op->src[2];
+            if (!q||!k||!v || op->src[4]) return false;              // src[4]=sinks -> CPU (v1)
+            float max_bias=0.0f, softcap=0.0f;
+            memcpy(&max_bias,(char*)op->op_params+4,4); memcpy(&softcap,(char*)op->op_params+8,4);
+            if (max_bias!=0.0f || softcap!=0.0f) return false;      // v1: no ALiBi / softcap
+            const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+            if (Hkv<1 || H%Hkv || DK%32 || DV%16) return false;
+            if (N < 64) return false;                                // prefill only; decode (N==1) -> CPU
             return true;
         }
         default:
