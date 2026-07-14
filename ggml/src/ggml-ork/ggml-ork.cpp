@@ -4261,16 +4261,19 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
     const int64_t r2_1 = src1->ne[2] ? ne2 / src1->ne[2] : 1, r3_1 = src1->ne[3] ? ne3 / src1->ne[3] : 1;
     std::vector<ork_f16> A((size_t) M * K), B((size_t) K * N);
     std::vector<float>   C((size_t) M * N);
-    auto rd = [](const struct ggml_tensor * t, const char * base, size_t j) -> float {
-        return t->type == GGML_TYPE_F16 ? (float) ((const ork_f16 *) base)[j] : ((const float *) base)[j];
+    // strided read of logical element (i0,i1) of a per-head slice — densifies non-contiguous (permuted-view)
+    // attention operands (real QK^T/A·V read permuted-Q / non-contig KV-cache views) into the packed A/B.
+    auto rds = [](const struct ggml_tensor * t, const char * base, int64_t i0, int64_t i1) -> float {
+        const char * p = base + i0 * t->nb[0] + i1 * t->nb[1];
+        return t->type == GGML_TYPE_F16 ? (float) *(const ork_f16 *) p : *(const float *) p;
     };
     for (int64_t i3 = 0; i3 < ne3; i3++)
     for (int64_t i2 = 0; i2 < ne2; i2++) {
         const char * s0 = (const char *) src0->data + (i2 / r2_0) * src0->nb[2] + (i3 / r3_0) * src0->nb[3];
         const char * s1 = (const char *) src1->data + (i2 / r2_1) * src1->nb[2] + (i3 / r3_1) * src1->nb[3];
         float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
-        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rd(src0, s0, j);
-        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rd(src1, s1, j);
+        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j % K, j / K);   // src0 [K,N]
+        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
         if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] %s x %s  M=%d K=%d N=%d  head(%lld,%lld)/(%lld,%lld) s0t=%d s1t=%d\n",
                 src0->name, src1->name, M, K, N, (long long)i2,(long long)i3,(long long)ne2,(long long)ne3, src0->type, src1->type);
         if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) {
@@ -5119,8 +5122,10 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                     // dynamic KV-cache operand fall into the int8 static-weight resolve path (which packs it
                     // as a weight -> "not in orkpack" slow live-convert) NOR into the M=1 in-graph A·V wedge.
                     // Decode attention is a CPU path anyway (decode-is-cpu-path); the parity target is prefill.
+                    // NOTE: contiguity NOT required — the bmm handler gathers permuted/non-contig operands
+                    // via nb[] strides (rds). This is the densify unblock: real QK^T/A·V read permuted-Q /
+                    // non-contig KV-cache views that ggml_is_contiguous previously declined.
                     return M > 1 && K % 32 == 0 && N % 16 == 0
-                        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
                         && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)
                         && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
                 }
