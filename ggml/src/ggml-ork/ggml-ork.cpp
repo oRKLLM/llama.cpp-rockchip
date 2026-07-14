@@ -4548,7 +4548,10 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             for (int e=0;e<DK;e++) for (int j=0;j<nkvp;j++) KTh[(size_t)e*nkvp+j]=(j<nkv)?(ork_f16)rdf(k,e,j,hkv,b):(ork_f16)0.0f;
             if (ork_mm_repack_f16(ctx->npu,P->wqk[h],DK,nkvp,KTh)) return false;
             P->tk[h]=(ork_mm_task_f16){P->wqk[h],N,Qh,P->scores+(size_t)h*N*nkvp}; }
-        if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        const char *dbg_e = getenv("ORK_ATTN_CPU"); const int dbg_cpu = dbg_e ? atoi(dbg_e) : 0;   // bit0=QK^T on CPU, bit1=A·V on CPU
+        if (dbg_cpu & 1) { for (int h=0;h<H;h++){ ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp; float *sc=P->scores+(size_t)h*N*nkvp;
+            for (int m=0;m<N;m++) for (int j=0;j<nkvp;j++){ float a=0; for (int e=0;e<DK;e++) a+=(float)Qh[(size_t)m*DK+e]*(float)KTh[(size_t)e*nkvp+j]; sc[(size_t)m*nkvp+j]=a; } } }
+        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
         // (2) softmax on CPU: scale + mask, per row over real nkv; Pf pad cols = 0
         for (int h=0; h<H; h++) {
             const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
@@ -4568,7 +4571,9 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             for (int j=0;j<nkvp;j++) for (int e=0;e<DV;e++) Vh[(size_t)j*DV+e]=(j<nkv)?(ork_f16)rdf(v,e,j,hkv,b):(ork_f16)0.0f;
             if (ork_mm_repack_f16(ctx->npu,P->wav[h],nkvp,DV,Vh)) return false;
             P->tk[h]=(ork_mm_task_f16){P->wav[h],N,P->Pf+(size_t)h*N*nkvp,P->outf+(size_t)h*N*DV}; }
-        if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        if (dbg_cpu & 2) { for (int h=0;h<H;h++){ ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp, *Vh=P->Vf+(size_t)h*nkvp*DV; float *o=P->outf+(size_t)h*N*DV;
+            for (int m=0;m<N;m++) for (int e=0;e<DV;e++){ float a=0; for (int j=0;j<nkvp;j++) a+=(float)Ph[(size_t)m*nkvp+j]*(float)Vh[(size_t)j*DV+e]; o[(size_t)m*DV+e]=a; } } }
+        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
         // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
         for (int h=0; h<H; h++) for (int m=0;m<N;m++) for (int e=0;e<DV;e++)
             ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+e] = P->outf[(size_t)h*N*DV + (size_t)m*DV + e];
