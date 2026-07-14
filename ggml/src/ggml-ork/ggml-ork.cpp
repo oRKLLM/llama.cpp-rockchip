@@ -4267,21 +4267,28 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
         const char * p = base + i0 * t->nb[0] + i1 * t->nb[1];
         return t->type == GGML_TYPE_F16 ? (float) *(const ork_f16 *) p : *(const float *) p;
     };
-    for (int64_t i3 = 0; i3 < ne3; i3++)
-    for (int64_t i2 = 0; i2 < ne2; i2++) {
+    // DETERMINISTIC IOVA fix: reuse ONE persistent scratch weight across all heads (repack in place per
+    // head) instead of ork_bmm_fp16's per-head ork_mm_pack (a fresh ~6MB dma-buf import + cache entry ×
+    // heads×layers -> PRIME_FD / bcreate OOM). Footprint = one K×N weight + reused A/C, constant regardless
+    // of head/layer count — same pool discipline as ork_ssm/gdn_scan. K%32/N%16 already gated by supports_op.
+    ork_w * w = ork_mm_f16_scratch(ctx->npu, K, N);
+    if (!w) return false;
+    bool ok = true;
+    for (int64_t i3 = 0; ok && i3 < ne3; i3++)
+    for (int64_t i2 = 0; ok && i2 < ne2; i2++) {
         const char * s0 = (const char *) src0->data + (i2 / r2_0) * src0->nb[2] + (i3 / r3_0) * src0->nb[3];
         const char * s1 = (const char *) src1->data + (i2 / r2_1) * src1->nb[2] + (i3 / r3_1) * src1->nb[3];
         float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
         for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j % K, j / K);   // src0 [K,N]
         for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
-        if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] %s x %s  M=%d K=%d N=%d  head(%lld,%lld)/(%lld,%lld) s0t=%d s1t=%d\n",
-                src0->name, src1->name, M, K, N, (long long)i2,(long long)i3,(long long)ne2,(long long)ne3, src0->type, src1->type);
-        if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) {
-            if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ WEDGED on the above call\n");
-            return false; }
+        if (ork_mm_repack_f16(ctx->npu, w, K, N, B.data()) || ork_mm_run(ctx->npu, w, M, A.data(), C.data())) {
+            if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ FAILED M=%d K=%d N=%d head(%lld,%lld)\n",
+                M, K, N, (long long)i2, (long long)i3);
+            ok = false; break; }
         for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
     }
-    return true;
+    ork_mm_free(ctx->npu, w);
+    return ok;
 }
 
 // 2b: attention softmax on the NPU. ggml GGML_OP_SOFT_MAX is soft_max_ext = softmax(scale*x + mask) per
