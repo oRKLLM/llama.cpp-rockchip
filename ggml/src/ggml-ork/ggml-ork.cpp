@@ -4687,19 +4687,37 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
           _t=ork_now_us();
           if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
           if(prof) a_av+=ork_now_us()-_t;
-          // (3.5) on-NPU per-channel normalize Ô[d][m] *= (1/Σ)[m], per head (1/Σ per query = per channel)
+          // (3.5) on-NPU per-channel normalize Ô[d][m]*=(1/Σ)[m]. BATCHED across heads into ONE submit:
+          // lay Ô as [DV][H*N] (channel = head*N+query) so a single per-channel scale by invS[H*N] does all
+          // heads. Falls back to per-head when H*N exceeds the op limits (>8192 or not %8).
           double _sn=ork_now_us();
-          if (sm_invf_n < N) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)N*2); sm_invf_n=N; }
-          for (int h=0; h<H; h++) { float *o=P->outf+(size_t)h*DV*N; ork_f16 *o16=P->Oh16+(size_t)h*DV*N;
-            for (size_t i=0;i<(size_t)DV*N;i++) o16[i]=(ork_f16)o[i];
-            for (int m=0;m<N;m++) sm_invf[m]=(ork_f16)P->invS[(size_t)h*N+m];
-            if (ork_npu_mul_perchan_f16(ctx->npu,o16,sm_invf,DV,N,o16,NULL)) return false; }
+          const int HN=H*N; const int batch=(HN<=8192 && (HN&7)==0);
+          if (batch) {
+            if (sm_invf_n < HN) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)HN*2); sm_invf_n=HN; }
+            #pragma omp parallel for schedule(static)
+            for (int d=0; d<DV; d++) for (int h=0;h<H;h++) for (int m=0;m<N;m++)
+              P->Oh16[(size_t)d*HN + (size_t)h*N + m] = (ork_f16)P->outf[(size_t)h*DV*N + (size_t)d*N + m];
+            for (int h=0;h<H;h++) for (int m=0;m<N;m++) sm_invf[(size_t)h*N+m]=(ork_f16)P->invS[(size_t)h*N+m];
+            if (ork_npu_mul_perchan_f16(ctx->npu,P->Oh16,sm_invf,DV,HN,P->Oh16,NULL)) return false;  // ONE submit, all heads
+          } else {
+            if (sm_invf_n < N) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)N*2); sm_invf_n=N; }
+            for (int h=0; h<H; h++) { float *o=P->outf+(size_t)h*DV*N; ork_f16 *o16=P->Oh16+(size_t)h*DV*N;
+              for (size_t i=0;i<(size_t)DV*N;i++) o16[i]=(ork_f16)o[i];
+              for (int m=0;m<N;m++) sm_invf[m]=(ork_f16)P->invS[(size_t)h*N+m];
+              if (ork_npu_mul_perchan_f16(ctx->npu,o16,sm_invf,DV,N,o16,NULL)) return false; }
+          }
           if(prof) a_smn+=ork_now_us()-_sn;
-          // (4T) scatter: dst(d,h,m,b) = Ô_norm[h][d][m]
+          // (4T) scatter: dst(d,h,m,b) = Ô_norm  (layout depends on batch vs per-head)
           _t=ork_now_us();
-          #pragma omp parallel for schedule(static)
-          for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
-            ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)h*DV*N + (size_t)d*N + m];
+          if (batch) {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
+              ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)d*HN + (size_t)h*N + m];
+          } else {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
+              ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)h*DV*N + (size_t)d*N + m];
+          }
         } else {
         // (3) A·V: densify V weights, batched submit -> out_h[N,DV] f32
         _t=ork_now_us();
