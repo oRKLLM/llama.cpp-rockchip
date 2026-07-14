@@ -4470,6 +4470,20 @@ static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
     }
 }
 
+// GGML_OP_SSM_SCAN (Mamba-2) -> ork_ssm_scan_f32 (chunked mode-5: NPU pooled 3-core matmul stream + CPU
+// elementwise). Thin marshaller: srcs are contiguous fp32 + ns==1 (guaranteed by supports_op); y + s_new
+// are written into the contiguous dst ([y | s_new] at s_off). Falls back to CPU on failure.
+static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *S=dst->src[0],*X=dst->src[1],*DT=dst->src[2],*A=dst->src[3],*B=dst->src[4],*C=dst->src[5];
+    const int nc=(int)S->ne[0], nr=(int)S->ne[1], nh=(int)X->ne[1], ng=(int)B->ne[1], nt=(int)X->ne[2], ns=(int)X->ne[3];
+    const size_t s_off=(size_t)ggml_nelements(X)*sizeof(float);
+    int rc=ork_ssm_scan_f32(ctx->npu, nc,nr,nh,ng,nt,ns,
+        (const float*)S->data,(const float*)X->data,(const float*)DT->data,(const float*)A->data,
+        (const float*)B->data,(const float*)C->data,
+        (float*)dst->data,(float*)((char*)dst->data+s_off));
+    return rc==0;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
@@ -4756,6 +4770,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (getenv("ORK_OPS_NPU")) done = (node->op == GGML_OP_ROPE) ? ggml_backend_ork_rope_npu(ctx, node)
                                                                               : ggml_backend_ork_rmsnorm_npu(ctx, node);
                 if (!done && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
+            case GGML_OP_SSM_SCAN: {
+                if (!ggml_backend_ork_ssm_scan(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
             case GGML_OP_NONE:
@@ -5321,6 +5339,24 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
             if (ork_ffn_chain_on()) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
+        }
+        case GGML_OP_SSM_SCAN: {
+            // Mode-5 on-NPU Mamba-2 scan. SIZE-GATED default (2026-07-13): wins ~2x at Q8 2.7B+ but LOSES on
+            // small Mamba-2 (130m/nh=24) & decode, so auto-enable ONLY for large models (nh>=64 ≈ >=1.5B;
+            // head_dim/d_state are fixed in the family so nh is the size proxy). ORK_SSM_NPU=1 forces on at
+            // any size (A/B), =0 forces off. Unset = auto.
+            const char *ssm_env = getenv("ORK_SSM_NPU");
+            const int ssm_force = ssm_env ? atoi(ssm_env) : -1;
+            if (ssm_force == 0) return false;
+            const struct ggml_tensor *S=op->src[0],*X=op->src[1],*A=op->src[3],*B=op->src[4];
+            if (!S||!X||!A||!B) return false;
+            const int nc=(int)S->ne[0], nr=(int)S->ne[1], nh=(int)X->ne[1], ng=(int)B->ne[1], nt=(int)X->ne[2], ns=(int)X->ne[3];
+            if (A->ne[0] != 1) return false;        // Mamba-2 scalar decay only
+            if (nt < 64 || ns != 1) return false;   // prefill single-seq (chunking worthwhile); decode/multi-seq -> CPU
+            if (nc%32 || nr%16 || nh%ng) return false;
+            if (ssm_force < 0 && nh < 64) return false;   // AUTO: small Mamba-2 (nh<64 ≈ <1.5B) stays on CPU
+            for (int k=0;k<6;k++) if (op->src[k] && !ggml_is_contiguous(op->src[k])) return false;
+            return true;
         }
         default:
             return false;
