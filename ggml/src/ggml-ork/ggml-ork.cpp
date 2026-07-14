@@ -4500,28 +4500,32 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
 // Materializes scores (mathematically == the online CPU flash form). nkv padded to %32 (pad cols masked out).
 // v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
 // the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
-struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav;
-    ork_f16 *Qf, *KT, *Vf, *Pf; float *scores, *outf; ork_mm_task_f16 *tk; };
-static struct ork_attn_pool g_attnp = {0,0,0,0,0,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav, **wet;
+    ork_f16 *Qf, *KT, *Vf, *Pf, *Oh16; float *scores, *outf, *invS; ork_mm_task_f16 *tk; };
+static struct ork_attn_pool g_attnp = {0};
 static void attn_pool_free(ork_npu * c) {
     struct ork_attn_pool * P = &g_attnp;
-    if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); }
-    free(P->wqk); free(P->wav); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->scores); free(P->outf); free(P->tk);
-    *P = (struct ork_attn_pool){0,0,0,0,0,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+    if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); if (P->wet && P->wet[h]) ork_mm_free(c, P->wet[h]); }
+    free(P->wqk); free(P->wav); free(P->wet); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->Oh16);
+    free(P->scores); free(P->outf); free(P->invS); free(P->tk);
+    *P = (struct ork_attn_pool){0};
 }
 static int attn_pool_ensure(ork_npu * c, int DK, int DV, int N, int nkvp, int H) {
     struct ork_attn_pool * P = &g_attnp;
     if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return 0;   // warm reuse
     attn_pool_free(c);
-    P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*));
-    if (!P->wqk || !P->wav) { attn_pool_free(c); return -1; }
+    P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*)); P->wet = (ork_w**)calloc(H, sizeof(ork_w*));
+    if (!P->wqk || !P->wav || !P->wet) { attn_pool_free(c); return -1; }
     for (int h=0; h<H; h++) { P->wqk[h] = ork_mm_f16_scratch(c, DK, nkvp); P->wav[h] = ork_mm_f16_scratch(c, nkvp, DV);
-        if (!P->wqk[h] || !P->wav[h]) { P->H=H; attn_pool_free(c); return -1; } }
+        P->wet[h] = ork_mm_f16_scratch(c, nkvp, N);   // transposed A·V weight = e^T[nkvp][N]
+        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; attn_pool_free(c); return -1; } }
     P->Qf = (ork_f16*)malloc((size_t)H*N*DK*2); P->KT = (ork_f16*)malloc((size_t)H*DK*nkvp*2);
     P->Vf = (ork_f16*)malloc((size_t)H*nkvp*DV*2); P->Pf = (ork_f16*)malloc((size_t)H*N*nkvp*2);
-    P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*N*DV*4);
+    P->Oh16 = (ork_f16*)malloc((size_t)H*DV*N*2);
+    P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*DV*N*4);
+    P->invS = (float*)malloc((size_t)H*N*4);
     P->tk = (ork_mm_task_f16*)malloc((size_t)H*sizeof(ork_mm_task_f16));
-    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->scores||!P->outf||!P->tk) { P->H=H; attn_pool_free(c); return -1; }
+    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(c); return -1; }
     P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
 }
 static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
@@ -4540,44 +4544,187 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
         const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
         return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    static int prof=-1; if(prof<0) prof = getenv("ORK_ATTN_PROF")?1:0;   // per-stage timing for the bottleneck flow chart
+    static double a_dqk=0,a_qk=0,a_sm=0,a_dv=0,a_av=0,a_sc=0; static long a_calls=0; double _t;
+    static double a_smp=0,a_smq=0,a_sme=0,a_smr=0,a_smn=0;                // softmax sub-steps: prep / quant / exp-NPU / reduce-NPU / normalize
+    static int16_t *sm_xi=nullptr,*sm_ei=nullptr; static float *sm_mx=nullptr,*sm_ss=nullptr; static ork_f16 *sm_e=nullptr; static size_t sm_cap=0;
+    static int8_t *sm_q8=nullptr; static size_t sm_cap2=0; static int8_t sm_maxq[8192];   // int8 scores + per-row max for on-NPU max-reduce
+    static ork_f16 *sm_invf=nullptr; static int sm_invf_n=0;   // fp16 1/Σ per-head vector for the transposed per-channel normalize
+    static ork_w *sm_ones=nullptr; static int sm_ones_n=0;               // reduce-matmul weight ones[nkvp,16] for the on-NPU Sigma
     for (int b=0; b<Bt; b++) {
         // (1) densify per-head fp16 operands + QK^T weights (K^T), batched submit -> scores_h[N,nkvp] f32
+        _t=ork_now_us();
         for (int h=0; h<H; h++) { int hkv=h/rk2;
             ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp;
             for (int m=0;m<N;m++)  for (int e=0;e<DK;e++) Qh[(size_t)m*DK+e]=(ork_f16)rdf(q,e,m,h,b);
             for (int e=0;e<DK;e++) for (int j=0;j<nkvp;j++) KTh[(size_t)e*nkvp+j]=(j<nkv)?(ork_f16)rdf(k,e,j,hkv,b):(ork_f16)0.0f;
             if (ork_mm_repack_f16(ctx->npu,P->wqk[h],DK,nkvp,KTh)) return false;
             P->tk[h]=(ork_mm_task_f16){P->wqk[h],N,Qh,P->scores+(size_t)h*N*nkvp}; }
+        if(prof) a_dqk+=ork_now_us()-_t;
         const char *dbg_e = getenv("ORK_ATTN_CPU"); const int dbg_cpu = dbg_e ? atoi(dbg_e) : 0;   // bit0=QK^T on CPU, bit1=A·V on CPU
+        _t=ork_now_us();
         if (dbg_cpu & 1) { for (int h=0;h<H;h++){ ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp; float *sc=P->scores+(size_t)h*N*nkvp;
             for (int m=0;m<N;m++) for (int j=0;j<nkvp;j++){ float a=0; for (int e=0;e<DK;e++) a+=(float)Qh[(size_t)m*DK+e]*(float)KTh[(size_t)e*nkvp+j]; sc[(size_t)m*nkvp+j]=a; } } }
         else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
-        // (2) softmax on CPU: scale + mask, per row over real nkv; Pf pad cols = 0
-        for (int h=0; h<H; h++) {
-            const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
-            float *sc=P->scores+(size_t)h*N*nkvp; ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp;
-            for (int m=0;m<N;m++) {
-                const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
-                float mx=-INFINITY;
-                for (int j=0;j<nkv;j++){ float s=scale*sc[(size_t)m*nkvp+j] + (mp?(float)mp[j]:0.0f); sc[(size_t)m*nkvp+j]=s; if(s>mx)mx=s; }
-                float sm=0; for (int j=0;j<nkv;j++){ float e=expf(sc[(size_t)m*nkvp+j]-mx); sc[(size_t)m*nkvp+j]=e; sm+=e; }
-                float inv=(sm>0)?1.0f/sm:0.0f;
-                for (int j=0;j<nkv;j++)  Ph[(size_t)m*nkvp+j]=(ork_f16)(sc[(size_t)m*nkvp+j]*inv);
-                for (int j=nkv;j<nkvp;j++) Ph[(size_t)m*nkvp+j]=(ork_f16)0.0f;
+        if(prof) a_qk+=ork_now_us()-_t;
+        // (2) softmax. Default = FUSED softmax-on-NPU chain: scale+mask+max (CPU prep) -> quantize (CPU)
+        // -> exp on the NPU (ork_npu_exp_i16, ONE batched SDP submit over all H*N rows, in-line between
+        // the QK^T and A·V fp16 matmuls = in-chain precision swap) -> sum+normalize (CPU). ORK_ATTN_SM_CPU=1
+        // forces the CPU-softmax path instead. Sub-step timers exposed under ORK_ATTN_PROF.
+        static int sm_npu=-1; if(sm_npu<0) sm_npu = getenv("ORK_ATTN_SM_CPU")?0:1;
+        static int tnorm=-1; if(tnorm<0) tnorm = getenv("ORK_ATTN_TNORM_OFF")?0:1;  // transposed on-NPU normalize (A·V transposed + per-channel 1/Σ)
+        int tnorm_ok=0;
+        _t=ork_now_us();
+        if (sm_npu) {
+            const int MR=H*N; const size_t NB=(size_t)MR*nkvp;
+            if (sm_cap < NB) { free(sm_xi); free(sm_ei); free(sm_mx); free(sm_e); free(sm_ss);
+                sm_xi=(int16_t*)malloc(NB*2); sm_ei=(int16_t*)malloc(NB*2); sm_mx=(float*)malloc((size_t)MR*4);
+                sm_e=(ork_f16*)malloc(NB*2); sm_ss=(float*)malloc(NB*4); sm_cap=NB; }
+            // 2a: scale+mask into scores; per-row max ON NPU (ork_npu_row_max_i8, coarse int8 => softmax
+            // max-invariant so exact-enough); then global min-delta lo. ORK_ATTN_MAX_CPU=1 forces CPU max.
+            static int max_npu=-1; if(max_npu<0) max_npu = getenv("ORK_ATTN_MAX_CPU")?0:1;
+            double _p=ork_now_us(); float lo=0.0f; const int MR2=H*N;
+            // pass 1: scale+mask into scores (mask is data-dependent -> CPU)
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) {
+                const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
+                float *sc=P->scores+(size_t)h*N*nkvp;
+                for (int m=0;m<N;m++){ const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
+                    for (int j=0;j<nkv;j++) sc[(size_t)m*nkvp+j]=scale*sc[(size_t)m*nkvp+j]+(mp?(float)mp[j]:0.0f); }
+            }
+            int have_npu_max=0;
+            if (max_npu && MR2<=8192) {                          // per-row max on the NPU (coarse int8)
+                if (sm_cap2 < NB) { free(sm_q8); sm_q8=(int8_t*)malloc(NB); sm_cap2=NB; }
+                int8_t *maxq=sm_maxq;                             // MR2<=8192
+                #pragma omp parallel for schedule(static)
+                for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; int8_t *q=sm_q8+(size_t)r*nkvp;
+                    for (int j=0;j<nkv;j++){ float s=sc[j]; q[j]=(int8_t)(s<-127.f?-128:s>127.f?127:(int)lrintf(s)); }
+                    for (int j=nkv;j<nkvp;j++) q[j]=-128; }
+                if (ork_npu_row_max_i8(ctx->npu, sm_q8, MR2, nkvp, maxq, NULL)==0){
+                    for (int r=0;r<MR2;r++) sm_mx[r]=(float)maxq[r]; have_npu_max=1; }
+            }
+            if (!have_npu_max) {                                 // CPU max fallback (batch too big, or forced)
+                #pragma omp parallel for schedule(static)
+                for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; float mx=-INFINITY;
+                    for (int j=0;j<nkv;j++) if(sc[j]>mx)mx=sc[j]; sm_mx[r]=mx; }
+            }
+            // global min-delta lo (for the exp int16 quant scale)
+            #pragma omp parallel for schedule(static) reduction(min:lo)
+            for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; float mx=sm_mx[r];
+                for (int j=0;j<nkv;j++){ float d=sc[j]-mx; if(d<lo)lo=d; } }
+            if(prof) a_smp+=ork_now_us()-_p;
+            double in_scale=(-lo)/32000.0; if(in_scale<=0) in_scale=1e-6; double out_scale=1.0/32000.0;
+            // 2b: quantize (x-max) -> int16; masked/pad cols -> -32768 (exp ~ 0)
+            double _q=ork_now_us();
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int m=0;m<N;m++){ float *sc=P->scores+((size_t)h*N+m)*nkvp; int16_t *xi=sm_xi+((size_t)h*N+m)*nkvp; float mx=sm_mx[(size_t)h*N+m];
+                for (int j=0;j<nkv;j++){ long qv=lround((sc[j]-mx)/in_scale); if(qv<-32768)qv=-32768; if(qv>32767)qv=32767; xi[j]=(int16_t)qv; }
+                for (int j=nkv;j<nkvp;j++) xi[j]=-32768; }
+            if(prof) a_smq+=ork_now_us()-_q;
+            // 2c: exp on the NPU (single batched SDP submit, in-chain between the two matmuls)
+            double _e=ork_now_us();
+            int erc = ork_npu_exp_i16(ctx->npu, sm_xi, MR, nkvp, in_scale, out_scale, sm_ei, NULL);
+            if(prof) a_sme+=ork_now_us()-_e;
+            // 2c2: Sigma over the row ON the NPU via reduce-matmul e . ones[nkvp,16] (sum in col 0).
+            // Everything-on-NPU: exp (SDP) -> sum (reduce-matmul) both on device; only max (2a) + the
+            // per-row divide (2d) remain CPU. ORK_ATTN_SM_SUMCPU=1 keeps the sum on CPU for A/B.
+            static int sumnpu=-1; if(sumnpu<0) sumnpu = getenv("ORK_ATTN_SM_SUMCPU")?0:1;
+            int rrc=-1;
+            if(!erc && sumnpu){
+                if(sm_ones_n!=nkvp){ if(sm_ones) ork_mm_free(ctx->npu,sm_ones);
+                    ork_f16 *on=(ork_f16*)malloc((size_t)nkvp*16*2); for(size_t i=0;i<(size_t)nkvp*16;i++) on[i]=(ork_f16)1.0f;
+                    sm_ones=ork_mm_pack(ctx->npu,nkvp,16,on); free(on); sm_ones_n=nkvp; }
+                double _r=ork_now_us();
+                // exp output ei (int16) -> fp16 e for the reduce matmul; pad cols already ~0 (exp of -32768)
+                #pragma omp parallel for schedule(static)
+                for (size_t i=0;i<(size_t)MR*nkvp;i++) sm_e[i]=(ork_f16)((double)sm_ei[i]*out_scale);
+                if(sm_ones) rrc = ork_mm_run(ctx->npu, sm_ones, MR, sm_e, sm_ss);   // sm_ss[MR,16], col0 = Sigma
+                if(prof) a_smr+=ork_now_us()-_r;
+            }
+            // 2d: normalize -> Pf (pad cols 0). Sigma from NPU reduce (sm_ss) if it ran, else CPU sum.
+            double _n=ork_now_us();
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int m=0;m<N;m++){ size_t r=(size_t)h*N+m; float *sc=P->scores+r*nkvp; int16_t *ei=sm_ei+r*nkvp; ork_f16 *Ph=P->Pf+r*nkvp; float mx=sm_mx[r];
+                double sum;
+                if(!rrc){ sum=sm_ss[r*16]; for (int j=0;j<nkv;j++) sc[j]=(float)((double)ei[j]*out_scale); }        // Sigma on NPU
+                else if(!erc){ sum=0; for (int j=0;j<nkv;j++){ double e=(double)ei[j]*out_scale; sc[j]=(float)e; sum+=e; } } // exp NPU, sum CPU
+                else { sum=0; for (int j=0;j<nkv;j++){ float e=expf(sc[j]-mx); sc[j]=e; sum+=e; } }                  // full CPU fallback
+                float inv=(sum>0)?1.0f/(float)sum:0.0f;
+                P->invS[r]=inv;                                    // for the transposed on-NPU normalize (1/Σ per query)
+                for (int j=0;j<nkv;j++)  Ph[j]=(ork_f16)(sc[j]*inv);
+                for (int j=nkv;j<nkvp;j++) Ph[j]=(ork_f16)0.0f; }
+            if(prof) a_smn+=ork_now_us()-_n;
+            tnorm_ok = tnorm && !erc && !rrc;   // transposed path needs unnormalized exp (sm_e) + Σ (sm_ss) from NPU
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) {
+                const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
+                float *sc=P->scores+(size_t)h*N*nkvp; ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp;
+                for (int m=0;m<N;m++) {
+                    const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
+                    float mx=-INFINITY;
+                    for (int j=0;j<nkv;j++){ float s=scale*sc[(size_t)m*nkvp+j] + (mp?(float)mp[j]:0.0f); sc[(size_t)m*nkvp+j]=s; if(s>mx)mx=s; }
+                    float sm=0; for (int j=0;j<nkv;j++){ float e=expf(sc[(size_t)m*nkvp+j]-mx); sc[(size_t)m*nkvp+j]=e; sm+=e; }
+                    float inv=(sm>0)?1.0f/sm:0.0f;
+                    for (int j=0;j<nkv;j++)  Ph[(size_t)m*nkvp+j]=(ork_f16)(sc[(size_t)m*nkvp+j]*inv);
+                    for (int j=nkv;j<nkvp;j++) Ph[(size_t)m*nkvp+j]=(ork_f16)0.0f;
+                }
             }
         }
+        if(prof) a_sm+=ork_now_us()-_t;
+        if (tnorm_ok) {
+          // (3T) TRANSPOSED A·V: Ô[DV][N] = V^T[DV][nkvp] · e^T[nkvp][N] (queries become the output channel);
+          // weight = e^T (repack per head, from unnormalized exp sm_e), activation = V^T (densified transposed).
+          _t=ork_now_us();
+          for (int h=0; h<H; h++) { int hkv=h/rk2;
+            ork_f16 *VT=P->Vf+(size_t)h*DV*nkvp;                                 // V^T[DV][nkvp] activation
+            for (int d=0;d<DV;d++) for (int j=0;j<nkvp;j++) VT[(size_t)d*nkvp+j]=(j<nkv)?(ork_f16)rdf(v,d,j,hkv,b):(ork_f16)0.0f;
+            ork_f16 *eT=P->Pf+(size_t)h*N*nkvp, *es=sm_e+(size_t)h*N*nkvp;        // reuse Pf slot as e^T[nkvp][N]
+            for (int j=0;j<nkvp;j++) for (int m=0;m<N;m++) eT[(size_t)j*N+m]=es[(size_t)m*nkvp+j];
+            if (ork_mm_repack_f16(ctx->npu,P->wet[h],nkvp,N,eT)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wet[h],DV,VT,P->outf+(size_t)h*DV*N}; } // C[DV][N] = Ô
+          if(prof) a_dv+=ork_now_us()-_t;
+          _t=ork_now_us();
+          if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+          if(prof) a_av+=ork_now_us()-_t;
+          // (3.5) on-NPU per-channel normalize Ô[d][m] *= (1/Σ)[m], per head (1/Σ per query = per channel)
+          double _sn=ork_now_us();
+          if (sm_invf_n < N) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)N*2); sm_invf_n=N; }
+          for (int h=0; h<H; h++) { float *o=P->outf+(size_t)h*DV*N; ork_f16 *o16=P->Oh16+(size_t)h*DV*N;
+            for (size_t i=0;i<(size_t)DV*N;i++) o16[i]=(ork_f16)o[i];
+            for (int m=0;m<N;m++) sm_invf[m]=(ork_f16)P->invS[(size_t)h*N+m];
+            if (ork_npu_mul_perchan_f16(ctx->npu,o16,sm_invf,DV,N,o16,NULL)) return false; }
+          if(prof) a_smn+=ork_now_us()-_sn;
+          // (4T) scatter: dst(d,h,m,b) = Ô_norm[h][d][m]
+          _t=ork_now_us();
+          #pragma omp parallel for schedule(static)
+          for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
+            ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)h*DV*N + (size_t)d*N + m];
+        } else {
         // (3) A·V: densify V weights, batched submit -> out_h[N,DV] f32
+        _t=ork_now_us();
         for (int h=0; h<H; h++) { int hkv=h/rk2; ork_f16 *Vh=P->Vf+(size_t)h*nkvp*DV;
             for (int j=0;j<nkvp;j++) for (int e=0;e<DV;e++) Vh[(size_t)j*DV+e]=(j<nkv)?(ork_f16)rdf(v,e,j,hkv,b):(ork_f16)0.0f;
             if (ork_mm_repack_f16(ctx->npu,P->wav[h],nkvp,DV,Vh)) return false;
             P->tk[h]=(ork_mm_task_f16){P->wav[h],N,P->Pf+(size_t)h*N*nkvp,P->outf+(size_t)h*N*DV}; }
+        if(prof) a_dv+=ork_now_us()-_t;
+        _t=ork_now_us();
         if (dbg_cpu & 2) { for (int h=0;h<H;h++){ ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp, *Vh=P->Vf+(size_t)h*nkvp*DV; float *o=P->outf+(size_t)h*N*DV;
             for (int m=0;m<N;m++) for (int e=0;e<DV;e++){ float a=0; for (int j=0;j<nkvp;j++) a+=(float)Ph[(size_t)m*nkvp+j]*(float)Vh[(size_t)j*DV+e]; o[(size_t)m*DV+e]=a; } } }
         else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        if(prof) a_av+=ork_now_us()-_t;
         // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
+        _t=ork_now_us();
+        #pragma omp parallel for schedule(static)
         for (int h=0; h<H; h++) for (int m=0;m<N;m++) for (int e=0;e<DV;e++)
             ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+e] = P->outf[(size_t)h*N*DV + (size_t)m*DV + e];
+        }
+        if(prof) a_sc+=ork_now_us()-_t;
     }
+    if(prof){ a_calls++; fprintf(stderr,
+        "[attnprof] calls=%ld  dqk=%.0f qk=%.0f | SM=%.0f [prep=%.0f quant=%.0f exp-NPU=%.0f red-NPU=%.0f norm=%.0f] | dv=%.0f av=%.0f sc=%.0f  total=%.0f ms | NPU(qk+av+exp+red)=%.0f CPU=%.0f\n",
+        a_calls, a_dqk/1e3,a_qk/1e3, a_sm/1e3, a_smp/1e3,a_smq/1e3,a_sme/1e3,a_smr/1e3,a_smn/1e3, a_dv/1e3,a_av/1e3,a_sc/1e3,
+        (a_dqk+a_qk+a_sm+a_dv+a_av+a_sc)/1e3, (a_qk+a_av+a_sme+a_smr)/1e3, (a_dqk+a_smp+a_smq+a_smn+a_dv+a_sc)/1e3); }
     return true;
 }
 
