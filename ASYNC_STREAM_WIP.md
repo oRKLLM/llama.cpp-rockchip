@@ -133,6 +133,26 @@ with the CPU draft. This stacks on the earlier obstacles:
 The primitive (Slices 1+2) is built, correct, and characterized; it's waiting on a consumer whose NPU half
 is prefill-scale. Recommend pivoting the consumer, or parking until batch-serving is prioritized.
 
+## TREE ATTENTION assessment (does it rescue Slice 3?) — clears the gate, but premise is shaky
+Tree/multi-candidate speculation (verify a 32-64+ node tree in one forward w/ a tree attention mask) makes the
+verify M>=32 -> clears the ork NPU gate. That's real. BUT the core payoff (NPU tree-verify > CPU verify) is
+UNPROVEN and the evidence leans against it at practical model sizes:
+- CPU prefill (qwen3-1.7b-q8, llama-bench, RELIABLE): ~84 t/s FLAT across pp32/64/128/256.
+- NPU: llama-bench pp32=37.9 t/s but UNRELIABLE (short-prompt + lazy-pack false-low pitfall — the reason the
+  project uses ork_bench). Clean ork_bench measurement BLOCKED: ork_bench DMA-faults on this model ("CREATE:
+  Bad address" -> compute status -1, its GDN setup path). NPU itself HEALTHY (ork_xstream matmul bit-correct).
+- Established truth (decode-is-cpu-path; NPU wins only LARGE-prefill/BIG-models) => for small-to-mid targets
+  (where spec decode is practical on 32GB), CPU is competitive-or-better even at tree scale.
+Plus tree spec is a LARGE research-grade build (tree construct + tree mask + tree KV + longest-path accept +
+rollback; llama.cpp lacks it), and the async primitive is only a SECONDARY win needing an EAGLE decoupled draft.
+=> NOT recommended speculatively. Gating fact to resolve FIRST: a clean NPU-vs-CPU verify-batch number (needs
+   ork_bench fixed on the target, or another warmed harness). Without it, tree spec is a big bet on an unproven premise.
+
+CONSISTENT THREAD (whole session): the NPU's strength is PREFILL of long prompts (big matmuls), NOT decode.
+Every decode-acceleration path (speculative/dflash/tree) fights that decode-scale work is CPU-competitive. The
+async cross-stream primitive is best where the NPU half is genuinely prefill-scale: BATCH SERVING (one request's
+prefill on NPU ‖ another request's CPU work). That is the clean consumer.
+
 ## Design implication for the consumer (pipelined dflash/spec loop, Slice 3)
 Pin the target-verify NPU worker to big cores, the draft/routing to little cores. Then target-verify(NPU) ‖
 draft-generate(CPU-on-little) overlaps free. Serialize any NPU submits from BOTH streams on g_npu_queue_mu
