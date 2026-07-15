@@ -105,6 +105,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <sched.h>
+#include <pthread.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -396,6 +399,13 @@ struct ggml_backend_ork_context {
     // MUL_MAT_ID kernel (NOT the per-expert vec_dot loop) on a compacted sub-graph. Created lazily.
     ggml_backend_t cpu_backend = nullptr;          // ggml_backend_cpu_init() (lazy)
     int      pathb_cpu_threads = 0;                // ORK_MOE_CPU_THREADS (default 4)
+    // ---- ASYNC CROSS-STREAM (ORK_ASYNC / ggml_backend_ork_graph_compute_async) ----
+    // A per-context worker thread runs the (blocking) graph_compute body so the launching stream can do CPU
+    // work while this stream's NPU submits are in flight. At most ONE in-flight job per backend. The worker
+    // holds the process-global g_npu_queue_mu (the RKNPU is single-stream) so cross-context NPU work serializes.
+    std::thread async_thr;
+    bool        async_inflight = false;
+    enum ggml_status async_status = GGML_STATUS_SUCCESS;
     // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
     // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
     // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
@@ -5060,6 +5070,42 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     } }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
+}
+
+// ---- ASYNC CROSS-STREAM SUBMIT PATH (opt-in; nothing calls these unless a consumer/harness does) ----
+// The RKNPU is single-stream (one hardware command queue), so two streams' NPU submits must serialize — but a
+// stream's CPU work overlaps another stream's NPU work for FREE (measured hidden~100%, ork-driver overlap_prof).
+// These let a driver run one context's NPU graph on a worker thread while the launching thread does other work
+// (e.g. a speculative draft's routing/sampling), then join. g_npu_queue_mu serializes the NPU across contexts;
+// the plain (synchronous) graph_compute does NOT take it, so the default make-test path is unchanged.
+static std::mutex g_npu_queue_mu;
+
+extern "C" enum ggml_status ggml_backend_ork_synchronize(ggml_backend_t backend) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight) {
+        if (ctx->async_thr.joinable()) ctx->async_thr.join();          // join = full memory barrier
+        ctx->async_inflight = false;
+    }
+    return ctx->async_status;
+}
+
+extern "C" void ggml_backend_ork_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight) ggml_backend_ork_synchronize(backend);    // one in-flight job per backend
+    ctx->async_inflight = true;
+    ctx->async_status   = GGML_STATUS_SUCCESS;
+    ctx->async_thr = std::thread([backend, cgraph, ctx]() {
+        // The NPU worker (matmul dispatch + quant/dequant) belongs on the big cores; without this it would
+        // INHERIT the launcher's affinity, so a launcher pinned elsewhere would drag the whole matmul onto
+        // slow cores. ORK_ASYNC_BIG pins it to the A76 cluster (RK3588: cores 4-7) so a concurrent CPU stream
+        // pinned to the little cores runs on disjoint cores (the core-partitioning path to free overlap).
+        if (getenv("ORK_ASYNC_BIG")) {
+            cpu_set_t s; CPU_ZERO(&s); for (int c = 4; c < 8; c++) CPU_SET(c, &s);
+            pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
+        }
+        std::lock_guard<std::mutex> lk(g_npu_queue_mu);                // single hardware queue: serialize NPU
+        ctx->async_status = ggml_backend_ork_graph_compute(backend, cgraph);
+    });
 }
 
 static struct ggml_backend_i ork_backend_i = {

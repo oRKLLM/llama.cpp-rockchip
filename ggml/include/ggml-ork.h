@@ -31,6 +31,16 @@ GGML_BACKEND_API void                ggml_backend_ork_set_hybrid(bool use_hybrid
 //   dflash:                            enable the speculative block-diffusion drafter (off by default).
 GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflash, bool silu_int8_fused);
 
+// ---- Async cross-stream submit path ----
+// Run this backend's NPU graph on a worker thread: the launch returns immediately so the caller can do CPU
+// work (e.g. a speculative draft's routing/sampling) while the NPU crunches; synchronize joins and returns the
+// graph_compute status. The RKNPU is single-stream, so concurrent NPU submits from multiple ork backends
+// SERIALIZE (one hardware queue) — the CPU halves overlap for free, the NPU halves cannot. At most ONE in-flight
+// async job per backend. Opt-in primitive for a pipelined speculative/dflash decode loop; the plain synchronous
+// path is unchanged when these are unused.
+GGML_BACKEND_API void                ggml_backend_ork_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+GGML_BACKEND_API enum ggml_status    ggml_backend_ork_synchronize(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif
