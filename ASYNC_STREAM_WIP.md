@@ -94,6 +94,26 @@ behavior-preserving for the core path, and the attention change is a mechanical 
 ORK_ATTN=1 (single-stream, safe) comparing perplexity vs ORK_ATTN=0 — NOT the synthetic harness (which needs
 its flash-attn setup debugged first). Board was recovered via HA power-cycle after the concurrent-submit wedge.
 
+## SLICE 2 VALIDATION (real model, 2026-07-15) — refactor CONFIRMED behavior-preserving
+llama-perplexity, qwen3-1.7b-q8_0, wiki_tiny, c=512, 2 chunks:
+- ORK_ATTN=0 (CPU attention, baseline): [1]222.3305 [2]58.3531
+- ORK_ATTN=1 (NPU attention), Slice-2 (per-context): [1]69867.6979 [2]159722.0777
+- ORK_ATTN=1 (NPU attention), pre-Slice-2 (old global g_attnp): [1]69867.6979 [2]159722.0777  <- BYTE-IDENTICAL
+=> Slice-2 refactor is EXACTLY behavior-preserving (identical PPL pre/post; matmul path also bit-correct).
+=> NPU attention (ORK_ATTN) is INCOHERENT (PPL ~70k vs ~222) but PRE-EXISTING — not the refactor. Matches
+   attention-on-npu-2a (WIP, off by default). So a dflash consumer's TARGET VERIFY must keep attention on CPU
+   (ORK_ATTN=0) and use the NPU only for the coherent MATMULS. Slice 3 does NOT depend on ORK_ATTN.
+
+## SLICE 3 STRUCTURAL FINDING — dflash loop is STRICTLY SEQUENTIAL (no free overlap)
+examples/dflash/dflash.cpp loop (per round): draft `llama_decode(ctx_dft)` -> verify `llama_decode(ctx_tgt)`
+(NPU matmuls) -> accept-prefix -> commit `llama_decode(ctx_tgt)`. Every step consumes the previous step's
+output, and draft(N+1) needs commit(N)'s accepted tokens. So the standard speculative loop has NO independent
+work for the async cross-stream primitive to overlap. Realizing overlap needs ASYNC-SPECULATIVE decode: the
+draft speculates block N+1 optimistically (assuming block N is accepted) DURING verify(N), rolling back the
+speculated draft on rejection. That is a research-grade decode-loop redesign (new state management + acceptance
+semantics), NOT a wiring change. => Slice 3 = that redesign, or a different consumer with genuine independent
+NPU+CPU work (batch serving of independent sequences; overlap next-request prefill with current decode).
+
 ## Design implication for the consumer (pipelined dflash/spec loop, Slice 3)
 Pin the target-verify NPU worker to big cores, the draft/routing to little cores. Then target-verify(NPU) ‖
 draft-generate(CPU-on-little) overlaps free. Serialize any NPU submits from BOTH streams on g_npu_queue_mu
