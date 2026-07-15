@@ -61,6 +61,39 @@ free again (hidden ~96%). Tradeoff: the draft on little cores is ~4× slower, so
 draft/router (fully hidden regardless) and needs a smarter split (e.g. 2 big + 2 big, or big+little mix) for
 a heavy draft-model forward. The MECHANISM is proven; the core-allocation policy is the tuning knob.
 
+## SLICE 2 (per-context attention scratch) — done + a reframing board finding (2026-07-15)
+Moved the fused-attention scratch off the process globals into the per-context struct:
+- `g_attnp` (attention pool: NPU scratch weights + QK^T/scores host buffers) -> `ctx->attnp`.
+- the 13 softmax function-`static`s -> `ctx->attn_sm` (aliased as C++ references so the 42 downstream `sm_*`
+  uses stay byte-identical + warm-reused). `bmm_fp16` was already safe (stack-local + per-ctx `ctx->npu`).
+- freed per-context in `ggml_backend_ork_free` (+ join any in-flight async worker first).
+- Compiles; matmul output still bit-correct (`ork_xstream` maxerr 0.000) => behavior-preserving.
+
+**REFRAMING FINDING (board):** the first concurrency test drove TWO ork contexts' attention graphs on two
+threads with NO serialization (raw `ggml_backend_graph_compute`). Result: **level-0 IOMMU translation fault +
+soft reset + wedge** (needed a reboot). So the binding constraint for concurrent real graphs is NOT the CPU
+scratch — it's the **single NPU hardware queue**: two contexts' submits cannot hit it concurrently. So:
+- Per-context scratch (this slice) removes the CPU-side shared-state hazard and is the PREREQUISITE for a
+  future fine-grained design, but by itself does NOT make two ork graphs safe to run concurrently.
+- Real cross-stream concurrency REQUIRES serialized NPU submits. The Slice-1 coarse `g_npu_queue_mu` provides
+  this (whole graph_compute serialized) — but then two ork graphs don't overlap at all (single queue anyway).
+- Under the coarse mutex the scratch is never touched concurrently (mutex serializes), so per-context scratch
+  only *matters* for a FINE-GRAINED design (lock just the submit ioctls, overlap the CPU/quant/softmax parts).
+- The practically useful + safe overlap is unchanged: ONE ork stream (NPU verify) ‖ another stream's NON-ork
+  CPU work (draft routing/sampling) — no concurrent ork graph_computes, so no queue collision, no scratch race.
+
+Corrected concurrency test drives the two workers through the async+mutex path (submits serialize). BUT the
+synthetic flash-attn harness (`tools/ork_xattn.cpp`) has a SETUP BUG: its CPU reference is itself garbage
+(max|.|=2400, ork=inf; the attention output for this data should be ~0.15), so it does NOT yet give a clean
+attention-correctness number on EITHER backend — the flash-attn graph/mask/layout construction is wrong, not
+the backend. Single-stream run did NOT wedge (safe); the earlier wedge was purely the raw-concurrent-submit path.
+
+**Validation status:** matmul path bit-correct post-refactor (`ork_xstream`, maxerr 0.000) => the refactor is
+behavior-preserving for the core path, and the attention change is a mechanical per-context storage move
+(references, identical warm-reuse). The attention path itself is best validated by a REAL MODEL run with
+ORK_ATTN=1 (single-stream, safe) comparing perplexity vs ORK_ATTN=0 — NOT the synthetic harness (which needs
+its flash-attn setup debugged first). Board was recovered via HA power-cycle after the concurrent-submit wedge.
+
 ## Design implication for the consumer (pipelined dflash/spec loop, Slice 3)
 Pin the target-verify NPU worker to big cores, the draft/routing to little cores. Then target-verify(NPU) ‖
 draft-generate(CPU-on-little) overlaps free. Serialize any NPU submits from BOTH streams on g_npu_queue_mu

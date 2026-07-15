@@ -243,6 +243,19 @@ struct ork_moe_slot {
     const void * key = nullptr;       // host ptr of the expert currently packed here (nullptr = empty)
 };
 
+// Fused-attention (GGML_OP_FLASH_ATTN_EXT) scratch. PER-CONTEXT (was the process-global g_attnp) so two ork
+// backends can run real attention graphs concurrently without clobbering each other's QK^T/scores/softmax
+// buffers. Pool = NPU scratch weights (wqk/wav/wet) + host densify/score buffers, warm-reused across calls of
+// the same shape. attn_sm = the softmax scratch (int8 scores, per-row max, exp/reduce/normalize buffers).
+struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav, **wet;
+    ork_f16 *Qf, *KT, *Vf, *Pf, *Oh16; float *scores, *outf, *invS; ork_mm_task_f16 *tk; };
+struct ork_attn_sm {
+    int16_t *xi=nullptr,*ei=nullptr; float *mx=nullptr,*ss=nullptr; ork_f16 *e=nullptr; size_t cap=0;
+    int8_t *q8=nullptr; size_t cap2=0; int8_t maxq[8192];
+    ork_f16 *invf=nullptr; int invf_n=0;
+    ork_w *ones=nullptr; int ones_n=0;
+};
+
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
     int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
@@ -406,6 +419,10 @@ struct ggml_backend_ork_context {
     std::thread async_thr;
     bool        async_inflight = false;
     enum ggml_status async_status = GGML_STATUS_SUCCESS;
+    // Per-context fused-attention scratch (moved off the old process-global g_attnp / softmax statics) so
+    // concurrent ork backends don't corrupt each other's attention buffers. Freed in ggml_backend_ork_free.
+    struct ork_attn_pool attnp = {};
+    struct ork_attn_sm   attn_sm = {};
     // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
     // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
     // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
@@ -2122,8 +2139,12 @@ static void ork_profile_dump(ggml_backend_ork_context * ctx) {
 }
 // LEVER3: atexit shim — fires the profile dump even when llama-bench never calls backend free.
 static void ork_profile_atexit(void) { ork_profile_dump(g_ork_ctx); }
+static void attn_pool_free(ggml_backend_ork_context * ctx);   // fwd decl (defined with the attention path below)
+
 static void ggml_backend_ork_free(ggml_backend_t backend) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight && ctx->async_thr.joinable()) ctx->async_thr.join();   // drain any in-flight async NPU graph first
+    ctx->async_inflight = false;
     ork_profile_dump(ctx);
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
     ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
@@ -2203,6 +2224,10 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
     for (auto & kv : ctx->pathb_repack) { if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf); if (kv.second.gctx) ggml_free(kv.second.gctx); }
+    attn_pool_free(ctx);                                         // per-context fused-attention pool (needs ctx->npu)
+    { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
+      free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
+      if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     g_ork_ctx = nullptr;
@@ -4510,32 +4535,32 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
 // Materializes scores (mathematically == the online CPU flash form). nkv padded to %32 (pad cols masked out).
 // v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
 // the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
-struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav, **wet;
-    ork_f16 *Qf, *KT, *Vf, *Pf, *Oh16; float *scores, *outf, *invS; ork_mm_task_f16 *tk; };
-static struct ork_attn_pool g_attnp = {0};
-static void attn_pool_free(ork_npu * c) {
-    struct ork_attn_pool * P = &g_attnp;
+// (ork_attn_pool / ork_attn_sm are defined above the context struct; the pool lives PER-CONTEXT in ctx->attnp.)
+static void attn_pool_free(ggml_backend_ork_context * ctx) {
+    ork_npu * c = ctx->npu;
+    struct ork_attn_pool * P = &ctx->attnp;
     if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); if (P->wet && P->wet[h]) ork_mm_free(c, P->wet[h]); }
     free(P->wqk); free(P->wav); free(P->wet); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->Oh16);
     free(P->scores); free(P->outf); free(P->invS); free(P->tk);
     *P = (struct ork_attn_pool){0};
 }
-static int attn_pool_ensure(ork_npu * c, int DK, int DV, int N, int nkvp, int H) {
-    struct ork_attn_pool * P = &g_attnp;
+static int attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int N, int nkvp, int H) {
+    ork_npu * c = ctx->npu;
+    struct ork_attn_pool * P = &ctx->attnp;
     if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return 0;   // warm reuse
-    attn_pool_free(c);
+    attn_pool_free(ctx);
     P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*)); P->wet = (ork_w**)calloc(H, sizeof(ork_w*));
-    if (!P->wqk || !P->wav || !P->wet) { attn_pool_free(c); return -1; }
+    if (!P->wqk || !P->wav || !P->wet) { attn_pool_free(ctx); return -1; }
     for (int h=0; h<H; h++) { P->wqk[h] = ork_mm_f16_scratch(c, DK, nkvp); P->wav[h] = ork_mm_f16_scratch(c, nkvp, DV);
         P->wet[h] = ork_mm_f16_scratch(c, nkvp, N);   // transposed A·V weight = e^T[nkvp][N]
-        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; attn_pool_free(c); return -1; } }
+        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; attn_pool_free(ctx); return -1; } }
     P->Qf = (ork_f16*)malloc((size_t)H*N*DK*2); P->KT = (ork_f16*)malloc((size_t)H*DK*nkvp*2);
     P->Vf = (ork_f16*)malloc((size_t)H*nkvp*DV*2); P->Pf = (ork_f16*)malloc((size_t)H*N*nkvp*2);
     P->Oh16 = (ork_f16*)malloc((size_t)H*DV*N*2);
     P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*DV*N*4);
     P->invS = (float*)malloc((size_t)H*N*4);
     P->tk = (ork_mm_task_f16*)malloc((size_t)H*sizeof(ork_mm_task_f16));
-    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(c); return -1; }
+    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(ctx); return -1; }
     P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
 }
 static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
@@ -4549,18 +4574,20 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     const int rk2 = H/Hkv;
     const int nkvp = (nkv+31)&~31;                                     // pad KV to %32 for the fp16 stream (K%32/N%16)
     if (DK%32 || DV%16) return false;
-    if (attn_pool_ensure(ctx->npu, DK, DV, N, nkvp, H)) return false;
-    struct ork_attn_pool * P = &g_attnp;
+    if (attn_pool_ensure(ctx, DK, DV, N, nkvp, H)) return false;
+    struct ork_attn_pool * P = &ctx->attnp;
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
         const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
         return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
     static int prof=-1; if(prof<0) prof = getenv("ORK_ATTN_PROF")?1:0;   // per-stage timing for the bottleneck flow chart
     static double a_dqk=0,a_qk=0,a_sm=0,a_dv=0,a_av=0,a_sc=0; static long a_calls=0; double _t;
     static double a_smp=0,a_smq=0,a_sme=0,a_smr=0,a_smn=0;                // softmax sub-steps: prep / quant / exp-NPU / reduce-NPU / normalize
-    static int16_t *sm_xi=nullptr,*sm_ei=nullptr; static float *sm_mx=nullptr,*sm_ss=nullptr; static ork_f16 *sm_e=nullptr; static size_t sm_cap=0;
-    static int8_t *sm_q8=nullptr; static size_t sm_cap2=0; static int8_t sm_maxq[8192];   // int8 scores + per-row max for on-NPU max-reduce
-    static ork_f16 *sm_invf=nullptr; static int sm_invf_n=0;   // fp16 1/Σ per-head vector for the transposed per-channel normalize
-    static ork_w *sm_ones=nullptr; static int sm_ones_n=0;               // reduce-matmul weight ones[nkvp,16] for the on-NPU Sigma
+    // PER-CONTEXT softmax scratch (was function-`static` -> aliased into ctx->attn_sm so concurrent ork
+    // backends don't share it). References keep the 42 downstream sm_* uses byte-identical + warm-reused.
+    int16_t *&sm_xi=ctx->attn_sm.xi, *&sm_ei=ctx->attn_sm.ei; float *&sm_mx=ctx->attn_sm.mx, *&sm_ss=ctx->attn_sm.ss; ork_f16 *&sm_e=ctx->attn_sm.e; size_t &sm_cap=ctx->attn_sm.cap;
+    int8_t *&sm_q8=ctx->attn_sm.q8; size_t &sm_cap2=ctx->attn_sm.cap2; int8_t *sm_maxq=ctx->attn_sm.maxq;   // int8 scores + per-row max for on-NPU max-reduce
+    ork_f16 *&sm_invf=ctx->attn_sm.invf; int &sm_invf_n=ctx->attn_sm.invf_n;   // fp16 1/Σ per-head vector for the transposed per-channel normalize
+    ork_w *&sm_ones=ctx->attn_sm.ones; int &sm_ones_n=ctx->attn_sm.ones_n;               // reduce-matmul weight ones[nkvp,16] for the on-NPU Sigma
     for (int b=0; b<Bt; b++) {
         // (1) densify per-head fp16 operands + QK^T weights (K^T), batched submit -> scores_h[N,nkvp] f32
         _t=ork_now_us();
