@@ -114,6 +114,25 @@ speculated draft on rejection. That is a research-grade decode-loop redesign (ne
 semantics), NOT a wiring change. => Slice 3 = that redesign, or a different consumer with genuine independent
 NPU+CPU work (batch serving of independent sequences; overlap next-request prefill with current decode).
 
+## SLICE 3 — DECISIVE OBSTACLE: speculative verify is BELOW the NPU threshold (runs on CPU)
+Building the async-speculative engine surfaced a hardware-rule blocker. ork MUL_MAT offload gate
+(ggml-ork.cpp:5510/5534/5552): `min_m=32`, `pass_m_threshold = M >= 32` for a big MULTI-DOMAIN int8 target
+(single-domain small targets get threshold=1). Speculative/dflash VERIFY batches are M = block size (~5–16)
+→ BELOW 32 → the target verify runs on CPU, not the NPU. So there is NO NPU work in the verify to overlap
+with the CPU draft. This stacks on the earlier obstacles:
+  1. dflash loop strictly sequential (draft→verify→commit chain).
+  2. dflash drafter target-hidden-coupled (draft(N+1) needs verify(N)'s hidden) → can't ahead-speculate.
+  3. NPU attention incoherent (verify attention must stay CPU).
+  4. **verify M<32 for a big target → verify matmuls on CPU too** ← the decisive one.
+=> Speculative/dflash decode is NOT a viable consumer for the async cross-stream primitive on RK3588: the
+   target verify simply isn't NPU work at speculative block sizes.
+
+**Natural consumer instead:** a workload with M>=32 NPU work ‖ independent CPU work —
+  - BATCH SERVING: one request's PREFILL (M=prompt>=32 → NPU) ‖ another request's decode/CPU work.
+  - PREFILL pipelines: overlap the next request's prefill (NPU) with current post-processing (CPU).
+The primitive (Slices 1+2) is built, correct, and characterized; it's waiting on a consumer whose NPU half
+is prefill-scale. Recommend pivoting the consumer, or parking until batch-serving is prioritized.
+
 ## Design implication for the consumer (pipelined dflash/spec loop, Slice 3)
 Pin the target-verify NPU worker to big cores, the draft/routing to little cores. Then target-verify(NPU) ‖
 draft-generate(CPU-on-little) overlaps free. Serialize any NPU submits from BOTH streams on g_npu_queue_mu
