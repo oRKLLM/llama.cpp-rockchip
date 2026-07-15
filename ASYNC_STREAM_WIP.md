@@ -153,6 +153,26 @@ Every decode-acceleration path (speculative/dflash/tree) fights that decode-scal
 async cross-stream primitive is best where the NPU half is genuinely prefill-scale: BATCH SERVING (one request's
 prefill on NPU ‖ another request's CPU work). That is the clean consumer.
 
+## DECODE ASYNC-OVERLAP — the viable consumer (MEASURED 2026-07-15, tools/async_decode_probe.c)
+The one decode-NPU idea with a measured positive. Async-overlap NPU decode matmuls (M=1, multi-core = now the
+default, +40% single-domain) with between-matmul CPU-prep. Qwen2.5-7B projections, bit-exact (async C==sync C):
+  op-point cpu/npu | stock per-call async | PERSISTENT big-core-pinned worker
+  0.27             | 1.00x                | 1.25x (97% of ceiling)
+  0.61             | 1.05x                | 1.36x (85%)
+  1.36             | 1.12x                | 1.28x (73%)
+  2.37             | 1.10x                | 1.22x (85%)
+=> at decode's ~1.9 op-point: ~1.22-1.28x, bit-exact. Persistent PINNED worker is the key (stock per-call
+   pthread_create spawn overhead capped it at 1.10x). Reaches only 73-85% of sum->max ceiling; residual =
+   worker kernel SLEEP/WAKE (~50us/matmul). LITTLE-CORE DRAM-DOORBELL (spin not sleep; big cores keep prepping)
+   targets exactly that -> ~1.35-1.4x.
+BOUNDS: single-domain models only (7B multi-domain decode stays CPU — baseline 3.32 CPU vs 3.30 "MC", knob
+gone/no-op). Matmul-level CEILING (real decode has dependency-chain edges that can't overlap; single-queue NPU
+means the overlap is NPU-matmul ‖ CPU-prep, NOT NPU ‖ NPU). Realistic end-to-end ~1.1-1.25x.
+INTEGRATION (next focused build): wire the persistent-pinned-worker async into the ggml-ork decode path as
+dataflow-aware intra-graph matmul pipelining (launch NPU matmul async, overlap next INDEPENDENT op's CPU-prep on
+big cores; PATH-b MoE std::thread is the in-backend precedent). Doorbell = follow-on (needs NONBLOCK+multi-submit
+poll — a decode matmul is 3 core-submits). Intricate but the mechanism is proven.
+
 ## Design implication for the consumer (pipelined dflash/spec loop, Slice 3)
 Pin the target-verify NPU worker to big cores, the draft/routing to little cores. Then target-verify(NPU) ‖
 draft-generate(CPU-on-little) overlaps free. Serialize any NPU submits from BOTH streams on g_npu_queue_mu
