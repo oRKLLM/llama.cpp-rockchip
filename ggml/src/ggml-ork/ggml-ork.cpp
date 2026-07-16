@@ -3333,9 +3333,15 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
         const int M_e = (int) kv.second.size();
         const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
-        // admit to NPU if the shape conforms AND (resident, or the pool has headroom under eff_cap)
+        // DECODE (max_Me < batch_minM): admit NOTHING to the NPU — a resident int8 expert at M=1 is
+        // submit-floor-bound and the #14 rendezvous blocks CPU decode (profiled net-negative on 35B:
+        // 2000 M=1 run_i8 submits). Force all experts to the CPU cold path regardless of precision; the
+        // NPU is a PREFILL/verify engine (max_Me >= batch_minM) only. ORK_M1_NPU restores decode-on-NPU.
+        static const bool m1_npu = env_enabled("ORK_M1_NPU");
+        const bool npu_phase_ok = ((int) max_Me >= batch_minM) || m1_npu;
+        // admit to NPU if the shape conforms, we're in the batched/prefill phase, AND (resident, or headroom)
         ggml_backend_ork_context::ork_hot_slot * s =
-            (npu_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
+            (npu_ok && npu_phase_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
         if (s) { hot_e.push_back(e); hot_s.push_back(s); }
         else   { cpu_expert(e, kv.second); }   // non-conforming or budget/cap-full -> CPU (deferred; run threaded below)
     }
