@@ -3381,6 +3381,18 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     const size_t eff_cap = batched ? (size_t) -1 /*budget-limited only*/ : hot_K;
     std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
+    // STEP B — DECODE CPU/NPU SPLIT. At decode (max_Me < batch_minM) route a FRACTION of the active experts
+    // to the NON-BLOCKING async doorbell (ork_submit_async, which overlaps run_cold) instead of all-CPU. The
+    // blocking #14 rendezvous lost net (profiled); the thread-free doorbell should overlap for free. Knob:
+    //   ORK_SPLIT_FRAC (default 0.0) = CPU-only baseline;  0.5 = half the experts to the NPU async share.
+    // Prefill (max_Me >= batch_minM) admits all as before; ORK_M1_NPU forces all-decode-on-NPU (old A/B).
+    static const bool  m1_npu     = env_enabled("ORK_M1_NPU");
+    static const float split_frac = getenv("ORK_SPLIT_FRAC") ? (float) atof(getenv("ORK_SPLIT_FRAC")) : 0.0f;
+    const bool prefill_phase = ((int) max_Me >= batch_minM);
+    const int  n_active_e    = (int) buckets.size();
+    const int  npu_budget    = prefill_phase ? n_active_e
+                             : (m1_npu ? n_active_e : (int) lrintf(split_frac * (float) n_active_e));
+    int npu_admitted = 0;
     for (auto & kv : buckets) {
         const int e = kv.first;
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
@@ -3389,16 +3401,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
         const int M_e = (int) kv.second.size();
         const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
-        // DECODE (max_Me < batch_minM): admit NOTHING to the NPU — a resident int8 expert at M=1 is
-        // submit-floor-bound and the #14 rendezvous blocks CPU decode (profiled net-negative on 35B:
-        // 2000 M=1 run_i8 submits). Force all experts to the CPU cold path regardless of precision; the
-        // NPU is a PREFILL/verify engine (max_Me >= batch_minM) only. ORK_M1_NPU restores decode-on-NPU.
-        static const bool m1_npu = env_enabled("ORK_M1_NPU");
-        const bool npu_phase_ok = ((int) max_Me >= batch_minM) || m1_npu;
-        // admit to NPU if the shape conforms, we're in the batched/prefill phase, AND (resident, or headroom)
+        const bool npu_phase_ok = (npu_admitted < npu_budget);   // split budget (decode: split_frac share; prefill: all)
+        // admit to NPU if the shape conforms, we're within the NPU budget, AND (resident, or headroom)
         ggml_backend_ork_context::ork_hot_slot * s =
             (npu_ok && npu_phase_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
-        if (s) { hot_e.push_back(e); hot_s.push_back(s); }
+        if (s) { hot_e.push_back(e); hot_s.push_back(s); npu_admitted++; }
         else   { cpu_expert(e, kv.second); }   // non-conforming or budget/cap-full -> CPU (deferred; run threaded below)
     }
 
