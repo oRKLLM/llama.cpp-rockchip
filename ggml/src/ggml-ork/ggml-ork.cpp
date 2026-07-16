@@ -1351,6 +1351,54 @@ static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_M
 //                           only valid within a domain; layer-aligned placement keeps a chain co-domain)
 //   • N, cross-domain     → ork_mm_run_chain_i8 (single-core chain; cross-domain concurrency unsupported)
 // On any error, falls back to sequential per-task run_i8. Returns true on success.
+// Shared NEON f32->int8 per-row activation quant: amr[k]=round(yr[k]*127/absmax), returns scale=absmax/127.
+// Round-half-away-from-zero via copysignf(0.5) — BIT-IDENTICAL to the scalar and to the dense mul_mat_i8
+// NEON path. Used to vectorize the MoE chain-path act-quant (was scalar — the profiled ~385ms on 35B decode).
+static inline float ork_quant_row_i8(const float * yr, int K, int8_t * amr) {
+    float mx = 1e-9f;
+#if defined(__ARM_NEON)
+    int k = 0;
+    float32x4_t v_mx0 = vdupq_n_f32(mx), v_mx1 = vdupq_n_f32(mx);
+    for (; k <= K - 8; k += 8) {
+        v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+        v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+    }
+    mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+    for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+    const float inv = 127.0f / mx;
+    const float32x4_t v_inv = vdupq_n_f32(inv), v_half = vdupq_n_f32(0.5f);
+    const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+    const int32x4_t   v_hi = vdupq_n_s32(127), v_lo = vdupq_n_s32(-127);
+    k = 0;
+    for (; k <= K - 8; k += 8) {
+        float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+        float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+        float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+        float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+        int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+        int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+        v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+        v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+        int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+        vst1_s8(amr + k, vmovn_s16(v_s16));
+    }
+    for (; k < K; k++) {
+        float q = yr[k] * inv;
+        int qi = (int) (q + copysignf(0.5f, q));
+        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+    }
+#else
+    for (int kk = 0; kk < K; kk++) { float v = fabsf(yr[kk]); mx = v > mx ? v : mx; }
+    const float inv = 127.0f / mx;
+    for (int kk = 0; kk < K; kk++) {
+        float q = yr[kk] * inv;
+        int qi = (int) (q + copysignf(0.5f, q));
+        amr[kk] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+    }
+#endif
+    return mx / 127.0f;
+}
+
 static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
     if (tasks.empty()) return true;
     int rc;
@@ -2611,21 +2659,11 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
-            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (SCALAR — lever2 NEON not applied here!)
+            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (now NEON via ork_quant_row_i8)
             #pragma omp parallel for if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
-                    const float * yr = y + (size_t) m*K;
-                    int8_t * amr = task_A + (size_t) m*K;
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                    task_as[m] = mx / 127.0f;
-                    const float inv = 127.0f / mx;
-                    for (int k = 0; k < K; k++) {
-                        float q = yr[k] * inv;
-                        int qi = (int) (q + copysignf(0.5f, q));
-                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
-                    }
+                    task_as[m] = ork_quant_row_i8(y + (size_t) m*K, K, task_A + (size_t) m*K);
                 } else {
                     memset(task_A + (size_t) m*K, 0, K);
                     task_as[m] = 0.0f;
