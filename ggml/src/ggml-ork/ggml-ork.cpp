@@ -3342,7 +3342,10 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // each expert's N output rows into ROW_BLK-sized blocks keeps every thread busy even when only one or
     // two experts went cold this step (the decode case) — the old per-expert fan-out left N-row parallelism
     // on the table and serialized a lone cold expert's 1792 vec_dot calls onto a single core.
-    if (!cold.empty()) {
+    // #14 swap-hidden pipeline: wrap the CPU cold bulk (ork-native #12 / vec_dot) as a callable so it can
+    // run CONCURRENTLY with the NPU hot submit below (the NPU int8 chain hides behind the CPU window).
+    auto run_cold = [&]() {
+        if (cold.empty()) return;
         const double cd0 = ctx->profile ? ork_now_us() : 0;
         const int n_cold = (int) cold.size();
         std::vector<cold_item> items;
@@ -3373,11 +3376,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         }
         ctx->moe_cold_cpu += n_cold;
         if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
-    }
+    };
 
     if (ctx->profile && ctx->moe_calls < 4) fprintf(stderr, "[ork MoE-DIM] K=%d N=%d S=%d type=%d (chain-envelope K%%512==0&&K<=4096: %s)\n", K, N, (int)hot_e.size(), (int)type, (K%512==0&&K<=4096)?"YES":"no");
     const int S = (int) hot_e.size();
-    if (S == 0) { if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
+    if (S == 0) { run_cold(); if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
 
     // Pack the hot experts' routed rows into one chained submit (run_chain_i8; per-task run_i8 fallback
     // for the K=1792 down-proj that sits outside the chain envelope).
@@ -3413,12 +3416,22 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // per-task run_i8 path below — same correctness, just no cross-core dispatch for those.
     // ORK_MOE_STREAM=0 reverts to the chain path (A/B comparison).
     static const bool use_stream = !(getenv("ORK_MOE_STREAM") && atoi(getenv("ORK_MOE_STREAM")) == 0);
+    // #14 SWAP-HIDDEN PIPELINE: fire the NPU hot chain on a dedicated thread (its kernel-wait parks the
+    // thread, freeing the core) CONCURRENTLY with the CPU cold bulk (run_cold), then join — the NPU int8
+    // share hides behind the CPU int4/NF4 window (validated: tools/hybrid_decode_probe ~1.07x @M=1). Uses
+    // the chained/stream submit (NOT the batched mcworker path that errno=110's at M=1).
     const double ch0 = ctx->profile ? ork_now_us() : 0;
-    int crc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
-                         : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
-    const double ch1 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] split stream/chain vs fallback
-    if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C);
-               if (ctx->profile) { ctx->moe_fallback_t += ork_now_us() - ch1; ctx->moe_fallback_calls++; } }
+    std::atomic<int> crc_a(0);
+    auto npu_submit = [&]() {
+        int rc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
+                            : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
+        if (rc) { rc = 0; for (int x = 0; x < S && rc == 0; x++) rc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
+        crc_a.store(rc);
+    };
+    std::thread t_npu(npu_submit);
+    run_cold();                       // CPU cold bulk (ork-native #12) — overlaps the NPU submit
+    t_npu.join();
+    int crc = crc_a.load();
     if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id partition run FAIL rc=%d S=%d K=%d N=%d\n", crc, S, K, N); return false; }
 
