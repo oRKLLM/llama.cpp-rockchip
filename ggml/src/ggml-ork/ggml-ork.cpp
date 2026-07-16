@@ -1419,6 +1419,24 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     return true;
 }
 
+// ===================== UNIFIED NPU SUBMIT ROUTER =====================
+// One chokepoint for every NPU int8 matmul submit. The split's async/blocking choice — and (next) the
+// SRAM-backed doorbell — lives HERE, not scattered across the handlers. Three primitives so the caller
+// controls the overlap window:
+//   ork_submit_async(): try the NON-BLOCKING multi-core doorbell (ork_dyn_begin_mc). Returns a live chain
+//     the caller MUST ork_submit_end() AFTER its overlapping CPU work — or NULL if ineligible (M>1 / K not
+//     %512 / K>4096 / C not resident / mixed domain), in which case the caller falls back to ork_submit_sync.
+//   ork_submit_sync():  blocking dispatch (1->run_i8 / N same-domain->run_stream / N cross->run_chain).
+//   ork_submit_end():   rendezvous + writeback + free the async chain. 0=ok, <0=error.
+// Canonical split pattern:  h = ork_submit_async(...);  <CPU-complete work>;  rc = h ? ork_submit_end(h) : ork_submit_sync(...);
+static inline ork_dyn_chain * ork_submit_async(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
+    return tasks.empty() ? nullptr : ork_dyn_begin_mc(ctx->npu, (int) tasks.size(), tasks.data(), 0 /*all cores*/);
+}
+static inline int ork_submit_sync(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
+    return ork_dispatch_i8(ctx, tasks) ? 0 : -1;
+}
+static inline int ork_submit_end(ork_dyn_chain * h) { return h ? (ork_dyn_end(h) < 0 ? -1 : 0) : 0; }
+
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -1581,7 +1599,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 if (ork_stream_pool_run(ctx->spool, task_se[t], tasks[t].M, tasks[t].A, tasks[t].C)) { ok = -1; break; }
             if (ok != 0) return false;
         } else {
-            if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
+            if (ork_submit_sync(ctx, tasks)) return false;   // unified router: 1→run_i8 · N same-dom→run_stream · N cross→run_chain
             ok = 0;
         }
 
@@ -2690,7 +2708,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
     fflush(stderr);
     
-    if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
+    if (ork_submit_sync(ctx, tasks)) return false;   // unified router: 1→run_i8 · N same-dom→run_stream · N cross→run_chain
 
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
@@ -3508,13 +3526,9 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14-mc] begin_mc S=%d K=%d N=%d\n", S, K, N);
         // multi-core NONBLOCK: fire the int8 share across 3 cores, run the CPU bulk in parallel, rendezvous
         // on the output doorbells (thread-free). Cbuf is the resident DMA output ork_dyn_end writes back.
-        ork_dyn_chain * h = ork_dyn_begin_mc(ctx->npu, S, tasks.data(), 0 /*all cores*/);
+        ork_dyn_chain * h = ork_submit_async(ctx, tasks);     // NON-BLOCKING doorbell (NULL if ineligible)
         run_cold();                                            // CPU cold bulk ‖ NPU
-        if (h) { ork_dyn_end(h); crc = 0; }
-        else {                                                 // begin_mc declined — synchronous fallback
-            crc = ork_mm_run_stream_i8(ctx->npu, S, tasks.data());
-            if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
-        }
+        crc = h ? ork_submit_end(h) : ork_submit_sync(ctx, tasks);   // rendezvous, or sync fallback AFTER cold
     } else {
         // #14 SWAP-HIDDEN (default): NPU hot chain on a dedicated thread ‖ CPU cold bulk, then join.
         std::atomic<int> crc_a(0);
