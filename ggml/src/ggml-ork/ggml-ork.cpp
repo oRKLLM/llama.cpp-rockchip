@@ -3400,9 +3400,16 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // back to the std::thread + blocking-stream path (handles M>1 / non-conforming K via per-task run_i8).
     static const int dyn_mc = getenv("ORK_DYN_MC") ? atoi(getenv("ORK_DYN_MC")) : 0;
     bool dyn_ok = dyn_mc && (K % 512 == 0 && K <= 4096) && (total_rows == (size_t) S);
+    // SINGLE-DOMAIN ONLY: ork_dyn_begin_mc reuses per-core buffers (mc_ensure) fixed to one IOMMU domain and
+    // submits under one domain; on a multi-domain model (n_domains>1) the buffer/weight domains mismatch ->
+    // errno=110 (the same pre-existing limitation the whole multi-core MoE-on-NPU path has). Gate to
+    // n_domains<=1, where begin_mc is validated bit-correct; multi-domain falls back to the thread+stream path.
+    if (dyn_ok && ctx->n_domains > 1) dyn_ok = false;
     int32_t * Cbuf = bigC.data();
     if (dyn_ok) { int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC, &ctx->dma_moeC_sz, (size_t) total_rows * N * 4);
         if (d) Cbuf = d; else dyn_ok = false; }
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14] S=%d K=%d N=%d total_rows=%zu dyn_mc=%d Kconform=%d oneRow=%d dyn_ok=%d\n",
+        S, K, N, total_rows, dyn_mc, (int)(K%512==0 && K<=4096), (int)(total_rows==(size_t)S), (int)dyn_ok);
     size_t off = 0;
     for (int x = 0; x < S; x++) {
         const int e = hot_e[x]; std::vector<std::pair<int,int>> & ent = buckets[e];
@@ -3436,6 +3443,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     const double ch0 = ctx->profile ? ork_now_us() : 0;
     int crc;
     if (dyn_ok) {
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14-mc] begin_mc S=%d K=%d N=%d\n", S, K, N);
         // multi-core NONBLOCK: fire the int8 share across 3 cores, run the CPU bulk in parallel, rendezvous
         // on the output doorbells (thread-free). Cbuf is the resident DMA output ork_dyn_end writes back.
         ork_dyn_chain * h = ork_dyn_begin_mc(ctx->npu, S, tasks.data(), 0 /*all cores*/);
