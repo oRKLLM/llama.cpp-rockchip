@@ -115,6 +115,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
 extern "C" {
 #include "ork_npu.h"
+#include "ork_native_cpu.h"   // #12: CPU-side NEON GEMV over the ork-native tiered format (shared with the NPU)
 }
 
 #include <sys/mman.h>
@@ -2895,15 +2896,60 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // Collect cold (expert, entries) pairs; run them all in one threaded fan-out after the split.
     std::vector<std::pair<int, std::vector<std::pair<int,int>> *>> cold;
     auto cpu_expert = [&](int e, std::vector<std::pair<int,int>> & ent) { cold.push_back({e, &ent}); };
-    // One cold work-item: dot output rows [n0,n1) of expert e's weight against the quantized activation
-    // for (token t, slot j). We split the N output rows into blocks so the thread pool fans across ROWS,
-    // not just across experts — critical at decode, where there may be only a few cold experts but each
-    // has N=1792..2048 independent output rows. (vec_dot writes dr[n] from the raw quant weight row.)
-    struct cold_item { int e, t, j, n0, n1; size_t qoff; };
+
+    // #12 FEATURE-DETECT (no env flag): if the loaded orkpack stores THIS tensor's experts as int4/NF4,
+    // compute cold experts from the ork-native Bi4 (the single shared format, ork_native_cpu.h) instead of
+    // ggml Q4_K. Driven purely by the orkpack (persist_mode==1) + each expert's O4N1 entry (20B hdr
+    // {magic,ver,K,N,quant_kind} + bscale[N] f32 + Bi4[K*N/2] channel-contiguous). Activations -> int8.
+    const int n_expert_c = (int) src0->ne[2];
+    std::vector<const uint8_t*> onib(n_expert_c, nullptr);
+    std::vector<const float*>   obsc(n_expert_c, nullptr);
+    ork_cpu_fmt ofmt = ORK_CPU_I4; bool ork_native = false;
+    static int8_t ork_nf4_lut[16]; static int ork_lut_done = 0;
+    if (!ork_lut_done) { for (int i=0;i<16;i++) ork_nf4_lut[i]=(int8_t)lrintf(ORK_NF4_LVL[i]*127.0f); ork_lut_done=1; }
+    int8x16_t ork_lutv = vld1q_s8(ork_nf4_lut);
+    if (ctx->persist_mode == 1 && ctx->persist_map) {
+        auto p0 = ctx->persist_idx.find(ork_expert_key(src0->name, 0));
+        if (p0 != ctx->persist_idx.end() && p0->second.dtype == ORKPACK_DT_I4) {
+            ork_native = true;
+            for (int e = 0; e < n_expert_c; e++) {
+                auto pe = ctx->persist_idx.find(ork_expert_key(src0->name, e));
+                if (pe == ctx->persist_idx.end()) { ork_native = false; break; }
+                const char * blob = (const char *) ctx->persist_map + pe->second.blob_off;
+                uint32_t qk; memcpy(&qk, blob + 16, 4);                 // O4N1 hdr: [magic,ver,K,N,quant_kind]
+                if (e == 0) ofmt = (qk == 1u) ? ORK_CPU_NF4 : ORK_CPU_I4;   // 1=CODEBOOK_NF4, 0=UNIFORM
+                obsc[e] = (const float *)(blob + 20);
+                onib[e] = (const uint8_t *)(blob + 20 + (size_t) N * sizeof(float));
+            }
+        }
+    }
+    // int8 activation cache for the ork-native path (absmax/127 per token), keyed like tok_q. Built
+    // single-threaded in the dispatch loop below (ai8 stable — no resize — before the threaded run).
+    std::unordered_map<int,int> tok_i8; std::vector<int8_t> ai8; std::vector<float> ai8sc;
+    auto quant_tok_i8 = [&](int t, int jslot) -> int {
+        const int key = bcast ? t : (t * 100000 + jslot);
+        auto it = tok_i8.find(key); if (it != tok_i8.end()) return it->second;
+        const int idx = (int) ai8sc.size(); ai8.resize((size_t)(idx + 1) * K); ai8sc.resize(idx + 1);
+        const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jslot)*src1->nb[1] + (size_t) t*src1->nb[2]);
+        float mx = 1e-9f; for (int k=0;k<K;k++){ float v=fabsf(y[k]); if(v>mx)mx=v; } float inv = 127.0f/mx;
+        int8_t * a = ai8.data() + (size_t) idx * K;
+        for (int k=0;k<K;k++){ int q=(int)lrintf(y[k]*inv); a[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+        ai8sc[idx] = mx/127.0f; tok_i8[key] = idx; return idx;
+    };
+
+    // One cold work-item: output rows [n0,n1) of expert e for (token t, slot j). ork-native path uses the
+    // shared Bi4 (int8 activation); else ggml vec_dot on the raw Q4_K row.
+    struct cold_item { int e, t, j, n0, n1; size_t qoff; int i8idx; };
     auto run_cold_item = [&](const cold_item & ci) {
+        float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
+        if (ork_native) {
+            ork_cpu_w w; w.fmt = ofmt; w.nibble = onib[ci.e]; w.bit4 = nullptr; w.bit5 = nullptr;
+            w.i8 = nullptr; w.bscale = obsc[ci.e]; w.nf4_lut = ork_lutv; w.K = K; w.N = N;
+            ork_cpu_gemv_m1(&w, ai8.data() + (size_t) ci.i8idx * K, ai8sc[ci.i8idx], dr, ci.n0, ci.n1);
+            return;
+        }
         const char * xw = (const char *) src0->data + (size_t) ci.e * src0->nb[2];
         const void * qa = qact.data() + ci.qoff;
-        float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
         for (int n = ci.n0; n < ci.n1; n++)
             vec_dot(K, dr + n, 0, xw + (size_t) n * row_bytes, 0, qa, 0, 1);
     };
@@ -3304,9 +3350,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         for (auto & ce : cold) {
             const int e = ce.first;
             for (auto & pr : *ce.second) {
-                const size_t qoff = quant_tok(pr.first, pr.second);   // populate qact (single-threaded)
+                // ork-native path uses int8 acts (quant_tok_i8); else Q8_K for ggml vec_dot. Single-threaded.
+                const size_t qoff  = ork_native ? 0 : quant_tok(pr.first, pr.second);
+                const int    i8idx = ork_native ? quant_tok_i8(pr.first, pr.second) : 0;
                 for (int n0 = 0; n0 < N; n0 += ROW_BLK)
-                    items.push_back(cold_item{ e, pr.first, pr.second, n0, n0+ROW_BLK<N ? n0+ROW_BLK : N, qoff });
+                    items.push_back(cold_item{ e, pr.first, pr.second, n0, n0+ROW_BLK<N ? n0+ROW_BLK : N, qoff, i8idx });
             }
         }
         const int n_items = (int) items.size();
