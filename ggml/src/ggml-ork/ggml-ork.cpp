@@ -5653,7 +5653,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // CONVERT/WRITE mode (persist_mode==2) MUST keep M=1 on the NPU: the .orkpack build is a single
             // 1-token (M=1) forward that packs every weight, so declining M=1 there would pack ZERO weights
             // and produce no .orkpack for >4GiB models. Only SERVING (read/off) routes multi-domain M=1 to CPU.
-            if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1 || g_ork_ctx->persist_mode == 2)) threshold = 1;
+            // CONVERT/WRITE (persist_mode==2) MUST keep M=1 on NPU (packs every weight). For SERVING,
+            // single-domain M=1-on-NPU is submit-floor-bound and LOSES to CPU on MoE models — profiled on
+            // LFM2.5/Qwen3.6-35B: ~1440 M=1 run_i8 submits/decode = 82% of run time, decode 14/6.16 vs ggml
+            // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
+            // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
+            if (target_qbits == 8 && g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;
+            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) && env_enabled("ORK_M1_NPU")) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
             // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
