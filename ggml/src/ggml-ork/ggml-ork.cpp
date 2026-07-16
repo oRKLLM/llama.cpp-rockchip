@@ -2946,7 +2946,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     auto run_cold_item = [&](const cold_item & ci) {
         float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
         if (ork_native) {
-            ork_cpu_w w; w.fmt = ofmt; w.nibble = onib[ci.e]; w.bit4 = nullptr; w.bit5 = nullptr;
+            ork_cpu_w w; w.fmt = ofmt; w.nibble = onib[ci.e]; w.bit4 = nullptr; w.bit5 = nullptr; w.bit6 = nullptr;
             w.i8 = nullptr; w.bscale = obsc[ci.e]; w.nf4_lut = ork_lutv; w.K = K; w.N = N;
             ork_cpu_gemv_m1(&w, ai8.data() + (size_t) ci.i8idx * K, ai8sc[ci.i8idx], dr, ci.n0, ci.n1);
             return;
