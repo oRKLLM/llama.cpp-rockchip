@@ -276,6 +276,7 @@ struct ggml_backend_ork_context {
     void * dma_in = nullptr;  size_t dma_in_sz = 0;
     void * dma_up = nullptr;  size_t dma_up_sz = 0;
     void * dma_gt = nullptr;  size_t dma_gt_sz = 0;
+    void * dma_moeC = nullptr; size_t dma_moeC_sz = 0;   // #14 multi-core NONBLOCK: resident MoE output (doorbell-pollable)
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
@@ -2219,6 +2220,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
     if (ctx->dma_up) ork_dma_free(ctx->npu, ctx->dma_up);
     if (ctx->dma_gt) ork_dma_free(ctx->npu, ctx->dma_gt);
+    if (ctx->dma_moeC) ork_dma_free(ctx->npu, ctx->dma_moeC);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
@@ -3390,6 +3392,16 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     std::vector<float>   as_row(total_rows);
     std::vector<ork_mm_task_i8> tasks(S);
     std::vector<size_t> offs(S);
+    // #14 multi-core NONBLOCK path (ORK_DYN_MC): if every hot expert has exactly one routed row (M==1, the
+    // decode case) and K conforms (K%512==0 && K<=4096), fire the int8 share across all 3 cores NONBLOCK via
+    // ork_dyn_begin_mc (doorbell rendezvous, thread-free — beats the blocking stream 1.38-2.3x) and overlap
+    // run_cold. That requires the output resident, so point tasks[x].C into a reused DMA buffer. Else fall
+    // back to the std::thread + blocking-stream path (handles M>1 / non-conforming K via per-task run_i8).
+    static const int dyn_mc = getenv("ORK_DYN_MC") ? atoi(getenv("ORK_DYN_MC")) : 0;
+    bool dyn_ok = dyn_mc && (K % 512 == 0 && K <= 4096) && (total_rows == (size_t) S);
+    int32_t * Cbuf = bigC.data();
+    if (dyn_ok) { int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC, &ctx->dma_moeC_sz, (size_t) total_rows * N * 4);
+        if (d) Cbuf = d; else dyn_ok = false; }
     size_t off = 0;
     for (int x = 0; x < S; x++) {
         const int e = hot_e[x]; std::vector<std::pair<int,int>> & ent = buckets[e];
@@ -3406,7 +3418,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
             }
         }
-        tasks[x].w = hot_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
+        tasks[x].w = hot_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = Cbuf + off * N;
         offs[x] = off; off += cnt;
     }
     // M2 change #2: dispatch the S independent hot experts via the ASYNC ROUND-ROBIN STREAM
@@ -3421,17 +3433,31 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // share hides behind the CPU int4/NF4 window (validated: tools/hybrid_decode_probe ~1.07x @M=1). Uses
     // the chained/stream submit (NOT the batched mcworker path that errno=110's at M=1).
     const double ch0 = ctx->profile ? ork_now_us() : 0;
-    std::atomic<int> crc_a(0);
-    auto npu_submit = [&]() {
-        int rc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
-                            : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
-        if (rc) { rc = 0; for (int x = 0; x < S && rc == 0; x++) rc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
-        crc_a.store(rc);
-    };
-    std::thread t_npu(npu_submit);
-    run_cold();                       // CPU cold bulk (ork-native #12) — overlaps the NPU submit
-    t_npu.join();
-    int crc = crc_a.load();
+    int crc;
+    if (dyn_ok) {
+        // multi-core NONBLOCK: fire the int8 share across 3 cores, run the CPU bulk in parallel, rendezvous
+        // on the output doorbells (thread-free). Cbuf is the resident DMA output ork_dyn_end writes back.
+        ork_dyn_chain * h = ork_dyn_begin_mc(ctx->npu, S, tasks.data(), 0 /*all cores*/);
+        run_cold();                                            // CPU cold bulk ‖ NPU
+        if (h) { ork_dyn_end(h); crc = 0; }
+        else {                                                 // begin_mc declined — synchronous fallback
+            crc = ork_mm_run_stream_i8(ctx->npu, S, tasks.data());
+            if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
+        }
+    } else {
+        // #14 SWAP-HIDDEN (default): NPU hot chain on a dedicated thread ‖ CPU cold bulk, then join.
+        std::atomic<int> crc_a(0);
+        auto npu_submit = [&]() {
+            int rc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
+                                : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
+            if (rc) { rc = 0; for (int x = 0; x < S && rc == 0; x++) rc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
+            crc_a.store(rc);
+        };
+        std::thread t_npu(npu_submit);
+        run_cold();                   // CPU cold bulk (ork-native #12) — overlaps the NPU submit
+        t_npu.join();
+        crc = crc_a.load();
+    }
     if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id partition run FAIL rc=%d S=%d K=%d N=%d\n", crc, S, K, N); return false; }
 
@@ -3442,7 +3468,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const float * bs = hot_s[x]->bscale.data();
         for (int i = 0; i < cnt; i++) {
             const int t = ent[i].first, j = ent[i].second;
-            const int32_t * cr = bigC.data() + (o + i) * N;
+            const int32_t * cr = Cbuf + (o + i) * N;
             float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
             const float as = as_row[o + i];
             for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
