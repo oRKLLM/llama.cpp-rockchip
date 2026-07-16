@@ -2752,6 +2752,7 @@ static void ork_moe_deq_row(void * vctx, int n, float * dst, int K) {
     else           c->to_float(c->x + (size_t) n * c->nb01, dst, K);
 }
 
+static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need);   // defined below; used by the #14 multi-core NONBLOCK path
 // MoE expert matmul (GGML_OP_MUL_MAT_ID), int8 path. Handles any n_tokens.
 // dst[N, n_used, n_tokens] = for each (token t, slot j): W[ids[j,t]] (K x N) @ x_t (K).
 // We GROUP tokens by their selected expert and run ONE M=count matmul per active expert (M-padded to 32

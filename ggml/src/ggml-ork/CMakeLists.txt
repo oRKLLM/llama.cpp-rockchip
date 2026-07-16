@@ -33,3 +33,16 @@ find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+# ork_bench / ork_ppl — open-stack perf + quality harnesses that drive the llama.cpp C API against the
+# ggml-ork backend (tools/re in the vendored ork-driver). Built here so they ALWAYS compile alongside the
+# backend (ccache keeps rebuilds cheap) instead of an out-of-tree g++. Board-only; guarded on the source.
+# `llama`/`ggml` are forward target references (defined later in the project) — CMake resolves at generate.
+foreach(orktool ork_bench ork_ppl)
+    if (EXISTS ${ORK_DIR}/tools/re/${orktool}.cpp)
+        add_executable(${orktool} ${ORK_DIR}/tools/re/${orktool}.cpp)
+        target_link_libraries(${orktool} PRIVATE llama ggml)
+        target_include_directories(${orktool} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ORK_DIR}/include)
+        set_target_properties(${orktool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    endif()
+endforeach()
