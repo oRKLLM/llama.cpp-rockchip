@@ -276,7 +276,7 @@ struct ggml_backend_ork_context {
     void * dma_in = nullptr;  size_t dma_in_sz = 0;
     void * dma_up = nullptr;  size_t dma_up_sz = 0;
     void * dma_gt = nullptr;  size_t dma_gt_sz = 0;
-    void * dma_moeC = nullptr; size_t dma_moeC_sz = 0;   // #14 multi-core NONBLOCK: resident MoE output (doorbell-pollable)
+    void * dma_moeC[16] = {}; size_t dma_moeC_sz[16] = {};   // #14 multi-core NONBLOCK: per-domain resident MoE output (in-domain -> begin_mc direct-writes, no copy-back)
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
@@ -2220,7 +2220,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
     if (ctx->dma_up) ork_dma_free(ctx->npu, ctx->dma_up);
     if (ctx->dma_gt) ork_dma_free(ctx->npu, ctx->dma_gt);
-    if (ctx->dma_moeC) ork_dma_free(ctx->npu, ctx->dma_moeC);
+    for (int d = 0; d < 16; d++) if (ctx->dma_moeC[d]) ork_dma_free(ctx->npu, ctx->dma_moeC[d]);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
@@ -3404,8 +3404,19 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // requires all experts in one domain (a MoE node's experts share the layer's domain) — it returns NULL
     // (=> fall back) if that's ever violated. So no n_domains gate is needed here.
     int32_t * Cbuf = bigC.data();
-    if (dyn_ok) { int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC, &ctx->dma_moeC_sz, (size_t) total_rows * N * 4);
-        if (d) Cbuf = d; else dyn_ok = false; }
+    if (dyn_ok) {
+        // Lever 1: place the output buffer in the HOT EXPERTS' domain (a node's experts share one — layer-based
+        // residence) so begin_mc direct-writes it in place (no copy-back) even in a non-0 domain. ork_dma_alloc
+        // uses the pack domain, so set it to the node's domain for the (re)alloc, then RESTORE it (else a later
+        // weight resolve/pack would land in the wrong domain).
+        int nd = ork_w_domain(hot_s[0]->w); if (nd < 0) nd = 0; if (nd > 15) nd = 15;
+        int saved_pd = ork_npu_pack_domain(ctx->npu);
+        ork_npu_activate_domain(ctx->npu, nd);   // a non-0 domain buffer must be allocated with THAT domain active
+        ork_npu_set_pack_domain(ctx->npu, nd);
+        int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC[nd], &ctx->dma_moeC_sz[nd], (size_t) total_rows * N * 4);
+        ork_npu_set_pack_domain(ctx->npu, saved_pd);
+        if (d) Cbuf = d; else dyn_ok = false;
+    }
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14] S=%d K=%d N=%d total_rows=%zu dyn_mc=%d Kconform=%d oneRow=%d dyn_ok=%d\n",
         S, K, N, total_rows, dyn_mc, (int)(K%512==0 && K<=4096), (int)(total_rows==(size_t)S), (int)dyn_ok);
     size_t off = 0;
