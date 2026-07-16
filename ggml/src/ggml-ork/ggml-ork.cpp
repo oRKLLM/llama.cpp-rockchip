@@ -3400,11 +3400,9 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // back to the std::thread + blocking-stream path (handles M>1 / non-conforming K via per-task run_i8).
     static const int dyn_mc = getenv("ORK_DYN_MC") ? atoi(getenv("ORK_DYN_MC")) : 0;
     bool dyn_ok = dyn_mc && (K % 512 == 0 && K <= 4096) && (total_rows == (size_t) S);
-    // SINGLE-DOMAIN ONLY: ork_dyn_begin_mc reuses per-core buffers (mc_ensure) fixed to one IOMMU domain and
-    // submits under one domain; on a multi-domain model (n_domains>1) the buffer/weight domains mismatch ->
-    // errno=110 (the same pre-existing limitation the whole multi-core MoE-on-NPU path has). Gate to
-    // n_domains<=1, where begin_mc is validated bit-correct; multi-domain falls back to the thread+stream path.
-    if (dyn_ok && ctx->n_domains > 1) dyn_ok = false;
+    // Multi-domain-safe: ork_dyn_begin_mc outputs to its own in-domain per-core scratch and copies back, and
+    // requires all experts in one domain (a MoE node's experts share the layer's domain) — it returns NULL
+    // (=> fall back) if that's ever violated. So no n_domains gate is needed here.
     int32_t * Cbuf = bigC.data();
     if (dyn_ok) { int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC, &ctx->dma_moeC_sz, (size_t) total_rows * N * 4);
         if (d) Cbuf = d; else dyn_ok = false; }
