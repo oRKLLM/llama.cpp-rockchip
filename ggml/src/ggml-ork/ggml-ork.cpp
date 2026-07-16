@@ -3367,15 +3367,24 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         unsigned hw = std::thread::hardware_concurrency();
         int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
         if (nthr < 1) nthr = 1; if (nthr > n_items) nthr = n_items;
+        // (a) FUSED CPU MoE: pin the cold-expert workers to the A76 BIG cluster (RK3588 cores 4-7) so the
+        // ork-native CPU GEMV runs on the fast cores like ggml's -t4, instead of scattering onto the slow A55
+        // little cores (the measured ork-CPU < ggml-CPU gap). Gated by ORK_NO_AFFINITY (default: pin).
+        static const bool cold_pin = !env_enabled("ORK_NO_AFFINITY");
         if (nthr <= 1) {
             for (auto & ci : items) run_cold_item(ci);
         } else {
+            cpu_set_t saved; bool have_saved = cold_pin && sched_getaffinity(0, sizeof saved, &saved) == 0;
             std::atomic<int> next(0);
-            auto worker = [&]() { int i; while ((i = next.fetch_add(1)) < n_items) run_cold_item(items[i]); };
+            auto worker = [&]() {
+                if (cold_pin) { cpu_set_t s; CPU_ZERO(&s); for (int c = 4; c < 8; c++) CPU_SET(c, &s); sched_setaffinity(0, sizeof s, &s); }
+                int i; while ((i = next.fetch_add(1)) < n_items) run_cold_item(items[i]);
+            };
             std::vector<std::thread> th; th.reserve(nthr-1);
             for (int w = 0; w < nthr-1; w++) th.emplace_back(worker);
             worker();
             for (auto & t : th) t.join();
+            if (have_saved) sched_setaffinity(0, sizeof saved, &saved);   // restore main-thread affinity
         }
         ctx->moe_cold_cpu += n_cold;
         if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
