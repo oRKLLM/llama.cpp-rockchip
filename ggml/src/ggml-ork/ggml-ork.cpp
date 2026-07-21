@@ -5358,8 +5358,25 @@ ggml_backend_t ggml_backend_ork_init(void) {
         GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
                       g_ork_cfg_silu_int8fused ? "int8-fused(through)" : "int16-coherent", g_ork_cfg_dflash ? "on" : "off");
     }
+    // orkd is THE NPU access path on this branch — not an opt-in, no toggle. The daemon owns the single-stream
+    // NPU and serializes every submit (direct concurrent access wedges the IOMMU). ork_npu_init() activates the
+    // orkd client through these env vars (its only public trigger; the daemon itself sets ORKD_IS_DAEMON, which
+    // we never do here, so this only routes the CLIENT). We FORCE them (overwrite) so there is no environment
+    // gate that can silently drop the process back to the direct path. The ring is the low-latency decode
+    // transport that async ork_mm_submit/collect ride.
+    setenv("ORK_USE_ORKD", "1", 1);
+    setenv("ORK_ORKD_RING", "1", 1);
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
+    // Direct-NPU is not a supported fallback here: if the daemon didn't connect (missing/unspawnable ORKD_BIN,
+    // socket refused) the routing silently drops to the single-stream direct path — the exact footgun the orkd
+    // migration removes. Fail loudly so a misconfigured daemon is caught at load, not as a mid-run IOMMU wedge.
+    if (!ork_npu_uses_orkd(npu)) {
+        GGML_LOG_ERROR("%s: NOT routed through orkd (daemon connect failed) — check ORKD_BIN points at the orkd "
+                       "binary and it is spawnable. Direct-NPU is not a supported path on this build.\n", __func__);
+        ork_npu_free(npu);
+        return NULL;
+    }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
     g_ork_ctx = ctx;
@@ -5469,12 +5486,17 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // map/unmap) is only needed BEYOND that; leave it off (NULL) so the domain path is used.
     ctx->spool = nullptr;
     fprintf(stderr, "[ork] residency: multi-domain (up to %d domains x ~4 GiB IOVA, dom_activate swap)\n", ctx->n_domains);
+    // orkd routing (ork-driver >=1.0.0): every NPU submit routes through the orkd daemon (serialized — the
+    // safe way to share the single-stream NPU; direct concurrent access wedges the IOMMU). This is the
+    // committed path — init already hard-failed above if the daemon didn't connect — so ork_npu_uses_orkd()
+    // is true here; report it for the run log.
+    fprintf(stderr, "[ork] routing: orkd daemon (serialized) + shm ring\n");
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
     fprintf(stderr, "[ork] ork-driver %s (W%dA%d%s)\n", ork_npu_version(),
             ctx->qbits, ctx->qbits, ctx->hadamard ? "+Had" : "");
-    GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, %sW%dA%d%s)\n", __func__, ork_npu_version(),
+    GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, orkd %sW%dA%d%s)\n", __func__, ork_npu_version(),
                   ctx->hybrid ? "Hybrid " : "",
                   ctx->qbits, ctx->qbits,
                   ctx->hadamard ? "+Hadamard" : "");
