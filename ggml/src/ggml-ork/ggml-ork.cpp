@@ -1416,9 +1416,12 @@ static inline float ork_quant_row_i8(const float * yr, int K, int8_t * amr) {
 
 static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
     if (tasks.empty()) return true;
-    // orkd: only ork_mm_run_i8 is daemon-routed (run_stream_i8 / run_chain_i8 are fd-local). Run each task
-    // through the routed single-matmul primitive; the daemon serializes them (and multi-cores each internally).
+    // orkd: run_i8 AND run_chain_i8 are daemon-routed (run_stream_i8 is fd-local). Chain N tasks into ONE
+    // routed round-trip (orkd_run_chain_i8 — needs daemon-resident is_orkd weights, which the routed pack
+    // guarantees here); if the chain declines (rc!=0), fall back to sequential routed run_i8.
     if (ctx->via_orkd) {
+        if (tasks.size() > 1 && ork_mm_run_chain_i8(ctx->npu, (int) tasks.size(), tasks.data()) == 0)
+            return true;
         for (size_t t = 0; t < tasks.size(); t++)
             if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) return false;
         return true;
@@ -5041,15 +5044,16 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
     // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
     const bool fuse_force = getenv("ORK_FUSE") != nullptr;
-    // orkd: group fusion packs a CONCATENATED weight and runs it — that pack IS routed, but for the first
-    // orkd landing we force the single-node routed path (one ork_mm_pack_i8 + ork_mm_run_i8 per weight) so the
-    // whole matmul path is provably daemon-routed. Re-enabling group/chain fusion under orkd (both routed) is
-    // a follow-on perf step once NPU residency is validated.
-    const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE") && !ctx->via_orkd;
+    // orkd: group fusion is daemon-routed — it packs a CONCATENATED weight via ork_mm_pack_i8 and runs it as
+    // ONE ork_mm_run_i8 (host A/C), so it works through the daemon AND amortizes the per-matmul submit floor
+    // (q/k/v, gate/up -> 1 submit). Enabled under orkd.
+    const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE");
     // FUSED FFN chain (gate+SiLU, up, GLU, down). The fused per-tensor gate (fc.wg) is packed as an import
     // co-resident in its own layer's domain (ork_pack_pt_f32), so it works at ANY domain count — single
     // domain (<=4GiB) or many (>4GiB), gate/up/down naturally sharing their layer's domain. Just needs int8.
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;   // orkd: FFN chain uses fd-local run_i8_silu/run_f16_silu + DMA scratch — force per-node
+    // orkd: the FFN SwiGLU chain stays disabled — it uses fd-local run_i8_silu / run_f16_silu + the GU_CHAIN
+    // DMA scratch (not daemon-routed). The generic MUL_MAT chain (below) IS routed and stays on.
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -5117,8 +5121,9 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
                 // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
                 // co-resident under allow_evict=false, which the RAM/IOVA tiering can't guarantee).
-                // orkd: the i8 chain runner has fd-local segments — force per-node (routed run_i8).
-                if (ctx->spool || ctx->via_orkd) type = ORK_CHAIN_NONE;
+                // (orkd: the MUL_MAT chain is routed — ork_resolve_weight_i8 + ork_dispatch_i8 dispatch it
+                // through the daemon's run_chain_i8 / run_i8, so it stays enabled.)
+                if (ctx->spool) type = ORK_CHAIN_NONE;
 
                 if (type != ORK_CHAIN_NONE && node->ne[2] == 1 && node->ne[3] == 1) {
                     chain_nodes.push_back(node);
