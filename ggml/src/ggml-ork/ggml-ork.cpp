@@ -160,11 +160,14 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 3u   // v3 adds ork_fmt (ork-driver pack-compat token = its MAJOR ver) to the footer
+#define ORKPACK_VERSION 4u   // v4 adds bf_size to each entry (the full-K Bf blob stored right after the Bb blob,
+                             // so the orkd import maps Bf directly — no runtime rebuild); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
-struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
+// bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
+// blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; };
 // ork_fmt = ork_pack_format_version() at write time. A tile-layout / quant change bumps ork-driver's
 // MAJOR version, so a stored ork_fmt != this build's => the tiled bytes are incompatible; the file is
 // rejected on read and regenerated (the read path falls through to write mode). magic stays last so it
@@ -621,16 +624,12 @@ static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
 // Open ORK_PERSIST: if the file exists and validates, mmap it for READ (load weights by name); otherwise
 // open a <path>.tmp for WRITE (this run packs the model and dumps it, then finalize renames it in).
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
-    // orkd routes weight residency through the daemon (ork_mm_pack_i8 sends raw bytes, daemon packs +
-    // owns the tile). The .orkpack fast path is fd-local — READ maps page-cache pages into the client's
-    // NPU IOVA (ork_mm_load_i8_import) and WRITE dumps the client's resident tile (ork_w_dump) — neither
-    // works when the daemon owns the NPU. So under orkd, disable persist: every weight live-packs via the
-    // routed pack (correct + NPU-resident; slower cold load — a daemon-side .orkpack import is the follow-on).
-    if (ctx->via_orkd) {
-        if (getenv("ORK_PERSIST") && getenv("ORK_VERBOSE"))
-            fprintf(stderr, "[ORK PERSIST] disabled under orkd (weights live-pack through the daemon; .orkpack import/dump is fd-local)\n");
-        return;
-    }
+    // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
+    // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_mm_import_i8),
+    // which maps it into the client's IOMMU domain — the client manages its own IOVA, the daemon never tiles
+    // or owns weights. WRITE mode (packing a fresh .orkpack) still needs a resident NPU tile to dump, which is
+    // fd-local, so under orkd we only support READ; if the file is absent, fall back to the live-pack path
+    // (write mode is a one-time offline step — generate the .orkpack in a direct-NPU run, then run under orkd).
     const char * p = getenv("ORK_PERSIST");
     if (!p || !*p) return;
     int fd = open(p, O_RDONLY);
@@ -668,6 +667,9 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         }
         close(fd);
     }
+    // WRITE mode (build the .orkpack) works under orkd too: the tiling is done PURE-CPU (ork_w_dump_i8_cpu for
+    // Bb + ork_w_dump_bf_i8_cpu for Bf) from the live-converted raw int8 — no resident NPU tile, no daemon. So a
+    // missing/stale .orkpack self-heals: this run rebuilds it (one-time), future runs READ + import it.
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
@@ -894,8 +896,8 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
             if (tb) {
                 std::vector<char> tmp(tb);
                 ork_w_dump_i4a8(w4, tmp.data(), tb);
-                orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
-                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;
+                orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
                 fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
                 ctx->persist_built.emplace_back(std::string(name), e);
                 ork_mm_free(ctx->npu, w4);
@@ -909,15 +911,28 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     // int8 tier: tile on the CPU from the raw int8 weights when forced CPU-only or when there's no
     // NPU-packed weight (hybrid CPU route — no NPU/IOVA); otherwise dump the NPU-packed tiles. Both
     // produce byte-identical blobs.
-    const bool cpu_dump = (ork_orkpack_cpu_only() && bi_i8) || !ow.w;
+    // Under orkd ow.w is a daemon handle (no local Bb to dump) — must CPU-tile from the raw int8; direct mode
+    // may still dump the NPU-packed tiles. Both produce byte-identical Bb blobs.
+    const bool cpu_dump = ctx->via_orkd ? true : ((ork_orkpack_cpu_only() && bi_i8) || !ow.w);
+    if (cpu_dump && !bi_i8) {   // no raw int8 available for the CPU dump (only under orkd would we get here) — can't persist
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] skip %s (no raw int8 for CPU dump)\n", name);
+        return;
+    }
     size_t tb = cpu_dump ? ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, nullptr, 0)
                          : ork_w_dump(ow.w, nullptr, 0);
     std::vector<char> tmp(tb);
     if (cpu_dump) ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, tmp.data(), tb);
     else          ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
-    e.blob_off = ctx->persist_off; e.blob_size = tb;
+    // Bf (full-K re-tiled) blob, from the raw int8, stored RIGHT AFTER Bb (contiguous) so the orkd import maps
+    // it directly with no runtime rebuild. Only within the Bf run envelope (K%512==0 && K<=4096); else bf==0
+    // and the loader/daemon leaves Bf NULL (wide-K weights run the Bb K-split path). Needs bi_i8 (have it here).
+    size_t bf = bi_i8 ? ork_w_dump_bf_i8_cpu(ctx->npu, K, N, bi_i8, nullptr, 0) : 0;
+    std::vector<char> bftmp(bf);
+    if (bf) ork_w_dump_bf_i8_cpu(ctx->npu, K, N, bi_i8, bftmp.data(), bf);
+    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
+    e.blob_off = ctx->persist_off; e.blob_size = tb; e.bf_size = bf;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+    if (bf) { fwrite(bftmp.data(), 1, bf, ctx->persist_out); ctx->persist_off += bf; }
     e.bscale_off = ctx->persist_off;
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
@@ -934,7 +949,7 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     size_t tb = ork_w_dump(ow.w, nullptr, 0);
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
     e.bscale_off = ctx->persist_off;
@@ -1059,7 +1074,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
             }
             const std::string key = ork_expert_key(src0->name, e);
             const int tier = ork_orkpack_tier(src0->name, K, N, type);
-            orkpack_entry ent; ent.K = K; ent.N = N;
+            orkpack_entry ent{}; ent.K = K; ent.N = N;
             if (tier == 4) {
                 const float * im = ork_imatrix_lookup(src0->name, K);
                 size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nullptr, 0);
@@ -1225,8 +1240,18 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                     if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
                 } else {
                     const double _l0 = ctx->profile ? ork_now_us_e() : 0;
-                    if (!no_import) ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
-                    if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // copy (import off / unavailable)
+                    if (ctx->via_orkd) {
+                        // orkd: the client allocs a dma-buf, copies the pre-tiled blob (Bb, then the contiguous
+                        // Bf region) in, and hands the fd to the daemon (ORKD_IMPORT) which maps it into this
+                        // client's domain — no daemon tiling/ownership. Bf sits right after Bb (relative offset
+                        // = blob_size), so the daemon lays base matmuls' fast-path Bf as views; bf_size==0 =>
+                        // no Bf (wide-K weights run the Bb K-split path).
+                        size_t blob_n = (size_t) e.blob_size + (size_t) e.bf_size;
+                        ow.w = ork_mm_import_i8(ctx->npu, K, N, blob, blob_n, e.bf_size ? (size_t) e.blob_size : 0);
+                    } else {
+                        if (!no_import) ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                        if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // copy (import off / unavailable)
+                    }
                     if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
                     if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
                                 ow.bscale.assign(bs, bs + e.bscale_n); }
