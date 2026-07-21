@@ -259,6 +259,11 @@ struct ork_attn_sm {
 
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
+    bool via_orkd = false;     // true = NPU access routed through the orkd daemon (ork_npu_uses_orkd). In this
+                               // mode the client has NO local NPU fd, so weight residency + matmuls must use the
+                               // ORKD-ROUTED driver APIs only (ork_mm_pack_i8 / ork_mm_run_i8 — the daemon owns
+                               // the buffers). The zero-copy .orkpack import, DMA activation buffers, and the
+                               // fused/stream/chain/MoE runners are fd-local (not routed) and are gated OFF here.
     int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
@@ -616,6 +621,16 @@ static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
 // Open ORK_PERSIST: if the file exists and validates, mmap it for READ (load weights by name); otherwise
 // open a <path>.tmp for WRITE (this run packs the model and dumps it, then finalize renames it in).
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
+    // orkd routes weight residency through the daemon (ork_mm_pack_i8 sends raw bytes, daemon packs +
+    // owns the tile). The .orkpack fast path is fd-local — READ maps page-cache pages into the client's
+    // NPU IOVA (ork_mm_load_i8_import) and WRITE dumps the client's resident tile (ork_w_dump) — neither
+    // works when the daemon owns the NPU. So under orkd, disable persist: every weight live-packs via the
+    // routed pack (correct + NPU-resident; slower cold load — a daemon-side .orkpack import is the follow-on).
+    if (ctx->via_orkd) {
+        if (getenv("ORK_PERSIST") && getenv("ORK_VERBOSE"))
+            fprintf(stderr, "[ORK PERSIST] disabled under orkd (weights live-pack through the daemon; .orkpack import/dump is fd-local)\n");
+        return;
+    }
     const char * p = getenv("ORK_PERSIST");
     if (!p || !*p) return;
     int fd = open(p, O_RDONLY);
@@ -1401,6 +1416,13 @@ static inline float ork_quant_row_i8(const float * yr, int K, int8_t * amr) {
 
 static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
     if (tasks.empty()) return true;
+    // orkd: only ork_mm_run_i8 is daemon-routed (run_stream_i8 / run_chain_i8 are fd-local). Run each task
+    // through the routed single-matmul primitive; the daemon serializes them (and multi-cores each internally).
+    if (ctx->via_orkd) {
+        for (size_t t = 0; t < tasks.size(); t++)
+            if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) return false;
+        return true;
+    }
     int rc;
     if (tasks.size() == 1) {
         rc = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
@@ -5019,11 +5041,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
     // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
     const bool fuse_force = getenv("ORK_FUSE") != nullptr;
-    const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE");
+    // orkd: group fusion packs a CONCATENATED weight and runs it — that pack IS routed, but for the first
+    // orkd landing we force the single-node routed path (one ork_mm_pack_i8 + ork_mm_run_i8 per weight) so the
+    // whole matmul path is provably daemon-routed. Re-enabling group/chain fusion under orkd (both routed) is
+    // a follow-on perf step once NPU residency is validated.
+    const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE") && !ctx->via_orkd;
     // FUSED FFN chain (gate+SiLU, up, GLU, down). The fused per-tensor gate (fc.wg) is packed as an import
     // co-resident in its own layer's domain (ork_pack_pt_f32), so it works at ANY domain count — single
     // domain (<=4GiB) or many (>4GiB), gate/up/down naturally sharing their layer's domain. Just needs int8.
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8;
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;   // orkd: FFN chain uses fd-local run_i8_silu/run_f16_silu + DMA scratch — force per-node
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -5091,7 +5117,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
                 // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
                 // co-resident under allow_evict=false, which the RAM/IOVA tiering can't guarantee).
-                if (ctx->spool) type = ORK_CHAIN_NONE;
+                // orkd: the i8 chain runner has fd-local segments — force per-node (routed run_i8).
+                if (ctx->spool || ctx->via_orkd) type = ORK_CHAIN_NONE;
 
                 if (type != ORK_CHAIN_NONE && node->ne[2] == 1 && node->ne[3] == 1) {
                     chain_nodes.push_back(node);
@@ -5379,6 +5406,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
+    ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // always true here (init hard-fails above otherwise) — gates the orkd-routed weight/matmul path
     g_ork_ctx = ctx;
     ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
     // (b) load the persisted gmax sidecar (<ORK_PERSIST>.gmax) if present: a known model's per-layer gate
@@ -5638,6 +5666,22 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
 static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
     if (ork_off) return false;
+    // orkd: only MUL_MAT is daemon-routed (ork_mm_pack_i8 + ork_mm_run_i8). The other NPU ops here — MoE
+    // (MUL_MAT_ID), attention (SOFT_MAX/FLASH_ATTN), SDP activations (GLU/UNARY/MUL/ADD), SSM_SCAN — run on
+    // fd-local primitives (run_i8_silu, doorbell, dom_activate, DMA scratch) that break when the daemon owns
+    // the NPU. Decline them so ggml keeps them on the CPU backend (correct; they are all opt-in/experimental
+    // and default-off anyway). Routing these through orkd is the follow-on. MUL_MAT + the metadata ops
+    // (NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE) fall through to the normal per-op logic below.
+    if (g_ork_ctx && g_ork_ctx->via_orkd) {
+        switch (op->op) {
+            case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT:
+                break;
+            default:
+                return false;
+        }
+    }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     switch (op->op) {
