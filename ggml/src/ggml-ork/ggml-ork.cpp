@@ -4792,7 +4792,55 @@ static int attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int 
     if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(ctx); return -1; }
     P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
 }
+// GGML_OP_FLASH_ATTN_EXT, DECODE (N==1) -> int8 attention on the NPU under orkd. The fp16 path above is
+// prefill-only (N>=64) and can't run under orkd (its scratch bcreate needs a direct fd). This fills the decode
+// gap: per query head, QK^T and the weighted e.V run int8 on the NPU (via the orkd-routed matmul), the [1,nkv]
+// softmax runs in fp on the HOST (real per-head max-subtraction -> correct for arbitrary scores). Opt-in
+// ORK_ATTN_DEC; gated to nkv in [256, 2048] (int8 0x1040 sched floor .. single-N-tile). v1 packs K^T/V per call
+// (perf-negative — the resident-KV append via ork_kv_* is the next step); this proves orkd-native decode
+// attention is COHERENT first. Returns true on success (supports_op guarantees the shape is handled).
+static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2];
+    const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    const int rk2 = H/Hkv, Kp=512, Lp=(nkv+511)&~511;
+    if (DK>Kp || Lp>2048) return false;
+    { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-dec] NPU decode attention engaged (call %ld): H=%d Hkv=%d DK=%d DV=%d nkv=%d\n", n, H, Hkv, DK, DV, nkv); }
+    float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
+    ork_npu *c = ctx->npu;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    int8_t *Qp=(int8_t*)calloc((size_t)Kp,1), *KTp=(int8_t*)calloc((size_t)Kp*Lp,1),
+           *Vp=(int8_t*)calloc((size_t)Lp*DV,1), *w8=(int8_t*)calloc((size_t)Lp,1);
+    int32_t *scores=(int32_t*)malloc((size_t)Lp*4), *attv=(int32_t*)malloc((size_t)DV*4);
+    double *sc=(double*)malloc((size_t)Lp*sizeof(double));
+    bool ok=false;
+    if (!Qp||!KTp||!Vp||!w8||!scores||!attv||!sc) goto done;
+    for (int h=0; h<H; h++) { int hkv=h/rk2;
+        float qmax=1e-6f,kmax=1e-6f,vmax=1e-6f;
+        for (int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax)qmax=a; }
+        for (int j=0;j<nkv;j++){ for(int e=0;e<DK;e++){ float a=fabsf(rdf(k,e,j,hkv,0)); if(a>kmax)kmax=a; }
+                                 for(int e=0;e<DV;e++){ float a=fabsf(rdf(v,e,j,hkv,0)); if(a>vmax)vmax=a; } }
+        float qs=127.0f/qmax, ks=127.0f/kmax, vs=127.0f/vmax;
+        for (int e=0;e<DK;e++){ Qp[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*qs); for(int j=0;j<nkv;j++) KTp[(size_t)e*Lp+j]=(int8_t)lrintf(rdf(k,e,j,hkv,0)*ks); }
+        ork_w *wkt=ork_mm_pack_i8(c,Kp,Lp,KTp); if(!wkt) goto done;
+        ork_mm_task_i8 t1={wkt,1,Qp,scores}; int rc=ork_mm_run_chain_i8(c,1,&t1); ork_w_free(wkt); if(rc) goto done;
+        double mx=-1e300; for(int j=0;j<nkv;j++){ sc[j]=(double)scores[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
+        double Z=0; for(int j=0;j<nkv;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
+        double wmax=0; for(int j=0;j<nkv;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0);
+        for(int j=0;j<nkv;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
+        for(int j=0;j<nkv;j++)for(int e=0;e<DV;e++) Vp[(size_t)j*DV+e]=(int8_t)lrintf(rdf(v,e,j,hkv,0)*vs);
+        ork_w *wv=ork_mm_pack_i8(c,Lp,DV,Vp); if(!wv) goto done;
+        ork_mm_task_i8 t2={wv,1,w8,attv}; rc=ork_mm_run_chain_i8(c,1,&t2); ork_w_free(wv); if(rc) goto done;
+        for(int e=0;e<DV;e++) ((float*)dst->data)[(size_t)h*DV+e]=(float)((double)attv[e]/(ws*vs));
+    }
+    ok=true;
+done:
+    free(Qp);free(KTp);free(Vp);free(w8);free(scores);free(attv);free(sc);
+    return ok;
+}
 static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    if ((int)dst->src[0]->ne[1] == 1) return ggml_backend_ork_flash_attn_decode(ctx, dst);   // decode -> int8 orkd path
     const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
     const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Bt=(int)q->ne[3];
     const int nkv=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
@@ -5708,6 +5756,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
             case GGML_OP_MUL_MAT:
                 break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                // task #20: the int8 DECODE attention path (ggml_backend_ork_flash_attn_decode) is
+                // orkd-routed (ork_mm_run_chain_i8 / ork_mm_pack_i8), unlike the fp16 prefill path and the
+                // other fd-local primitives this gate declines. Let it through ONLY under ORK_ATTN_DEC so
+                // the real FLASH_ATTN_EXT case below applies the full decode gate (N==1 + shape). Off by
+                // default: without ORK_ATTN_DEC this still declines to CPU, preserving orkd safety.
+                if (getenv("ORK_ATTN_DEC")) break;
+                return false;
             default:
                 return false;
         }
@@ -5981,16 +6037,24 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             return true;
         }
         case GGML_OP_FLASH_ATTN_EXT: {
-            // Fused attention on the NPU (batched QK^T + A·V via fp16 stream, softmax on CPU). Opt-in ORK_ATTN.
-            if (getenv("ORK_ATTN") == nullptr) return false;
+            // NPU attention. PREFILL (N>=64): fp16 batched QK^T+A·V, opt-in ORK_ATTN. DECODE (N==1): int8 path
+            // on the NPU under orkd, opt-in ORK_ATTN_DEC (the fp16 path is prefill-only + can't run under orkd).
             const struct ggml_tensor *q=op->src[0],*k=op->src[1],*v=op->src[2];
             if (!q||!k||!v || op->src[4]) return false;              // src[4]=sinks -> CPU (v1)
             float max_bias=0.0f, softcap=0.0f;
             memcpy(&max_bias,(char*)op->op_params+4,4); memcpy(&softcap,(char*)op->op_params+8,4);
             if (max_bias!=0.0f || softcap!=0.0f) return false;      // v1: no ALiBi / softcap
             const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+            const int nkv=(int)k->ne[1];
+            { static int nq=0; if (getenv("ORK_ATTN_DEC") && nq++ < 8) fprintf(stderr,"[ork-fa-supp] FLASH_ATTN_EXT queried: N=%d nkv=%d DK=%d DV=%d Hkv=%d\n", N, nkv, DK, DV, Hkv); }
             if (Hkv<1 || H%Hkv || DK%32 || DV%16) return false;
-            if (N < 64) return false;                                // prefill only; decode (N==1) -> CPU
+            if (N == 1) {                                            // DECODE -> int8 orkd path (ggml_backend_ork_flash_attn_decode)
+                if (getenv("ORK_ATTN_DEC") == nullptr) return false;
+                if (DK > 512 || nkv < 256 || ((nkv+511)&~511) > 2048) return false;  // sched floor .. single-N-tile
+                return true;
+            }
+            if (getenv("ORK_ATTN") == nullptr) return false;
+            if (N < 64) return false;                                // prefill only
             return true;
         }
         default:
