@@ -5757,6 +5757,13 @@ ggml_backend_t ggml_backend_ork_init(void) {
     if (!want_direct) {
         setenv("ORK_USE_ORKD", "1", 1);   // FORCE (overwrite) so nothing silently drops orkd mode back to direct
         setenv("ORK_ORKD_RING", "1", 1);  // the low-latency decode transport async ork_mm_submit/collect ride
+    } else {
+        // In-process direct mode shares the 4 big cores with llama.cpp's compute threadpool (-t 4). Pinning the
+        // NPU-driver worker threads to those same cores (the default) OVERSUBSCRIBES them against the threadpool
+        // and drags prefill (measured: 136 -> 213 t/s at M=228, i.e. faster than orkd's 168 once unpinned). orkd
+        // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
+        // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
+        setenv("ORK_NO_AFFINITY", "1", 0);
     }
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
