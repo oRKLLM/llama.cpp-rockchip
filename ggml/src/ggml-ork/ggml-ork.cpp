@@ -442,8 +442,16 @@ struct ggml_backend_ork_context {
         std::vector<float> ks, vs;            // [Hkv] fixed int8 scales (from first pack)
         int packed = 0;                       // keys packed so far (== last nkv)
         int Lmax = 0, Hkv = 0, DK = 0, DV = 0;
+        ork_w *ones = nullptr;                // ORK_ATTN_FUSED: resident ones[Lmax,32] reduce weight (Σ = e·ones)
+        int fused = -1;                       // -1 uninit; 0/1 = this layer's resident scales are per-head/global
     };
     std::unordered_map<const void *, ork_kv_layer> attn_kv;
+    // Per-layer DECODE FFN calibration cache (ORK_FFN_DEC): route the SwiGLU inner through the fused orkd
+    // chain (ork_mm_ffn_orkd — one submit) at decode. Per-tensor int8; the intermediate int8 scales (is/os/
+    // us/gs) are calibrated ONCE per layer on the first real decode activation (representative), then reused;
+    // the activation scale + gate/up requant are recomputed live per token. Keyed on the gate weight ptr.
+    struct ork_ffn_dec { bool ready=false; float is=1,os=1,us=1,gs=1, wg_s=1,wu_s=1,wd_s=1; int K=0,Nff=0,Kd=0; };
+    std::unordered_map<const void *, ork_ffn_dec> ffndec;
     // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
     // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
     // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
@@ -2358,8 +2366,10 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
       free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
       if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
-    for (auto & e : ctx->attn_kv)                                // resident-KV decode buffers (ORK_ATTN_KV)
+    for (auto & e : ctx->attn_kv) {                              // resident-KV decode buffers (ORK_ATTN_KV)
         for (ork_kv_resident * r : e.second.kv) if (r) ork_kv_resident_free(ctx->npu, r);
+        if (e.second.ones) ork_mm_free(ctx->npu, e.second.ones);   // ORK_ATTN_FUSED resident ones[Lmax,32]
+    }
     ctx->attn_kv.clear();
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
@@ -4095,6 +4105,83 @@ static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need)
     return *buf;
 }
 
+// ratio r -> fixed-point (mult>>shift), mult kept precise in [2^13, 2^15).
+static inline void ork_ratio_to_ms(double r, int * mult, int * shift) {
+    if (r <= 0) { *mult = 1; *shift = 14; return; }
+    int sh = 14; double m = r * (double)(1 << sh);
+    while (m >= 32767.0 && sh > 0)  { sh--; m = r * (double)(1 << sh); }
+    while (m <  8192.0  && sh < 30) { sh++; m = r * (double)(1 << sh); }
+    int mi = (int) lrint(m); if (mi > 32767) mi = 32767; if (mi < 1) mi = 1;
+    *mult = mi; *shift = sh;
+}
+
+// ORK_FFN_DEC: run the DECODE (M==1) SwiGLU FFN inner on the NPU against the orkpack's ALREADY-RESIDENT
+// PER-CHANNEL int8 weights (ork_resolve_weight_i8 — NO second per-tensor copy, so no double-pack, no IOVA
+// wedge, and full per-channel quality; the weights are SHARED with the prefill path). gate+up batch into ONE
+// run_chain_i8 submit (shared input x, K<=4096); SiLU/GLU run on the host (fp32, per-channel dequant via
+// bscale[n]); down is one wide-K ork_mm_run_i8 submit. 2 NPU submits/layer. Falls through on any miss.
+static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
+        struct ggml_tensor * gate_n, struct ggml_tensor * up_n,
+        struct ggml_tensor * glu_n, struct ggml_tensor * down_n) {
+    (void) glu_n;
+    const struct ggml_tensor * Wg = gate_n->src[0], * Wu = up_n->src[0], * Wd = down_n->src[0];
+    const struct ggml_tensor * x  = gate_n->src[1];
+    const int K = (int) Wg->ne[0], Nff = (int) Wg->ne[1], Kd = (int) Wd->ne[1], M = (int) x->ne[1];
+    if (M != 1 || x->type != GGML_TYPE_F32) return false;              // decode only, fp32 activation
+    if (K % 32 || Nff % 32 || Kd % 16 || K > 4096) return false;       // gate/up chain tile (K<=4096); down wide-K via run_i8
+    // resolve the 3 per-channel weights from the orkpack wcache (resident is_orkd; shared with prefill -> no
+    // extra IOVA). A stream-pool tier entry (w==null) can't feed the chain -> fall through to per-node.
+    auto tof = [](const struct ggml_tensor * W){ return ggml_get_type_traits(W->type)->to_float; };
+    auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, tof(Wg), true);
+    auto itu = ork_resolve_weight_i8(ctx, Wu, K, Nff, Wu->nb[1], Wu->type, tof(Wu), true);
+    auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, tof(Wd), true);
+    if (itg==ctx->wcache.end() || itu==ctx->wcache.end() || itd==ctx->wcache.end()) return false;
+    ork_w *wg=itg->second.w, *wu=itu->second.w, *wd=itd->second.w;
+    if (!wg || !wu || !wd) return false;
+    const float *bsg=itg->second.bscale.data(), *bsu=itu->second.bscale.data(), *bsd=itd->second.bscale.data();
+    // ORK_FFN_PROF: TRUE per-hop timers + bytes moved -> achieved weight-DMA GB/s. The decode wall is
+    // bandwidth: gb/s here vs the LPDDR4X peak (~30) says whether we're at the ceiling or moving data
+    // suboptimally (K-slice re-reads, socket copies). run() time = socket + submit(5us) + HW + return.
+    static int fprof=-1; if(fprof<0) fprof=getenv("ORK_FFN_PROF")?1:0;
+    static double p_q=0,p_gu=0,p_host=0,p_dn=0,p_deq=0; static long p_n=0; double _t;
+    const float * xf = (const float *) x->data;
+    float amx=1e-9f; for (int k=0;k<K;k++){ float a=fabsf(xf[k]); if(a>amx)amx=a; }
+    const float a_scale=amx/127.0f, ainv=127.0f/amx;
+    int8_t  *xi  =(int8_t*) malloc((size_t)K);
+    int32_t *gi  =(int32_t*)malloc((size_t)Nff*4), *ui=(int32_t*)malloc((size_t)Nff*4);
+    int8_t  *glu8=(int8_t*) malloc((size_t)Nff);
+    int32_t *di  =(int32_t*)malloc((size_t)Kd*4);
+    float   *glf =(float*)  malloc((size_t)Nff*4);
+    bool ok=false;
+    if (!xi||!gi||!ui||!glu8||!di||!glf) goto done;
+    _t=fprof?ork_now_us():0;
+    for (int k=0;k<K;k++){ int q=(int)lrintf(xf[k]*ainv); xi[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+    if(fprof){ p_q+=ork_now_us()-_t; _t=ork_now_us(); }
+    { ork_mm_task_i8 t[2]={{wg,1,xi,gi},{wu,1,xi,ui}}; if (ork_mm_run_chain_i8(ctx->npu,2,t)) goto done; }  // gate+up: ONE submit
+    if(fprof){ p_gu+=ork_now_us()-_t; _t=ork_now_us(); }
+    { float gmax=1e-9f;                                                                                   // host: per-channel dequant + SiLU*up
+      for (int n=0;n<Nff;n++){ float g=(float)gi[n]*a_scale*bsg[n], u=(float)ui[n]*a_scale*bsu[n];
+          float v=(g/(1.0f+expf(-g)))*u; glf[n]=v; float av=fabsf(v); if(av>gmax)gmax=av; }
+      const float gs=gmax/127.0f, ginv=127.0f/gmax;
+      for (int n=0;n<Nff;n++){ int q=(int)lrintf(glf[n]*ginv); glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
+      if(fprof){ p_host+=ork_now_us()-_t; _t=ork_now_us(); }
+      if (ork_mm_run_i8(ctx->npu, wd, 1, glu8, di)) goto done;                                            // down: ONE submit (wide-K)
+      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us(); }
+      float * dst=(float*)down_n->data;
+      for (int j=0;j<Kd;j++) dst[j]=(float)((double)di[j]*gs*bsd[j]);
+      if(fprof) p_deq+=ork_now_us()-_t;
+    }
+    ok=true;
+    if(fprof){ p_n++; if(p_n%64==0){ double T=p_q+p_gu+p_host+p_dn+p_deq; if(T<1)T=1;
+        double gub=(double)2*K*Nff, dnb=(double)Nff*Kd;   // resident weight bytes streamed (int8)
+        fprintf(stderr,"[ork-ffn-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus(%.1fGB/s) host-silu %.0fus Down %.0fus(%.1fGB/s) deq %.0fus | %.0fus/layer\n",
+            p_n, p_q/p_n, p_gu/p_n, gub/(p_gu/p_n*1e3), p_host/p_n, p_dn/p_n, dnb/(p_dn/p_n*1e3), p_deq/p_n, T/p_n); } }
+    { static long n=0; if((n++%256)==0) fprintf(stderr,"[ork-ffn-dec] per-channel decode FFN on NPU (call %ld): K=%d Nff=%d Kd=%d\n", n,K,Nff,Kd); }
+done:
+    free(xi);free(gi);free(ui);free(glu8);free(di);free(glf);
+    return ok;
+}
+
 static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         struct ggml_tensor * gate_n, struct ggml_tensor * up_n,
         struct ggml_tensor * glu_n, struct ggml_tensor * down_n) {
@@ -4836,23 +4923,34 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
     if (nkv < 1 || nkv > LmaxCap) return false;
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-kv] resident decode: live_nkv=%d (pad=%d) H=%d Hkv=%d DK=%d\n", nkv, nkv_pad, H, Hkv, DK); }
     auto & LY = ctx->attn_kv[(const void*)k->data];
+    // ORK_ATTN_FUSED: run the whole attention core as Hkv fused chains fanned RR across cores in ONE orkd
+    // round-trip (vs the 2-submit QK^T + host-softmax + e.V path). Needs GLOBAL K/Q scales (the RR dispatch
+    // shares one exp LUT) + a resident ones[Lmax,32] reduce weight.
+    static int fused_env=-1; if(fused_env<0) fused_env=getenv("ORK_ATTN_FUSED")?1:0;
     // (re)alloc on first touch, a sequence reset (cache shrank), a head-count change, OR growth past the
     // current resident width. Lmax is sized to the live nkv rounded to a 512-chunk (NOT the 2048 cap) so the
     // QK^T/e.V matmuls stream only ~nkv-wide weights (weight-DMA-bound) instead of always 2048 — growth
     // re-packs all keys but only crosses a 512 boundary a few times over a full generation. Scales refreshed
     // from the current [0,nkv) abs-max at each (re)pack so all keys quantize consistently.
-    if (LY.kv.empty() || nkv < LY.packed || LY.Hkv != Hkv || nkv > LY.Lmax) {
+    if (LY.kv.empty() || nkv < LY.packed || LY.Hkv != Hkv || nkv > LY.Lmax || LY.fused != fused_env) {
         for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r);
+        if (LY.ones) { ork_mm_free(c, LY.ones); LY.ones = nullptr; }
         int Lm = (nkv+511)&~511; if (Lm < 32) Lm = 32; if (Lm > LmaxCap) Lm = LmaxCap;
         LY.kv.assign(Hkv, nullptr); LY.ks.assign(Hkv, 1.0f); LY.vs.assign(Hkv, 1.0f);
-        LY.packed=0; LY.Lmax=Lm; LY.Hkv=Hkv; LY.DK=DK; LY.DV=DV;
+        LY.packed=0; LY.Lmax=Lm; LY.Hkv=Hkv; LY.DK=DK; LY.DV=DV; LY.fused=fused_env;
+        float kmax_g=1e-6f;
         for (int hkv=0; hkv<Hkv; hkv++) {
             LY.kv[hkv] = ork_kv_resident_alloc(c, DV, Lm);
             if (!LY.kv[hkv]) { for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r); LY.kv.clear(); return false; }
             float kmax=1e-6f, vmax=1e-6f;
             for (int j=0;j<nkv;j++){ for(int e=0;e<DK;e++){ float a=fabsf(rdf(k,e,j,hkv,0)); if(a>kmax)kmax=a; }
                                      for(int e=0;e<DV;e++){ float a=fabsf(rdf(v,e,j,hkv,0)); if(a>vmax)vmax=a; } }
-            LY.ks[hkv]=127.0f/kmax; LY.vs[hkv]=127.0f/vmax;
+            LY.ks[hkv]=127.0f/kmax; LY.vs[hkv]=127.0f/vmax; if(kmax>kmax_g)kmax_g=kmax;   // vs stays per-head (host dequant)
+        }
+        if (fused_env) {   // GLOBAL K scale (shared exp LUT ⇒ qs·ks must be constant across chains) + resident ones[Lm,32]
+            float ksg=127.0f/kmax_g; for (int hkv=0; hkv<Hkv; hkv++) LY.ks[hkv]=ksg;
+            std::vector<int8_t> ones((size_t)Lm*32, 1); LY.ones=ork_mm_pack_i8(c, Lm, 32, ones.data());
+            if (!LY.ones) { for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r); LY.kv.clear(); return false; }
         }
     }
     // per-stage timers (ORK_ATTN_PROF): where the decode-attention wall goes — append(+first-fill) / Q-quant /
@@ -4873,6 +4971,49 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
         LY.packed = nkv;
     }
     if (aprof) a_app += ork_now_us()-_pt;
+    if (LY.fused && LY.ones) {
+        // ORK_ATTN_FUSED: fan the Hkv attention chains [QK^T→exp((s-bias))→reduce,e·V] across the NPU cores in
+        // ONE orkd round-trip. GLOBAL qs/ks ⇒ one shared exp LUT; in_scale/r_mult derived so score_i8·in_scale ==
+        // the true logit (scale·QK^T), so the exp curve is calibrated from known host scales (no data pass).
+        // max_bias keeps args ≤0 (int8 exp never saturates); padding keys [nkv,Lmax) have QK^T=0 ⇒ a constant
+        // e_pad subtracted from Σ (av is unaffected — padding V=0). Falls through to the 2-submit path on error.
+        const int Kp2=512, Nk=LY.Lmax, dv=DV, Nq=rk2;
+        float qmax_g=1e-6f; for(int h=0;h<H;h++) for(int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax_g)qmax_g=a; }
+        double qs=127.0/qmax_g, ks=LY.ks[0];
+        static double insc=-1, biasv=-1;
+        if(insc<0){ const char*e=getenv("ORK_ATTN_INSCALE"); insc=e?atof(e):0.0625; const char*b=getenv("ORK_ATTN_BIAS"); biasv=b?atof(b):127.0; }
+        double out_scale=1.0/127.0;
+        int r_shift=16; double F=(double)scale/(qs*ks)/insc;        // score_i8 = raw·F ⇒ score·insc = scale·QK^T
+        long rm=llround(F*(double)(1LL<<r_shift));
+        while(rm<64 && r_shift<30){ r_shift++; rm=llround(F*(double)(1LL<<r_shift)); }
+        while(rm>(1L<<22) && r_shift>2){ r_shift--; rm=llround(F*(double)(1LL<<r_shift)); }
+        if(rm<1)rm=1; int r_mult=(int)rm;
+        int8_t  *Qall =(int8_t*) calloc((size_t)Hkv*rk2*Kp2,1);
+        int32_t *ssall=(int32_t*)calloc((size_t)Hkv*rk2*32,4), *avall=(int32_t*)calloc((size_t)Hkv*rk2*dv,4);
+        std::vector<ork_w*> wkt(Hkv), wv(Hkv);
+        if (Qall && ssall && avall) {
+            for(int hkv=0;hkv<Hkv;hkv++){ wkt[hkv]=LY.kv[hkv]->wkt; wv[hkv]=LY.kv[hkv]->wv; }
+            for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; int8_t *dq=Qall+((size_t)hkv*rk2+qh)*Kp2;
+                for(int e=0;e<DK;e++) dq[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*(float)qs); }
+            _pt=aprof?ork_now_us():0;
+            int rc=ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                       r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
+            if(aprof) a_qk+=ork_now_us()-_pt;
+            if(rc==0){
+                double epad=exp((0.0-biasv)*insc)/out_scale; long ep=lround(epad); if(ep<0)ep=0; if(ep>127)ep=127;
+                long padc=(long)Nk-nkv;
+                for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; float vs=LY.vs[hkv];
+                    int32_t *ss=ssall+((size_t)hkv*rk2+qh)*32, *av=avall+((size_t)hkv*rk2+qh)*dv;
+                    double S=(double)ss[0]-(double)padc*ep; if(S<=0)S=1;
+                    for(int e=0;e<dv;e++) ((float*)dst->data)[(size_t)h*dv+e]=(float)((double)av[e]/((double)vs*S)); }
+                free(Qall);free(ssall);free(avall);
+                if(aprof){ a_n++; if(a_n%256==0) fprintf(stderr,"[ork-attn-fused] Hkv=%d Nq=%d Nk=%d r_mult=%d r_shift=%d in_scale=%.4f bias=%.0f\n",Hkv,Nq,Nk,r_mult,r_shift,insc,biasv); }
+                return true;
+            }
+            fprintf(stderr,"[ork-attn-fused] rr rc=%d -> fallback to 2-submit path\n", rc);
+        }
+        free(Qall);free(ssall);free(avall);   // fall through to the batched path (global ks is self-consistent there)
+    }
     // BATCHED submits: all H heads' QK^T go in ONE ork_mm_run_chain_i8 (one orkd round-trip), then host
     // softmax, then all H e.V in ONE chain. Collapses the 2*H per-head submits/layer -> 2 — the profiled
     // 87% submit wall. Per-head buffers are contiguous [H][...]; GQA heads share their kv-head's resident wkt/wv.
@@ -5257,6 +5398,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // orkd: the FFN SwiGLU chain stays disabled — it uses fd-local run_i8_silu / run_f16_silu + the GU_CHAIN
     // DMA scratch (not daemon-routed). The generic MUL_MAT chain (below) IS routed and stays on.
     const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;
+    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8 && ctx->via_orkd;   // decode FFN via fused orkd chain
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -5280,6 +5422,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (scan_ahead && !sa_done.empty() && sa_done.count(node)) continue;   // computed early by a scan-ahead group
+        // ORK_FFN_DEC: DECODE (M==1) SwiGLU inner via the fused orkd chain (one submit against the resident
+        // weights). Fires at the gate node; the matcher takes up from glu->src[1] and consumes glu/down.
+        if (ffn_dec && ctx->via_orkd && node->op == GGML_OP_MUL_MAT && node->src[0] &&
+            strstr(node->src[0]->name, "ffn_gate") && node->ne[1] == 1) {
+            struct ggml_tensor *g,*u,*gl,*dn; int last;
+            if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last) &&
+                ggml_backend_ork_ffn_decode_orkd(ctx, g, u, gl, dn)) { i = last; continue; }
+        }
         // ORK_FFN_CHAIN: recognize the fused-SwiGLU FFN inner and run it as ONE round-trip-free int8 chain
         // (int8 intermediates never touch fp32). Consumes all 4 nodes; falls through to per-node on any miss.
         if (ffn_chain && node->op == GGML_OP_MUL_MAT) {
@@ -5894,6 +6044,12 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 // default: without ORK_ATTN_DEC this still declines to CPU, preserving orkd safety.
                 if (getenv("ORK_ATTN_DEC")) break;
                 return false;
+            case GGML_OP_GLU:
+                // ORK_FFN_DEC: the fused DECODE FFN chain (ggml_backend_ork_ffn_decode_orkd) needs the SwiGLU
+                // node in the ORK split so the matcher keeps the gate/up/glu/down subgraph whole. The node's
+                // own compute is consumed (skipped) by the chain; it only needs to be scheduled to ORK.
+                if (getenv("ORK_FFN_DEC")) break;
+                return false;
             default:
                 return false;
         }
@@ -6016,6 +6172,16 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 static const int pe = env_enabled("ORK_MOE_PHASE_EVICT");
                 if (pe && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
             }
+            // ORK_FFN_DEC: admit the DECODE (M==1) FFN gate/up/down to the NPU so the whole gate/up/GLU/down
+            // subgraph is ONE contiguous ORK split (a CPU-side up would fragment it and the matcher couldn't
+            // span the splits). The gate-anchored matcher fuses all 4 (i=last skips up/GLU/down — up never
+            // runs standalone). Scoped by weight name so other decode matmuls (attention proj) stay on CPU.
+            if (getenv("ORK_FFN_DEC") && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
+                op->ne[2] == 1 && op->ne[3] == 1 && src0->name &&
+                (strstr(src0->name, "ffn_gate") || strstr(src0->name, "ffn_up") || strstr(src0->name, "ffn_down"))) {
+                const char * mn = getenv("ORK_FFN_DEC_MIN");   // diagnostic: only fire FFN-dec for layer >= MIN
+                if (!mn || ork_layer_of(src0->name) >= atoi(mn)) return true;
+            }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
             // src0 must be a plain 2-D STATIC weight. mul_mat_i8 resolves src0 as ONE resident 2-D
@@ -6133,7 +6299,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GLU: {
             // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
             // ORK_FFN_CHAIN also needs GLU on ork so the FFN's 4 nodes land in one ork subgraph (fused there).
-            if (!ork_ppu_glu_on() && !ork_ffn_chain_on()) return false;
+            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !getenv("ORK_FFN_DEC")) return false;
+            { const char * mn = getenv("ORK_FFN_DEC_MIN");   // match the FFN-matmul layer gate (src0=gate MM node -> its weight)
+              if (mn && src0 && src0->src[0] && ork_layer_of(src0->src[0]->name) < atoi(mn)) return false; }
             if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
             if (!src0 || !src1) return false;                        // split form only (two inputs)
             if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
@@ -6145,7 +6313,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // FFN's gate/up/GLU/down land in ONE ork subgraph and the chain matcher can fuse them — otherwise
             // the 7B's Nff=18944 GLU is rejected, the scheduler splits the FFN across backends, and the 4
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
-            if (ork_ffn_chain_on()) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
+            if (ork_ffn_chain_on() || getenv("ORK_FFN_DEC")) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         case GGML_OP_SSM_SCAN: {
