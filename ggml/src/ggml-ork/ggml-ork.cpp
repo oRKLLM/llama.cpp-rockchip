@@ -5746,25 +5746,33 @@ ggml_backend_t ggml_backend_ork_init(void) {
         GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
                       g_ork_cfg_silu_int8fused ? "int8-fused(through)" : "int16-coherent", g_ork_cfg_dflash ? "on" : "off");
     }
-    // orkd is THE NPU access path on this branch — not an opt-in, no toggle. The daemon owns the single-stream
-    // NPU and serializes every submit (direct concurrent access wedges the IOMMU). ork_npu_init() activates the
-    // orkd client through these env vars (its only public trigger; the daemon itself sets ORKD_IS_DAEMON, which
-    // we never do here, so this only routes the CLIENT). We FORCE them (overwrite) so there is no environment
-    // gate that can silently drop the process back to the direct path. The ring is the low-latency decode
-    // transport that async ork_mm_submit/collect ride.
-    setenv("ORK_USE_ORKD", "1", 1);
-    setenv("ORK_ORKD_RING", "1", 1);
+    // orkd is the DEFAULT NPU path: the daemon owns the single-stream NPU and serializes every submit, so
+    // concurrent processes can't wedge the IOMMU (a dev-time safety property, not a separate architecture).
+    // ork_npu_init() activates the orkd CLIENT via these env vars (the daemon itself sets ORKD_IS_DAEMON, which
+    // we never do here). The lib (direct) path is behaviorally IDENTICAL to orkd — same op set + shapes, proven
+    // by test_api_parity and the direct-vs-orkd A/B — differing only in transport; orkd just adds the socket +
+    // single-stream serialization. ORK_DIRECT=1 opts into the in-process lib path (single-process runs /
+    // profiling, where the daemon's serialization isn't needed and the socket round-trips aren't wanted).
+    const bool want_direct = getenv("ORK_DIRECT") != nullptr;
+    if (!want_direct) {
+        setenv("ORK_USE_ORKD", "1", 1);   // FORCE (overwrite) so nothing silently drops orkd mode back to direct
+        setenv("ORK_ORKD_RING", "1", 1);  // the low-latency decode transport async ork_mm_submit/collect ride
+    }
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
-    // Direct-NPU is not a supported fallback here: if the daemon didn't connect (missing/unspawnable ORKD_BIN,
-    // socket refused) the routing silently drops to the single-stream direct path — the exact footgun the orkd
-    // migration removes. Fail loudly so a misconfigured daemon is caught at load, not as a mid-run IOMMU wedge.
-    if (!ork_npu_uses_orkd(npu)) {
+    // In the DEFAULT (orkd) mode, direct-NPU is not a silent fallback: if the daemon didn't connect
+    // (missing/unspawnable ORKD_BIN, socket refused) the routing would silently drop to the single-stream direct
+    // path mid-load — the footgun the orkd migration removes. Fail loudly so a misconfigured daemon is caught at
+    // load, not as a mid-run IOMMU wedge. When ORK_DIRECT=1 the direct path is the DELIBERATE choice, so allow it.
+    if (!want_direct && !ork_npu_uses_orkd(npu)) {
         GGML_LOG_ERROR("%s: NOT routed through orkd (daemon connect failed) — check ORKD_BIN points at the orkd "
-                       "binary and it is spawnable. Direct-NPU is not a supported path on this build.\n", __func__);
+                       "binary and it is spawnable, or set ORK_DIRECT=1 to deliberately use the in-process lib "
+                       "path (single-stream: do not run concurrent NPU processes).\n", __func__);
         ork_npu_free(npu);
         return NULL;
     }
+    if (want_direct)
+        GGML_LOG_INFO("%s: ORK_DIRECT=1 — in-process lib NPU path (no orkd daemon; single-stream, no concurrent NPU procs)\n", __func__);
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
     ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // always true here (init hard-fails above otherwise) — gates the orkd-routed weight/matmul path
