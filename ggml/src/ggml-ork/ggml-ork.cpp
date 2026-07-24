@@ -5403,14 +5403,17 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
     if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
-        bool has_ffn = false, has_glu = false;
+        // ORK_LAYER_SPINE recon: dump the FULL assigned span (op + this-node name + src0/src1 names) so the
+        // whole-layer matcher can be written against the real runtime graph and its fragmentation seen.
+        int cap = getenv("ORK_DUMP_ALL") ? 200 : 40;
+        bool has_ffn = getenv("ORK_DUMP_ALL") ? true : false, has_glu = false;
         for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
             if (n->op == GGML_OP_GLU) has_glu = true;
             if (n->src[0] && (strstr(n->src[0]->name,"ffn_gate")||strstr(n->src[0]->name,"ffn_down"))) has_ffn = true; }
         if ((has_ffn || has_glu) && dumped++ < 3) {
-            fprintf(stderr, "[ORK GRAPH] FFN subgraph, %d nodes (has_ffn=%d has_glu=%d):\n", cgraph->n_nodes, has_ffn, has_glu);
-            for (int i = 0; i < cgraph->n_nodes && i < 40; i++) { struct ggml_tensor * n = cgraph->nodes[i];
-                fprintf(stderr, "  [%2d] %-12s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op),
+            fprintf(stderr, "[ORK GRAPH] span %d nodes (has_ffn=%d has_glu=%d):\n", cgraph->n_nodes, has_ffn, has_glu);
+            for (int i = 0; i < cgraph->n_nodes && i < cap; i++) { struct ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "  [%2d] %-12s %-18s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op), n->name[0]?n->name:"-",
                         n->src[0]?n->src[0]->name:"-", n->src[1]?n->src[1]->name:"-", (long)n->ne[0], (long)n->ne[1]);
             } fflush(stderr); } }
     // Step 1 (ORK_SCAN_AHEAD): gather INDEPENDENT same-input matmuls that graph order interleaves with movable
