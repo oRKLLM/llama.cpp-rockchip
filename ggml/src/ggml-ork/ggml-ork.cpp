@@ -433,6 +433,17 @@ struct ggml_backend_ork_context {
     // concurrent ork backends don't corrupt each other's attention buffers. Freed in ggml_backend_ork_free.
     struct ork_attn_pool attnp = {};
     struct ork_attn_sm   attn_sm = {};
+    // Resident-KV for the int8 DECODE attention path (ORK_ATTN_KV): pack K^T/V ONCE per (layer, kv-head)
+    // then append one key/value per token (no per-call repack — the perf lever, vs the default repack path).
+    // Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Fixed per-head int8
+    // scales chosen at the first pack. Freed in ggml_backend_ork_free / on a sequence reset (nkv shrink).
+    struct ork_kv_layer {
+        std::vector<ork_kv_resident *> kv;   // [Hkv] resident K^T/V bundles
+        std::vector<float> ks, vs;            // [Hkv] fixed int8 scales (from first pack)
+        int packed = 0;                       // keys packed so far (== last nkv)
+        int Lmax = 0, Hkv = 0, DK = 0, DV = 0;
+    };
+    std::unordered_map<const void *, ork_kv_layer> attn_kv;
     // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
     // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
     // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
@@ -2347,6 +2358,9 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
       free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
       if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
+    for (auto & e : ctx->attn_kv)                                // resident-KV decode buffers (ORK_ATTN_KV)
+        for (ork_kv_resident * r : e.second.kv) if (r) ork_kv_resident_free(ctx->npu, r);
+    ctx->attn_kv.clear();
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     g_ork_ctx = nullptr;
@@ -4792,6 +4806,118 @@ static int attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int 
     if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(ctx); return -1; }
     P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
 }
+// Resident-KV variant of the int8 decode attention (ORK_ATTN_KV): instead of packing K^T/V every call
+// (the O(nkv)/token repack tax that makes the default path perf-negative), pack ONCE per (layer, kv-head)
+// via ork_kv_resident_alloc, then append just the new key/value each token (ork_kv_append — one tile write,
+// no repack). Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Per-head int8
+// scales are FIXED at the first pack (appended keys reuse them — a v1 tradeoff: a later key that exceeds the
+// initial abs-max clips). The matmuls (QK^T, e.V) run against the resident weights; softmax stays host-fp.
+static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
+    const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv_pad=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    const int rk2 = H/Hkv, Kp=512, LmaxCap=2048;   // cap matches the supports_op gate (nkv<=2048); RK3588 nmax=8192
+    if (DK!=DV || DK>Kp || nkv_pad>LmaxCap || nkv_pad<1) return false;   // API bundles ONE HD for K^T & V; single N-tile
+    float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
+    ork_npu *c = ctx->npu;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    // k->ne[1] is the FULL/padded KV-cache width, NOT the live token count — it stays constant as generated
+    // tokens fill the cache, so "append when nkv grows" would never fire and the resident KV would go stale
+    // (the repack path dodges this by re-reading the whole cache every call). Derive the live count from the
+    // mask: valid keys have a finite mask value, padding/future keys are -inf. Valid region is contiguous
+    // [0,nkv) for causal decode. No mask -> assume the whole (padded) width is live.
+    int nkv = nkv_pad;
+    if (mask) {
+        auto mval = [&](int j) -> float { const char * p=(const char*)mask->data + (size_t)j*mask->nb[0];
+            return mask->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+        nkv = 0; for (int j=0;j<nkv_pad;j++) if (mval(j) > -1e30f) nkv = j+1;
+    }
+    if (nkv < 1 || nkv > LmaxCap) return false;
+    { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-kv] resident decode: live_nkv=%d (pad=%d) H=%d Hkv=%d DK=%d\n", nkv, nkv_pad, H, Hkv, DK); }
+    auto & LY = ctx->attn_kv[(const void*)k->data];
+    // (re)alloc on first touch, a sequence reset (cache shrank), a head-count change, OR growth past the
+    // current resident width. Lmax is sized to the live nkv rounded to a 512-chunk (NOT the 2048 cap) so the
+    // QK^T/e.V matmuls stream only ~nkv-wide weights (weight-DMA-bound) instead of always 2048 — growth
+    // re-packs all keys but only crosses a 512 boundary a few times over a full generation. Scales refreshed
+    // from the current [0,nkv) abs-max at each (re)pack so all keys quantize consistently.
+    if (LY.kv.empty() || nkv < LY.packed || LY.Hkv != Hkv || nkv > LY.Lmax) {
+        for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r);
+        int Lm = (nkv+511)&~511; if (Lm < 32) Lm = 32; if (Lm > LmaxCap) Lm = LmaxCap;
+        LY.kv.assign(Hkv, nullptr); LY.ks.assign(Hkv, 1.0f); LY.vs.assign(Hkv, 1.0f);
+        LY.packed=0; LY.Lmax=Lm; LY.Hkv=Hkv; LY.DK=DK; LY.DV=DV;
+        for (int hkv=0; hkv<Hkv; hkv++) {
+            LY.kv[hkv] = ork_kv_resident_alloc(c, DV, Lm);
+            if (!LY.kv[hkv]) { for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r); LY.kv.clear(); return false; }
+            float kmax=1e-6f, vmax=1e-6f;
+            for (int j=0;j<nkv;j++){ for(int e=0;e<DK;e++){ float a=fabsf(rdf(k,e,j,hkv,0)); if(a>kmax)kmax=a; }
+                                     for(int e=0;e<DV;e++){ float a=fabsf(rdf(v,e,j,hkv,0)); if(a>vmax)vmax=a; } }
+            LY.ks[hkv]=127.0f/kmax; LY.vs[hkv]=127.0f/vmax;
+        }
+    }
+    // per-stage timers (ORK_ATTN_PROF): where the decode-attention wall goes — append(+first-fill) / Q-quant /
+    // QK^T orkd submit / host softmax / e.V orkd submit. Answers pack-bound vs submit(round-trip)-bound.
+    static int aprof=-1; if(aprof<0) aprof=getenv("ORK_ATTN_PROF")?1:0;
+    static double a_app=0,a_qq=0,a_qk=0,a_sm=0,a_av=0; static long a_n=0,a_appk=0; double _pt;
+    // append newly-cached keys [packed, nkv) to each kv-head (1/step steady state; the whole prompt at first touch)
+    _pt = aprof?ork_now_us():0;
+    if (nkv > LY.packed) {
+        int8_t kcol[512], vrow[512];
+        for (int hkv=0; hkv<Hkv; hkv++) { float ks=LY.ks[hkv], vs=LY.vs[hkv];
+            for (int j=LY.packed; j<nkv; j++) {
+                for (int e=0;e<DK;e++) kcol[e]=(int8_t)lrintf(rdf(k,e,j,hkv,0)*ks);
+                for (int e=0;e<DV;e++) vrow[e]=(int8_t)lrintf(rdf(v,e,j,hkv,0)*vs);
+                if (ork_kv_append(c, LY.kv[hkv], j, kcol, vrow)) return false;
+                if (aprof) a_appk++;
+            } }
+        LY.packed = nkv;
+    }
+    if (aprof) a_app += ork_now_us()-_pt;
+    // BATCHED submits: all H heads' QK^T go in ONE ork_mm_run_chain_i8 (one orkd round-trip), then host
+    // softmax, then all H e.V in ONE chain. Collapses the 2*H per-head submits/layer -> 2 — the profiled
+    // 87% submit wall. Per-head buffers are contiguous [H][...]; GQA heads share their kv-head's resident wkt/wv.
+    int8_t  *Qp =(int8_t*) calloc((size_t)H*Kp,1),      *w8  =(int8_t*) calloc((size_t)H*LmaxCap,1);
+    int32_t *scores=(int32_t*)malloc((size_t)H*LmaxCap*4), *attv=(int32_t*)malloc((size_t)H*DV*4);
+    double  *sc =(double*)malloc((size_t)nkv*sizeof(double));
+    float   *qsA=(float*) malloc((size_t)H*4),          *wsA =(float*) malloc((size_t)H*4);
+    ork_mm_task_i8 *t1=(ork_mm_task_i8*)malloc((size_t)H*sizeof(ork_mm_task_i8));
+    ork_mm_task_i8 *t2=(ork_mm_task_i8*)malloc((size_t)H*sizeof(ork_mm_task_i8));
+    bool ok=false;
+    if (!Qp||!w8||!scores||!attv||!sc||!qsA||!wsA||!t1||!t2) goto done;
+    // Phase 1: quantize Q per head + build the QK^T task list
+    _pt=aprof?ork_now_us():0;
+    for (int h=0; h<H; h++) { int hkv=h/rk2;
+        float qmax=1e-6f; for (int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax)qmax=a; }
+        float qs=127.0f/qmax; qsA[h]=qs;
+        int8_t *Qh=Qp+(size_t)h*Kp; for (int e=0;e<DK;e++) Qh[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*qs);
+        t1[h]=(ork_mm_task_i8){LY.kv[hkv]->wkt,1,Qh,scores+(size_t)h*LmaxCap};
+    }
+    if(aprof){ a_qq+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    if (ork_mm_run_chain_i8(c, H, t1)) goto done;                     // ONE submit: all H QK^T
+    if(aprof){ a_qk+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    // Phase 2: host softmax per head (per-head max-subtraction) -> int8 weights + e.V task list
+    for (int h=0; h<H; h++) { int hkv=h/rk2; float qs=qsA[h], ks=LY.ks[hkv];
+        int32_t *sco=scores+(size_t)h*LmaxCap; int8_t *w=w8+(size_t)h*LmaxCap;
+        double mx=-1e300; for(int j=0;j<nkv;j++){ sc[j]=(double)sco[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
+        double Z=0; for(int j=0;j<nkv;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
+        double wmax=0; for(int j=0;j<nkv;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0); wsA[h]=(float)ws;
+        for(int j=0;j<nkv;j++){ int wi=(int)lrint(sc[j]*ws); w[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
+        t2[h]=(ork_mm_task_i8){LY.kv[hkv]->wv,1,w,attv+(size_t)h*DV};
+    }
+    if(aprof){ a_sm+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    if (ork_mm_run_chain_i8(c, H, t2)) goto done;                     // ONE submit: all H e.V
+    if(aprof) a_av+=ork_now_us()-_pt;
+    // Phase 3: dequant + write
+    for (int h=0; h<H; h++) { float ws=wsA[h], vs=LY.vs[h/rk2]; int32_t *av=attv+(size_t)h*DV;
+        for(int e=0;e<DV;e++) ((float*)dst->data)[(size_t)h*DV+e]=(float)((double)av[e]/(ws*vs)); }
+    if (aprof) { a_n++; if (a_n%256==0) { double T=a_app+a_qq+a_qk+a_sm+a_av; if(T<1)T=1;
+        fprintf(stderr,"[ork-attn-kv PROF] layer-calls=%ld total-appends=%ld | append+fill %.0fms(%.0f%%) Qquant %.0fms(%.0f%%) QKT-submit %.0fms(%.0f%%) softmax %.0fms(%.0f%%) AV-submit %.0fms(%.0f%%) | attn-tot %.0fms\n",
+            a_n,a_appk, a_app/1e3,100*a_app/T, a_qq/1e3,100*a_qq/T, a_qk/1e3,100*a_qk/T, a_sm/1e3,100*a_sm/T, a_av/1e3,100*a_av/T, T/1e3); } }
+    ok=true;
+done:
+    free(Qp);free(w8);free(scores);free(attv);free(sc);free(qsA);free(wsA);free(t1);free(t2);
+    return ok;
+}
 // GGML_OP_FLASH_ATTN_EXT, DECODE (N==1) -> int8 attention on the NPU under orkd. The fp16 path above is
 // prefill-only (N>=64) and can't run under orkd (its scratch bcreate needs a direct fd). This fills the decode
 // gap: per query head, QK^T and the weighted e.V run int8 on the NPU (via the orkd-routed matmul), the [1,nkv]
@@ -4805,6 +4931,10 @@ static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, s
     const int rk2 = H/Hkv, Kp=512, Lp=(nkv+511)&~511;
     if (DK>Kp || Lp>2048) return false;
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-dec] NPU decode attention engaged (call %ld): H=%d Hkv=%d DK=%d DV=%d nkv=%d\n", n, H, Hkv, DK, DV, nkv); }
+    // ORK_ATTN_KV: resident-KV (pack-once + append/token) — the perf path. ORK_ATTN_KV_REPACK forces the
+    // per-call repack below (default) for A/B. Resident needs DK==DV (the ork_kv_* API bundles one HD).
+    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : (getenv("ORK_ATTN_KV") ? 1 : 0);
+    if (kv_res && DK==DV) return ggml_backend_ork_flash_attn_decode_kv(ctx, dst);
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
