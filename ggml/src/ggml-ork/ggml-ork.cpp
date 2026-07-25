@@ -5914,8 +5914,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
           //   W8A8 (qbits==8): int8 tile K*N  (also the resident form for Q4_K/q4_0 sources — the i4a8 storage
           //                    path INFLATES their nibbles to int8; that's why we size from K*N, not the blob).
           //   W4A4 (qbits==4): native int4 tile K*N/2 (nibbles resident, DT_I4).
-          // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). FUSION adds NO volume: the fused
-          // per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1. MEASURED (int8): 7B = 12.26 GiB resident.
+          // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). ORK_FFN_CHAIN: the fused
+          // per-tensor gate (fc.wg, ork_pack_pt_f32) COEXISTS with the per-channel gate — ork_ffn_prep
+          // deliberately does NOT evict it (freeing mid-eval fragments the 32-bit IOVA -> import ENOMEM ->
+          // wedge). So fc.wg ADDS a K*Nff int8 tile + its full-K Bf per ffn_gate; it is packed FRESH at
+          // runtime and is NOT in persist_idx, so the loop below must add it explicitly or the byte-balanced
+          // domains have no room -> the runtime fc.wg pack overflows -> OOM (load) / re-pack churn (JIT). (The
+          // old "fc.wg REPLACES the gate 1:1, adds no volume" belief was stale — the code keeps both.)
+          // MEASURED (int8): 7B non-chain = 12.26 GiB resident.
           // ORK_FFN_F16: the FFN gate/up/down may run the fp16 route, whose buffers (resident fp16 tile =
           // 2*K*N, no Bf; or the JIT shared scratch + per-mode-switch Cc realloc) are NOT part of the int8
           // footprint below. Left unaccounted, they overflow near-full domains and a mid-forward alloc
@@ -5923,6 +5929,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // fp16 delta per FFN weight so auto-sizing leaves IOVA HEADROOM. gmax subset is unknown at init ->
           // assume all FFN layers (worst case; JIT over-counts but that's safe slack).
           const bool f16route = getenv("ORK_FFN_F16") != nullptr;
+          const bool chain    = ork_ffn_chain_on() && ctx->qbits == 8;   // packs a coexisting per-tensor fc.wg per ffn_gate
           const bool no_bf = getenv("ORK_NO_BF") != nullptr;   // NO_BF sheds the full-K Bf rebuild -> don't size for it
           size_t inflated = 0;
           for (const auto & kv : ctx->persist_idx) {
@@ -5934,6 +5941,12 @@ ggml_backend_t ggml_backend_ork_init(void) {
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
                   inflated += (size_t) 2 * K * N;                      // fp16 tile headroom (no Bf)
+              // ORK_FFN_CHAIN: the fused per-tensor gate fc.wg (packed fresh at runtime, NOT in persist_idx)
+              // coexists with the per-channel gate — add its int8 tile + full-K Bf per ffn_gate so the domains
+              // are sized to hold it (else the runtime fc.wg pack overflows -> OOM/churn — the multi-domain
+              // 7B chain bug). Same tile shape as the gate itself (ork_pack_pt_f32 K*Nff, K<=4096 -> has Bf).
+              if (chain && kv.first.find("ffn_gate") != std::string::npos)
+                  inflated += tile + ((K <= 4096 && !no_bf) ? tile : 0);
           }
           // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
           // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
