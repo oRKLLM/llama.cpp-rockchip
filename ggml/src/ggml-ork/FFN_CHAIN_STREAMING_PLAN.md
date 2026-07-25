@@ -22,44 +22,45 @@ The chain's *math* does not require co-residence — ggml-ork.cpp already notes 
 co-residence; each is a SEPARATE `ork_mm_run_*` call, `dom_activate` switching between." Only **one weight is
 needed resident at a time.** The co-residence is an artifact of the LRU cache policy, not the algorithm.
 
-## Goal
+## Goal (REVISED — domain-ordered full residence, ZERO reload; restores prior behavior)
 
-A **layer-windowed streaming** residence policy for the chain so the resident working set is bounded to the
-**active layer** (≈400–800 MB, fits one domain), with each layer's weights (re)loaded **once per prefill
-forward** instead of thrashed per-op. Turns the IOVA-budget wall into a bounded, amortizable per-forward DMA
-cost. **Gated on beating the 44 t/s non-chain baseline** — a null/negative result is acceptable and closes
-the thread.
+The correct model is **not** per-layer reload/streaming — it is **domain-ordered full residence**, which the
+non-chain multi-domain path ALREADY achieves (11.45 GiB across 5 domains, **churn=0**, 44 t/s): every weight
+stays NPU-resident across ALL domains the whole time (the domains' combined IOVA, N × ~3.9 GiB, holds the
+full set), and because domains are **layer-aligned** (`ork_weight_domain` advances only at layer boundaries →
+contiguous layer ranges), a forward naturally processes domain 0's layers, then domain 1's, … — `dom_activate`
+just switches the active domain at each domain boundary (~4 swaps/forward × 0.78 µs). **No reload, no
+eviction, churn=0.** The chain REGRESSED this (churn=1960 / OOM); the goal is to restore it for the chain path.
 
-## Approach
+## Approach (REVISED)
 
-1. **Windowed wcache eviction policy (the core change).** Today `ork_wcache_evict` is demand-driven LRU
-   (evicts the globally-least-recently-used when over budget). Add a **layer-window mode** (behind the chain):
-   evict the *previous* layer's weights when the chain advances to a new layer, keeping only the active layer
-   (and optionally layer+1 for prefetch/pipelining) resident. Deterministic eviction (last-layer-out,
-   next-layer-in) means a weight is never evicted-then-immediately-re-needed — which is exactly the churn
-   signature (`churn = 1960 ≫ 84 = 28 layers × 3 weights`).
-   - Mechanism: a `layer` hint from `ggml_backend_ork_ffn_swiglu_chain` (it already knows the layer via the
-     weight name / `ork_layer_of`) into the wcache; eviction prefers non-active-layer entries.
-   - This composes with the existing **`wcache_pin`** (already landed): pin protects the *active op's* weights
-     within a layer; the window bounds *across* layers.
+1. **Hold the chain's full resident set, process domain-ordered — don't evict mid-forward.** The chain must
+   NOT re-pack at runtime. Concretely:
+   - **Size for the chain's larger set.** The chain forces the wide `ffn_up`/`ffn_down` (N/K=18944) onto the
+     NPU that the baseline declines to CPU — so the resident footprint is bigger than the non-chain 11.45 GiB
+     (+ Bf under KEEP_BF). The auto-sizer + `ork_wcache_budget` must size `n_domains` and the budget for THAT
+     full set **plus per-domain headroom for runtime scratch** (the KEEP_BF run OOM'd on an 8 MB `Bb[0]`
+     scratch because all 8 domains were packed to the brim — leave ~one weight's slack per domain).
+   - **Load everything in the LOAD phase, never JIT at runtime.** churn (`mem_create_runtime`) counts
+     runtime packs; ORK_ALLOW_JIT builds weights during the first forward → those count as churn (the 1960 was
+     largely JIT build packs). A pre-built complete pack (all chain weights) + full residence = churn 0.
+   - With the set fully resident and budget ≥ footprint, `ork_wcache_evict` never fires within a forward →
+     domain-ordered processing falls out naturally (dom_activate at boundaries, no eviction). The landed
+     `wcache_pin` covers the within-op case; this covers the across-domain case by simply not over-committing.
 
-2. **Prefill-only engagement (already true).** The chain has an `M < 32` skip, so decode (M=1) never uses it.
-   Streaming is correct only for prefill (one forward over M rows amortizes the reload); decode stays CPU.
-   So the redesign needs **no** decode path — the `NO_BF` "no verified doorbell path" failure disappears
-   because the chain simply isn't on the decode path. (This also sidesteps task #19.)
+2. **Prefill-only (already true).** The chain's `M<32` skip keeps decode (M=1) off the chain → decode stays
+   CPU. So there is NO decode NPU path to satisfy — the `NO_BF` "no verified doorbell path" failure and the
+   warmup-decode OOM both come from decode wrongly trying the NPU; ensure M=1 `ffn_up`/`down` **decline to CPU**
+   (don't pack at runtime). That removes the last two failure modes without touching the driver decode path.
 
-3. **Bf under a window fits.** With only ~1 layer resident, `KEEP_BF` (Bf ≈ another tile per K≤4096 weight)
-   costs ~1 extra layer's worth (~few hundred MB) — well inside one domain. So `KEEP_BF` can stay on (keeps
-   the fused-SiLU envelope) without the 8-domain blowup, and the OOM disappears.
+## Why it should win (residence, not a reload tradeoff)
 
-## Why it *might* win (and why it must be measured)
-
-- Streaming reload = ~11 GiB @ ~11 GB/s ≈ 1–2 s per prefill forward, **amortized over the M-row batch**
-  (M=128 → ~0.01 s/row) — cheap per token.
-- The chain moves the *whole* FFN onto the NPU (int8 GEMM ~17× the CPU). The **baseline already declines the
-  wide `ffn_up`/`ffn_down` (N/K = 18944) to CPU** — so the win is `CPU_FFN_time_saved − reload_DMA_time`.
-  Plausibly positive at prefill M, but **not assumed** — the baseline's CPU FFN + NPU-for-fitting-weights is
-  already 44 t/s. The redesign clears the bar only if the reload DMA is cheaper than the CPU FFN it removes.
+Because it's zero-reload, the chain runs at the **same residence efficiency as the non-chain 44 t/s path**,
+PLUS the fusion benefit (gate/SiLU/up/GLU collapsed, int8 intermediates never round-trip to fp32, fewer
+submits). So the expected win is the **fusion delta over 44 t/s**, not a reload gamble. The only real work is
+restoring full residence (sizing + no runtime JIT + decode-declines-to-CPU) so churn returns to 0. Still
+**gated on a board A/B beating 44 t/s** (+ PPL for the SmoothQuant static scales), but the framing is now
+"restore the residence the chain regressed," not "pay a per-forward reload."
 
 ## Measurement gate
 
