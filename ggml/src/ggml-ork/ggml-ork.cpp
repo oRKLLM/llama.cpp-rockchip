@@ -5857,11 +5857,15 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
     // residence never evicts.
     { const char * nd = getenv("ORK_DOMAINS");
-      if (nd) {                                                  // explicit override (debug/pinning)
-          ctx->n_domains = atoi(nd);
-          if (ctx->n_domains < 1)  ctx->n_domains = 1;
-          if (ctx->n_domains > 16) ctx->n_domains = 16;
-      } else if (!ctx->persist_idx.empty()) {
+      // ORK_DOMAINS is DEPRECATED + IGNORED: the auto-sizer below computes the domain count from the resident
+      // orkpack footprint (per quant path, + full-K Bf, byte-balanced to a 2.5 GiB/domain cap). An explicit
+      // override that fell BELOW the auto-safe count under-provisioned IOVA -> last-domain overflow -> Bf
+      // PRIME-fail -> warmup soft-reset/wedge (hit at DOMAINS=2 and =4). Auto is authoritative; use
+      // ORK_DOMAIN_LAYERS for manual layer->domain control. TODO: drop the var entirely once no caller sets it.
+      if (nd) fprintf(stderr, "[ork] WARNING: ORK_DOMAINS=%s is DEPRECATED and IGNORED — the domain count is "
+                              "auto-sized from the orkpack footprint (an explicit value can under-provision IOVA "
+                              "and wedge). Unset it.\n", nd);
+      if (!ctx->persist_idx.empty()) {
           // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate for the resident Bb+Bf footprint,
           // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
           // 4 GiB domain -> n_domains=1 (the single-domain FAST PATH — and the regime the fused FFN chain
