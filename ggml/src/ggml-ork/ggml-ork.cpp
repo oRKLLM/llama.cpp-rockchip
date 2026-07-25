@@ -5857,14 +5857,12 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
     // residence never evicts.
     { const char * nd = getenv("ORK_DOMAINS");
-      // ORK_DOMAINS is DEPRECATED + IGNORED: the auto-sizer below computes the domain count from the resident
-      // orkpack footprint (per quant path, + full-K Bf, byte-balanced to a 2.5 GiB/domain cap). An explicit
-      // override that fell BELOW the auto-safe count under-provisioned IOVA -> last-domain overflow -> Bf
-      // PRIME-fail -> warmup soft-reset/wedge (hit at DOMAINS=2 and =4). Auto is authoritative; use
-      // ORK_DOMAIN_LAYERS for manual layer->domain control. TODO: drop the var entirely once no caller sets it.
-      if (nd) fprintf(stderr, "[ork] WARNING: ORK_DOMAINS=%s is DEPRECATED and IGNORED — the domain count is "
-                              "auto-sized from the orkpack footprint (an explicit value can under-provision IOVA "
-                              "and wedge). Unset it.\n", nd);
+      // ORK_DOMAINS is DEPRECATED: the auto-sizer below computes the domain count from the resident orkpack
+      // footprint. It is honored ONLY as a CLAMP-UP (force MORE domains than auto, never fewer) — a value BELOW
+      // the auto count under-provisions IOVA -> last-domain overflow -> Bf PRIME-fail -> warmup wedge (hit at
+      // DOMAINS=2, =4), so it can never lower the count; but the auto footprint calc can itself UNDER-count the
+      // import path (observed: 7B import auto=5 overflowed; needed more), so raising it stays a valid escape
+      // hatch. Applied AFTER the auto block (below). ORK_DOMAIN_LAYERS remains for manual layer->domain control.
       if (!ctx->persist_idx.empty()) {
           // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate for the resident Bb+Bf footprint,
           // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
@@ -5921,6 +5919,21 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // No .orkpack index (live-pack / write mode): footprint unknown up front (weights arrive one matmul
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
           ctx->n_domains = 8;
+      }
+      // DEPRECATED ORK_DOMAINS, applied as a CLAMP-UP only (see the block header). Raising n_domains alone is
+      // safe: ork_weight_domain fills each domain to the (unchanged) fill cap and simply uses more of them, so
+      // the extra domains add IOVA headroom and no domain overflows — the fix for an auto under-count.
+      if (nd) {
+          int req = atoi(nd); if (req < 1) req = 1; if (req > 16) req = 16;
+          if (req > ctx->n_domains) {
+              fprintf(stderr, "[ork] WARNING: ORK_DOMAINS is deprecated; auto sized %d domains, clamping UP to %d "
+                              "(auto can under-count the import footprint; raising is the only honored direction)\n",
+                      ctx->n_domains, req);
+              ctx->n_domains = req;
+          } else {
+              fprintf(stderr, "[ork] WARNING: ORK_DOMAINS=%d is deprecated and <= the auto-safe %d; ignored "
+                              "(auto wins — lowering would under-provision IOVA and wedge)\n", req, ctx->n_domains);
+          }
       }
       // ORK_DOMAIN_LAYERS: explicit override ONLY. domain_layers stays 0 (its default) unless set — the auto
       // branch above sizes domains by byte-balanced fill (ork_weight_domain), NOT layer-alignment, so there is
