@@ -36,11 +36,12 @@ eviction, churn=0.** The chain REGRESSED this (churn=1960 / OOM); the goal is to
 
 1. **Hold the chain's full resident set, process domain-ordered — don't evict mid-forward.** The chain must
    NOT re-pack at runtime. Concretely:
-   - **Size for the chain's larger set.** The chain forces the wide `ffn_up`/`ffn_down` (N/K=18944) onto the
-     NPU that the baseline declines to CPU — so the resident footprint is bigger than the non-chain 11.45 GiB
-     (+ Bf under KEEP_BF). The auto-sizer + `ork_wcache_budget` must size `n_domains` and the budget for THAT
-     full set **plus per-domain headroom for runtime scratch** (the KEEP_BF run OOM'd on an 8 MB `Bb[0]`
-     scratch because all 8 domains were packed to the brim — leave ~one weight's slack per domain).
+   - **Size for the chain's larger set.** NOTE (measured, corrected): the baseline ALSO runs the wide
+     `ffn_up`/`ffn_down` on the NPU at prefill (M≥32; `run_multicore` per-layer down-proj) — an earlier claim
+     that it CPUs them was wrong. The chain's footprint is bigger only because of the extra per-tensor `fc.wg`
+     gate (a 3rd gate copy). The auto-sizer must size `n_domains`/budget for that + `fc.wg` + **per-domain
+     headroom for runtime scratch** (the KEEP_BF OOM was an 8 MB `Bb[0]` with all domains packed to the brim).
+     **DONE** — commit `9bd0e5962` added the `fc.wg` inflation term → churn 1960→0, no OOM.
    - **Load everything in the LOAD phase, never JIT at runtime.** churn (`mem_create_runtime`) counts
      runtime packs; ORK_ALLOW_JIT builds weights during the first forward → those count as churn (the 1960 was
      largely JIT build packs). A pre-built complete pack (all chain weights) + full residence = churn 0.
