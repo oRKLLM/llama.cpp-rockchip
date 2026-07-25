@@ -4818,12 +4818,50 @@ static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_
 // (O, down), and CPU-delegate steps (norm/rope/residual) between them. This is the front-end the executor +
 // regcmd-precompile build on; here it just emits the plan (diagnostic, no execution change) so the segment
 // structure is verified on real graphs before the executor rewrites how they run.
+// ---- op-capability table: declarative, MEASURED heterogeneous placement / split / overlap -------------------
+// Per-op metadata driving the ork_spine dispatcher (data, not branches — cf. ork-driver's XSPEC + SoC caps).
+//   place   : the op's optimal unit, by MEASURED cost (tools/cpu_gemm_probe + tools/cpu_op_sweep, RK3588 2026-07-24).
+//   split   : if breakable across units, how (NONE everywhere — the CPU is only ~6% of NPU at int8 GEMM, so
+//             relocating matmul columns to the CPU has a ~1.06x ceiling: dead. No op is worth splitting today).
+//   overlap : an IDENTIFIED, MEASURED overlap opportunity (OVL_NONE everywhere — dense prefill is fused +
+//             latency-bound with no independent-work window; never auto-guessed, so it can't regress the fast path).
+// MEASURED PLACEMENT (why each row): matmul = NPU 345 vs CPU 20 GMAC/s (17x) at prefill, but M=1 DECODE -> CPU
+// (submit-bound, NPU no faster per-row). Standalone SDP/activation LUT ops (silu/gelu/rsqrt/exp) = ~106 ms/call
+// on the NPU (per-call LUT calibrate+load) vs ~0.1-19 ms CPU => ~1000x, decisively CPU. add/mul/norm/softmax/rope
+// = CPU (a submit round-trip or NEON-beatable). This CONFIRMS supports_op's current routing (matmul->NPU, rest
+// ->CPU) is optimal; the table records the measured WHY + guards against re-placing a submit-heavy op on the NPU.
+enum ork_place   { ORK_PLACE_CPU = 0, ORK_PLACE_NPU = 1, ORK_PLACE_EITHER = 2 };
+enum ork_split   { ORK_SPLIT_NONE = 0, ORK_SPLIT_NCOLS = 1, ORK_SPLIT_MROWS = 2 };
+enum ork_overlap { ORK_OVL_NONE = 0, ORK_OVL_RELOCATE_CPU = 1 };
+struct ork_op_cap { enum ork_place place; enum ork_split split; enum ork_overlap overlap; };
+
+static struct ork_op_cap ork_op_cap_for(const struct ggml_tensor * node) {
+    struct ork_op_cap c = { ORK_PLACE_CPU, ORK_SPLIT_NONE, ORK_OVL_NONE };
+    switch (node->op) {
+        case GGML_OP_MUL_MAT: case GGML_OP_MUL_MAT_ID:
+            c.place = (node->ne[1] > 1) ? ORK_PLACE_NPU : ORK_PLACE_CPU;   // prefill(M>1)->NPU; decode(M=1)->CPU
+            break;
+        // SDP / activation / norm / elementwise: measured CPU-optimal (NPU LUT-reload ~106ms or a submit floor).
+        case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_RMS_NORM: case GGML_OP_NORM:
+        case GGML_OP_SOFT_MAX: case GGML_OP_ROPE: case GGML_OP_MUL: case GGML_OP_ADD:
+        case GGML_OP_SCALE: case GGML_OP_FLASH_ATTN_EXT:
+            c.place = ORK_PLACE_CPU;
+            break;
+        default:   // metadata (NONE/RESHAPE/VIEW/…) + anything unmeasured -> CPU
+            c.place = ORK_PLACE_CPU;
+            break;
+    }
+    return c;
+}
+static const char * ork_place_name(enum ork_place p){ return p==ORK_PLACE_NPU?"NPU":p==ORK_PLACE_EITHER?"EITHER":"CPU"; }
+
 static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
     fprintf(stderr, "[ORK STATIC-PLAN] %d-node subgraph:\n", cgraph->n_nodes);
     int seg = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * n = cgraph->nodes[i];
         const char * nm = n->src[0] ? n->src[0]->name : "";
+        struct ork_op_cap cap = ork_op_cap_for(n);   // measured optimal placement (op-capability table)
         if (n->op == GGML_OP_MUL_MAT) {
             // look ahead for independent same-input siblings (the HW-chain group)
             int grp = 1;
@@ -4832,9 +4870,10 @@ static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
                 if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == n->src[1] && nj->src[0]->ne[0] == n->src[0]->ne[0]) grp++;
                 else break;
             }
-            fprintf(stderr, "  S%-2d  %-9s x%d  %-26s K=%ld N=%ld M=%ld  [%s]\n", seg++,
+            fprintf(stderr, "  S%-2d  %-9s x%d  %-26s K=%ld N=%ld M=%ld  opt=%s [%s]\n", seg++,
                     grp > 1 ? "HW-CHAIN" : "matmul", grp, nm,
                     (long) n->src[0]->ne[0], (long) n->ne[0], (long) n->ne[1],
+                    ork_place_name(cap.place),
                     grp > 1 ? "run_chain_i8" : "run_i8");
             i += grp - 1;
         } else if (n->op == GGML_OP_SOFT_MAX) {
