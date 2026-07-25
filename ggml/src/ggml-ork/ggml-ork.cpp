@@ -288,6 +288,11 @@ struct ggml_backend_ork_context {
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
+    // Keys the ACTIVE multi-weight op (e.g. the FFN SwiGLU chain) still holds references to. A multi-weight
+    // op resolves several weights up-front and uses them across later phases; a subsequent resolve's LRU
+    // ork_wcache_evict must NOT free one it still references (would dangle the held ork_weight& -> the
+    // ffn_swiglu_chain use-after-free, ASAN-confirmed 2026-07-25). Pinned keys are skipped by eviction.
+    std::unordered_set<const void *> wcache_pin;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
     // ORK_FFN_CHAIN: PER-TENSOR (scalar-scale) packed weights for the round-trip-free SwiGLU chain (the
     // fused SiLU stage's scalar R can't carry per-channel scale). Keyed by weight host ptr. Separate from
@@ -574,9 +579,11 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
     // pack). This makes conversion fit ANY model size (≤1 weight in the 4 GiB window) and avoids thrash.
     const size_t budget = ctx->persist_mode == 2 ? 0 : ork_wcache_budget();
     while (ctx->wcache_bytes + need > budget && !ctx->wcache.empty()) {
-        auto lru = ctx->wcache.begin();
+        auto lru = ctx->wcache.end();
         for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
-            if (it->second.last_use < lru->second.last_use) lru = it;
+            if (!ctx->wcache_pin.count(it->first) &&                    // never evict a weight the active op still references
+                (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
+        if (lru == ctx->wcache.end()) break;   // all remaining entries are pinned by the active op — can't free more
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
         ctx->wcache.erase(lru);
@@ -4344,12 +4351,18 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > mx) mx = v; }
         as_x[m] = mx / 127.0f; float iv = 127.0f / mx;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(xr[k]*iv); a[k] = (int8_t)(q>127?127:q<-127?-127:q); } }
-    // resolve per-channel up/down weights (standard wcache path)
+    // resolve per-channel up/down weights (standard wcache path). PIN each against LRU eviction: resolving
+    // `down` (and `gate` in the GU_CHAIN path) can trigger ork_wcache_evict, which under a tight budget would
+    // otherwise free the just-resolved `up` — dangling the held owu/bsu references (ASAN use-after-free at the
+    // phase-1 up matmul, 4421). The guard unpins on EVERY return path.
+    struct WCachePinGuard { std::unordered_set<const void *> & s; ~WCachePinGuard() { s.clear(); } } _wc_pin{ ctx->wcache_pin };
     auto itu = ork_resolve_weight_i8(ctx, Wu, K, Nff, Wu->nb[1], Wu->type, ggml_get_type_traits(Wu->type)->to_float, true);
     if (itu == ctx->wcache.end()) return false;
+    ctx->wcache_pin.insert(itu->first);                  // pin `up` BEFORE resolving `down` (which may evict)
     const ork_weight & owu = itu->second; const float * bsu = owu.bscale.data();
     auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, ggml_get_type_traits(Wd->type)->to_float, true);
     if (itd == ctx->wcache.end()) return false;
+    ctx->wcache_pin.insert(itd->first);
     const ork_weight & owd = itd->second; const float * bsd = owd.bscale.data();
     // NOTE: gate/up/down do NOT need co-residence. Each is a SEPARATE ork_mm_run_* call that goes through
     // run()->dom_activate(w->domain)->a SINGLE-domain submit, so they may live in different domains (the
@@ -4379,6 +4392,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     if (getenv("ORK_GU_CHAIN") && fc.silu_cpu && ablate < 0) {
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg != ctx->wcache.end()) {
+            ctx->wcache_pin.insert(itg->first);          // pin `gate` — GU_CHAIN uses up+gate co-resident in one submit
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // Stage the shared int8 input + gate/up int32 outputs in cached NPU-coherent DMA scratch so
             // run_chain_i8's dma_find HITS -> no per-task bcreate/memcpy/bsync/bdestroy, and the shared
