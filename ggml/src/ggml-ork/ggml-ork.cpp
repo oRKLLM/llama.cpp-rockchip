@@ -2048,8 +2048,19 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
                 }
             }
         }
+        // Multi-domain placement + spill: the fused concatenated weight (K x Ntot) is packed FRESH here and
+        // is NOT in persist_idx, so the auto-sizer never budgeted it (it duplicates the q/k/v or gate/up tiles
+        // that are already persist-resident — ~1.7x the model on a dense >4 GiB load). Like EVERY other pack
+        // site, pick a byte-balanced domain first, then spill to the next domain on IOVA overflow rather than
+        // hard-failing into domain 0 (the Bb[k] bcreate failure this fixes). Falls back to CPU only if ALL
+        // domains are exhausted.
+        int _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
+        ork_npu_set_pack_domain(ctx->npu, _dom);
         ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
         if (!ow.w) return false;
+        ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
@@ -2152,8 +2163,14 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
                     bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
             }
         }
+        // Multi-domain placement + spill (see mul_mat_group_i8): pick a byte-balanced domain, spill on overflow.
+        int _dom = ork_weight_domain(ctx, (size_t) K * Ntot / 2, ork_layer_of(g[0]->src[0]->name));   // int4 nibble tile
+        ork_npu_set_pack_domain(ctx->npu, _dom);
         ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
         if (!ow.w) return false;
+        ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
