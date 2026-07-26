@@ -106,6 +106,8 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <sched.h>
 #include <pthread.h>
 
@@ -115,6 +117,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
 extern "C" {
 #include "ork_npu.h"
+#include "ork_spine.h"   // generalized heterogeneous CPU<->NPU DAG dispatcher (ORK_FFN_SPINE path)
 #include "ork_native_cpu.h"   // #12: CPU-side NEON GEMV over the ork-native tiered format (shared with the NPU)
 }
 
@@ -334,6 +337,11 @@ struct ggml_backend_ork_context {
         // on-NPU int16 op (ork_npu_silu_i16, ~325x more accurate than the int8 fused LUT: 0.28 vs 92 err
         // @gmax132) instead of CPU fp32 — the coherent, integer-datapath replacement for the fragile fp16 gate.
         bool silu_i16 = false;
+        // ORK_FFN_SILU_I16_FUSED: FUSED int16 — fc.wg int8-mm -> int16-out (set_i16_out, on-device, no host
+        // int32->fp32->int16 round-trip, no separate per-channel gate matmul) feeding the int16 SiLU resident.
+        // Scale-bridge: gate_i16 = acc*(gate16_mult>>gate16_shift) ≈ g/gate16_is (g=acc*s_x*sg, is=gmax/32000).
+        int gate16_mult = 0, gate16_shift = 0;
+        double gate16_is = 0;
         double gmax = 0;                               // this layer's calibrated max|gate| (the sensitivity signal)
         // ORK_FFN_F16_JIT: IOVA-headroom variant of the all-fp16 path. Instead of RESIDING fp16 gate/up/down
         // (2x IOVA -> only ~5 layers fit a 4GiB domain), keep each weight host-side as compact int8 +
@@ -4028,6 +4036,15 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     if (getenv("ORK_FFN_SILU_I16")) { const char * t = getenv("ORK_FFN_SILU_I16_GMAX");
         if (!t || gmax_gate > atof(t)) { fc.silu_cpu = true; fc.silu_i16 = true; }   // outlier -> int16 (all-NPU, coherent)
         else { fc.silu_cpu = false; fc.silu_i16 = false; } }                          // low-gmax -> int8 FUSED silu (fast)
+    // ORK_FFN_SILU_I16_FUSED scale-bridge (used by the fused int16 handler branch): fc.wg int8-mm -> int16-out
+    // via set_i16_out feeding the int16 SiLU resident. gate g = acc*s_x*sg; int16 SiLU wants gate_i16 = g/is
+    // with is = gmax/32000. So set_i16_out mult/shift encodes s_x*sg/is = s_x*sg*32000/gmax (fixed point,
+    // mult<=32767, shift<=31), scaled up to ~[16384,32767] for precision.
+    { double is = fc.gmax / 32000.0; if (!(is > 0)) is = 1e-9; fc.gate16_is = is;
+      double r = (fc.s_x * (double) fc.sg) / is; int sh = 0; double m = r > 0 ? r : 1e-9;
+      while (m < 16384.0 && sh < 31) { m *= 2.0; sh++; }
+      long mult = lround(m); if (mult > 32767) mult = 32767; if (mult < 1) mult = 1;
+      fc.gate16_mult = (int) mult; fc.gate16_shift = sh; }
     // ORK_FFN_F16_GMAX: PER-LAYER all-fp16 selection. all-fp16 removes the CPU int8 quant/dequant but fp16
     // weights are 2x int8 RAM — ALL layers fp16 overflows one 4GiB domain -> ORK_DOMAINS=2 -> per-submit
     // overhead. Selecting only the MOST-SENSITIVE layers (gate gmax > threshold) keeps the fp16 footprint
@@ -4063,7 +4080,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             if (cw % 16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] Nff=%d chunk unaligned at %d (cw=%d)\n", Nff, n0, cw); return false; }
             for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++)
                 wgh[(size_t) k*cw + n] = cpusilu ? (ork_f16) wgf[(size_t) (n0+n)*K + k]           // raw Wg (CPU silu)
-                                                 : (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);  // -S*Wg (fused LUT)
+                                                 : (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);  // -S*Wg (dead fused-LUT run path)
             if (jit) {   // host int8 store (no resident fp16); inflated into a shared scratch at run
                 fc.jg.emplace_back(); auto & j = fc.jg.back(); j.N = cw;
                 ork_quant_f16_i8_perchan(wgh.data(), K, cw, j.i8, j.bs); continue; }
@@ -4204,6 +4221,152 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
 done:
     free(xi);free(gi);free(ui);free(glu8);free(di);free(glf);
     return ok;
+}
+
+// ==== Inc 1: work-stealing CPU pull-queue for the FFN silu/glu lane ===================================
+// Persistent workers pull row-tiles via an atomic counter (NO per-tile barrier -> little A55 cores contribute
+// their ~1/3 share without dragging, unlike a barrier threadpool; a slow puller just pulls fewer tiles).
+// Workers SLEEP on a CV between jobs (no idle spin to fight the doorbell); only the final join spins briefly.
+// Core set from ORK_FFN_POOL_CORES ("4,5,6"=3 big; "0,1,2,3,4,5,6"=big+little, reserve one big for the caller +
+// doorbell drain). Unset => serial (pool disabled). The NPU keeps its doorbell spinner (on the calling thread).
+struct OrkFfnPool {
+    std::vector<std::thread> ths;
+    std::mutex m; std::condition_variable cv;
+    std::deque<std::function<void()>> q; std::atomic<int> pending{0}; bool stop = false;
+    void worker() {
+        for (;;) {
+            std::function<void()> job;
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stop || !q.empty(); }); if (stop) return; job = std::move(q.front()); q.pop_front(); }
+            job(); pending.fetch_sub(1, std::memory_order_release);
+        }
+    }
+    void start(const std::vector<int> & cores) {
+        for (int c : cores) {
+            ths.emplace_back([this]{ worker(); });
+            cpu_set_t s; CPU_ZERO(&s); CPU_SET(c, &s);
+            pthread_setaffinity_np(ths.back().native_handle(), sizeof s, &s);
+        }
+    }
+    bool empty() const { return ths.empty(); }
+    // async: enqueue one task; workers pull it. Non-blocking (used by the scheduler while the caller polls the doorbell).
+    void submit(std::function<void()> f) { pending.fetch_add(1, std::memory_order_relaxed); { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(f)); } cv.notify_one(); }
+    void wait() { while (pending.load(std::memory_order_acquire) > 0) sched_yield(); }
+    // blocking parallel-for over [0,nt); the calling thread participates (drains the deque too).
+    void run(int nt, const std::function<void(int)> & f) {
+        if (ths.empty() || nt <= 1) { for (int t = 0; t < nt; t++) f(t); return; }
+        for (int t = 0; t < nt; t++) submit([&f, t]{ f(t); });
+        for (;;) { std::function<void()> job;   // calling thread participates
+            { std::lock_guard<std::mutex> lk(m); if (q.empty()) break; job = std::move(q.front()); q.pop_front(); }
+            job(); pending.fetch_sub(1, std::memory_order_release); }
+        wait();
+    }
+};
+static OrkFfnPool * ork_ffn_pool() {
+    static OrkFfnPool * p = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (const char * e = getenv("ORK_FFN_POOL_CORES")) {
+            std::vector<int> cores; for (const char * s = e; *s; ) { cores.push_back(atoi(s)); while (*s && *s != ',') s++; if (*s == ',') s++; }
+            if (!cores.empty()) { p = new OrkFfnPool(); p->start(cores);
+                if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[FFN POOL] started %zu workers on cores:", cores.size()); for (int c : cores) fprintf(stderr, " %d", c); fprintf(stderr, "\n"); } }
+        }
+    }
+    return p;
+}
+
+// Dedicated NPU-DRIVER (spinner) thread: owns the single-stream NPU. Pulls a doorbell chain, arms it, and
+// SPINS in ork_dyn_end driving/collecting it — so the NPU stays continuously driven even while OTHER cores do
+// silu. Fixes the ORK_FFN_SCHED starvation (there the calling thread left the doorbell to do silu, so the
+// chain wasn't advanced). Pinned to a big core (ORK_FFN_DRIVER_CORE, default 7). Only THIS thread touches the
+// NPU during a chain (single-stream). begin_mc NULL => per-task blocking fallback (still on the driver thread).
+struct OrkNpuDriver {
+    std::thread th; std::mutex m; std::condition_variable cv;
+    ork_npu * npu = nullptr;
+    const ork_mm_task_i8 * tasks = nullptr; int ntasks = 0; int K = 0; int nc = 0;   // nc: doorbell colsplit core count (0=all)
+    std::atomic<long> job{0}, done{0}; std::atomic<int> rc{0}; bool stop = false;
+    void driver() {
+        long seen = 0;
+        for (;;) {
+            const ork_mm_task_i8 * tk; int n, kk;
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stop || job.load() != seen; }); if (stop) return; seen = job.load(); tk = tasks; n = ntasks; kk = K; }
+            int r = 0;
+            ork_dyn_chain * h = ork_dyn_begin_mc(npu, n, tk, nc);
+            if (h) { if (ork_dyn_end(h) < 0) r = -1; }
+            else for (int i = 0; i < n && r == 0; i++) if (ork_mm_run_i8(npu, tk[i].w, tk[i].M, tk[i].A, tk[i].C)) r = -1;   // fallback (Bf missing / ineligible)
+            (void) kk; rc.store(r); done.store(seen, std::memory_order_release);
+        }
+    }
+    void start(ork_npu * n, int core) { npu = n; th = std::thread([this]{ driver(); });
+        cpu_set_t s; CPU_ZERO(&s); CPU_SET(core, &s); pthread_setaffinity_np(th.native_handle(), sizeof s, &s); }
+    void run_async(const ork_mm_task_i8 * tk, int n) { { std::lock_guard<std::mutex> lk(m); tasks = tk; ntasks = n; job.fetch_add(1); } cv.notify_one(); }
+    int wait() { long g = job.load(); while (done.load(std::memory_order_acquire) != g) sched_yield(); return rc.load(); }
+};
+static OrkNpuDriver * ork_npu_driver(ork_npu * npu) {
+    static OrkNpuDriver * d = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (getenv("ORK_FFN_DRIVER")) { d = new OrkNpuDriver();
+            int core = getenv("ORK_FFN_DRIVER_CORE") ? atoi(getenv("ORK_FFN_DRIVER_CORE")) : 7;
+            d->nc = getenv("ORK_FFN_DRIVER_NC") ? atoi(getenv("ORK_FFN_DRIVER_NC")) : 0;   // doorbell colsplit cores (0=all -> greedy; 1..3 leaves big cores for silu)
+            d->start(npu, core);
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN DRIVER] dedicated NPU spinner on core %d, doorbell nc=%d\n", core, d->nc);
+        }
+    }
+    return d;
+}
+
+// ==== Generalized ork_spine FFN scheduler (ORK_FFN_SPINE) ============================================
+// The dependency-ordered dual-priority DAG — the general form of the bespoke pool+driver. Units: 1 NPU
+// (blocking ork_mm_run_i8 = kernel-IRQ, frees its core during the matmul, apipe's mechanism) + N CPU units
+// (silu/glu), driven by ork_spine_run. Per M-tile ops: gate,up (NPU) -> silu (CPU, dep gate) -> glu (CPU,
+// dep silu+up) -> down (NPU, dep glu). Placement tags route ops; the scheduler overlaps + self-balances.
+// Op fns are C-style (ork_spine_op.fn = long(*)(void*)); the per-tile context rides in OrkSpineArg.
+struct OrkSpineArg {
+    ggml_backend_ork_context * ctx;
+    ork_w * wg; ork_w * wu; ork_w * wd;
+    const int8_t * xr_i8; const float * as_x; const float * bsg; const float * bsu; const float * bsd;
+    int32_t * g32; int32_t * u32; int32_t * d32;
+    float * silu_f; float * up_f; int8_t * glu_i8; float * as_g; float * dst;
+    int K; int Nff; int Kd; int m0; int mc;
+};
+static long ork_sp_gate(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // NPU: gate matmul -> g32
+    return ork_mm_run_i8(s->ctx->npu, s->wg, s->mc, s->xr_i8 + (size_t) s->m0*s->K, s->g32 + (size_t) s->m0*s->Nff); }
+static long ork_sp_up(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                   // NPU: up matmul -> u32
+    return ork_mm_run_i8(s->ctx->npu, s->wu, s->mc, s->xr_i8 + (size_t) s->m0*s->K, s->u32 + (size_t) s->m0*s->Nff); }
+static long ork_sp_silu(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // CPU: gate int32 -> exact fp32 silu
+    for (int r = 0; r < s->mc; r++) { const float rs = s->as_x[s->m0+r];
+        float * so = s->silu_f + (size_t)(s->m0+r)*s->Nff; const int32_t * gr = s->g32 + (size_t)(s->m0+r)*s->Nff;
+        for (int n = 0; n < s->Nff; n++) { float g = (float) gr[n] * rs * s->bsg[n]; so[n] = g / (1.0f + expf(-g)); } }
+    return 0; }
+static long ork_sp_glu(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                  // CPU: up dequant + glu=silu*up + per-row int8 quant
+    std::vector<float> g(s->Nff);
+    for (int r = 0; r < s->mc; r++) { const int m = s->m0+r; const float rs = s->as_x[m];
+        const int32_t * ur = s->u32 + (size_t) m*s->Nff; float * uo = s->up_f + (size_t) m*s->Nff; const float * so = s->silu_f + (size_t) m*s->Nff;
+        float mx = 1e-9f;
+        for (int n = 0; n < s->Nff; n++) { float u = rs * s->bsu[n] * (float) ur[n]; uo[n] = u; float gg = so[n]*u; g[n]=gg; float av=fabsf(gg); if(av>mx)mx=av; }
+        float sc = mx/127.0f; s->as_g[m] = sc; float iv = 127.0f/mx; int8_t * gi = s->glu_i8 + (size_t) m*s->Nff;
+        for (int n = 0; n < s->Nff; n++) { int q=(int)lrintf(g[n]*iv); gi[n]=(int8_t)(q>127?127:q<-127?-127:q); } }
+    return 0; }
+static long ork_sp_down(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // NPU: down matmul + dequant -> dst
+    if (ork_mm_run_i8(s->ctx->npu, s->wd, s->mc, s->glu_i8 + (size_t) s->m0*s->Nff, s->d32 + (size_t) s->m0*s->Kd)) return -1;
+    for (int r = 0; r < s->mc; r++) { const int m = s->m0+r; const float rs = s->as_g[m];
+        const int32_t * dr = s->d32 + (size_t) m*s->Kd; float * do_ = s->dst + (size_t) m*s->Kd;
+        for (int n = 0; n < s->Kd; n++) do_[n] = rs * s->bsd[n] * (float) dr[n]; }
+    return 0; }
+
+struct OrkSpine { ork_spine_unit * U = nullptr; int nu = 0; };
+static OrkSpine * ork_spine_get() {
+    static OrkSpine * s = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (getenv("ORK_FFN_SPINE")) {
+            std::vector<int> cc; if (const char * e = getenv("ORK_FFN_SPINE_CPU_CORES")) { for (const char * p=e; *p; ) { cc.push_back(atoi(p)); while(*p&&*p!=',')p++; if(*p==',')p++; } }
+            if (cc.empty()) cc = {4,5,6};
+            int npu_core = getenv("ORK_FFN_SPINE_NPU_CORE") ? atoi(getenv("ORK_FFN_SPINE_NPU_CORE")) : 7;
+            s = new OrkSpine(); s->nu = 1 + (int) cc.size(); s->U = new ork_spine_unit[s->nu];
+            ork_spine_unit_start(&s->U[0], ORK_UNIT_NPU, npu_core);
+            for (size_t i = 0; i < cc.size(); i++) ork_spine_unit_start(&s->U[1+i], ORK_UNIT_CPU, cc[i]);
+            if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[FFN SPINE] NPU unit core %d + %zu CPU units cores:", npu_core, cc.size()); for(int c:cc)fprintf(stderr," %d",c); fprintf(stderr,"\n"); }
+        }
+    }
+    return s;
 }
 
 static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
@@ -4383,7 +4546,53 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     std::vector<int32_t> acc_i32((size_t) M * Nff);   // reused (Nff >= Kd)
     std::vector<float>   up_f((size_t) M * Nff), silu_f((size_t) M * Nff), glu_f((size_t) M * Nff), as_g(M);
     bool ok = true;
+    // ORK_FFN_SPINE: generalized dependency-ordered dual-priority DAG. Runs the WHOLE FFN inner (gate/up/silu/
+    // glu/down -> dst) as an ork_spine op-graph and returns; Phase 1/2/3 below are skipped. Placement tags
+    // (NPU/CPU) route each op; ork_spine_run overlaps independent NPU/CPU work + self-balances free units.
+    if (getenv("ORK_FFN_SPINE") && fc.silu_cpu && !fc.silu_i16 && ablate < 0) {
+        OrkSpine * sp = ork_spine_get();
+        if (sp) {
+            auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+            if (itg == ctx->wcache.end()) return false;
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            // Default nt=1 (TS=M): full-M matmuls (no per-tile weight-DMA re-stream tax) with silu∥up overlap
+            // in the one tile — apipe's shape. Smaller TS pipelines more tiles but re-streams weights (net loss
+            // on this weight-DMA-bound matmul). ORK_FFN_SPINE_TS overrides; capped so nt*5 <= 30 (<32 DAG cap).
+            int TS = getenv("ORK_FFN_SPINE_TS") ? atoi(getenv("ORK_FFN_SPINE_TS")) : M;
+            if (TS < (M + 5) / 6) TS = (M + 5) / 6;   // keep nt <= 6
+            if (TS < 1) TS = 1; const int nt = (M + TS - 1) / TS;
+            std::vector<int32_t> g32((size_t) M*Nff), u32((size_t) M*Nff), d32((size_t) M*Kd);
+            std::vector<int8_t>  glu_i8b((size_t) M*Nff);
+            std::vector<OrkSpineArg> args(nt);
+            std::vector<ork_spine_op> ops((size_t) nt*5);
+            for (int t = 0; t < nt; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                args[t] = OrkSpineArg{ ctx, owg.w, owu.w, owd.w, xr_i8.data(), as_x.data(), bsg, bsu, bsd,
+                    g32.data(), u32.data(), d32.data(), silu_f.data(), up_f.data(), glu_i8b.data(), as_g.data(), (float *) down_n->data, K, Nff, Kd, m0, mc };
+                int b = t*5;
+                ops[b+0] = ork_spine_op{ 0,                       ORK_PL_NPU, ork_sp_gate, &args[t], 0, -1, 0, 0 };
+                ops[b+1] = ork_spine_op{ 0,                       ORK_PL_NPU, ork_sp_up,   &args[t], 0, -1, 0, 0 };
+                ops[b+2] = ork_spine_op{ 1<<(b+0),                ORK_PL_CPU, ork_sp_silu, &args[t], 0, -1, 0, 0 };   // dep gate
+                ops[b+3] = ork_spine_op{ (1<<(b+2))|(1<<(b+1)),   ORK_PL_CPU, ork_sp_glu,  &args[t], 0, -1, 0, 0 };   // dep silu + up
+                ops[b+4] = ork_spine_op{ 1<<(b+3),                ORK_PL_NPU, ork_sp_down, &args[t], 0, -1, 0, 0 };   // dep glu
+            }
+            int rc = ork_spine_run(sp->U, sp->nu, ops.data(), (int)(nt*5));
+            bool oks = rc == 0; for (size_t i = 0; i < ops.size() && oks; i++) if (ops[i].ret) oks = false;
+            if (getenv("ORK_VERBOSE")) { static int o = 0; if (!o++) fprintf(stderr, "[FFN SPINE] %s M=%d nt=%d TS=%d nu=%d rc=%d ok=%d\n", Wg->name, M, nt, TS, sp->nu, rc, oks); }
+            return oks;   // dst written by the down ops; Phase 1/2/3 skipped
+        }
+    }
     bool gu_done = false;
+    // ORK_FFN_PIPE: doorbell same-thread M-tile pipeline for the int8-gate + exact-CPU-SiLU path (fc.silu_cpu,
+    // the shipped-default chain path). Token rows are independent, so the NPU runs tile t's gate+up (one
+    // nonblocking doorbell submit) while the CPU does tile t-1's SiLU+up-dequant. Per-layer lane timing under
+    // ORK_VERBOSE. Superseded by ORK_FFN_SCHED (two-chain) which tunes higher; kept for A/B.
+    const bool pipe = getenv("ORK_FFN_PIPE") && fc.silu_cpu && !fc.silu_i16 && ablate < 0;
+    // ORK_FFN_SCHED: doorbell-native scheduler. gate-chain (one ork_dyn_begin_mc over ALL gate tiles -> the
+    // doorbell SPINS through them, no per-tile submit) -> drain (read-after-drain coherent) -> dispatch all
+    // silu to the CPU pool WHILE the up-chain spins on the NPU -> drain -> glu/down. Realizes the two-priority
+    // dep-ordered queue within the coherency contract (mid-chain reads are NOT coherent; per-chain drain is).
+    const bool sched = getenv("ORK_FFN_SCHED") && fc.silu_cpu && !fc.silu_i16 && ablate < 0;
     // STATIC-GRAPH submit reduction (ORK_GU_CHAIN): HW-chain up+gate into ONE run_chain_i8 submit per
     // M-tile — both read xr_i8 and are independent, so the hardware walks them as task_number=2 in a single
     // ioctl (collapses 2 tiled matmul submits -> 1 for the int16/cpu-silu path). run_chain_i8 is single-core;
@@ -4430,26 +4639,153 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
             gu_done = cok;
         }
     }
-    // Phase 1: up (per-channel, per-row) -> up_f fp32  [skipped if the chained fast-path already did up+gate]
-    for (int m0 = 0; !gu_done && m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
-        if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+    // Phase 1: up (per-channel, per-row) -> up_f fp32  [skipped if the chained fast-path already did up+gate,
+    // or if pipe/sched (doorbell) fold up into their overlapped Phase-2 schedule]
+    for (int m0 = 0; !gu_done && !pipe && !sched && m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+        if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: up matmul owu m0=%d\n",m0); ok = false; break; }
         for (int r = 0; r < mc; r++) { const int32_t * ur = acc_i32.data() + (size_t) r*Nff;
             float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
             for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } }
     // Phase 2: silu_f fp32
-    if (ok && !gu_done && fc.silu_cpu && ablate < 0) {
+    // FUSED int16 (ORK_FFN_SILU_I16_FUSED): fc.wg int8-mm -> int16-out (set_i16_out, on-device, internally
+    // N-tiled) -> int16 SiLU (N-tiled at nmax). No host int32->fp32->int16 round-trip, no separate per-channel
+    // gate matmul. Per-tensor gate (scalar out16) => PPL A/B vs the un-fused per-channel int16 path.
+    static const int silu_i16_fused = getenv("ORK_FFN_SILU_I16_FUSED") != nullptr;
+    if (sched && ok && !gu_done) {
+        // ---- ORK_FFN_SCHED: doorbell-native two-chain scheduler (the dependency-ordered queue, within the
+        // read-after-drain coherency contract). gate-chain: ONE ork_dyn_begin_mc over all gate tiles -> the
+        // doorbell spins through them (no per-tile submit) -> drain (coherent). Then dispatch all silu to the
+        // CPU pool (work-stealing, big+little) WHILE the up-chain spins on the NPU -> drain -> dequant up.
+        // Fills silu_f + up_f; Phase 3 (glu + down) runs unchanged. down (K=Nff>4096) is not doorbell-eligible.
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN SCHED] gate resolve miss %s\n", Wg->name); ok = false; }
+        else {
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            OrkFfnPool * pool = ork_ffn_pool();
+            const int TS = 64; const int nt = (M + TS - 1) / TS;                  // doorbell tile cap (mc M<=64)
+            std::vector<int32_t> g32((size_t) M*Nff), u32((size_t) M*Nff);        // gate/up int32 (read-after-drain coherent)
+            std::vector<ork_mm_task_i8> gt(nt), ut(nt);
+            for (int t = 0; t < nt; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                gt[t] = { owg.w, mc, xr_i8.data() + (size_t) m0*K, g32.data() + (size_t) m0*Nff };
+                ut[t] = { owu.w, mc, xr_i8.data() + (size_t) m0*K, u32.data() + (size_t) m0*Nff }; }
+            static double s_g = 0, s_u = 0; static long s_l = 0; double t0 = (double) ggml_time_us();
+            OrkNpuDriver * driver = ork_npu_driver(ctx->npu);   // dedicated spinner drives the NPU on its own core
+            // gate-chain: driven to completion (drain => coherent). Spinner if enabled, else calling thread.
+            if (driver) { driver->run_async(gt.data(), nt); if (driver->wait()) ok = false; }
+            else { ork_dyn_chain * hA = ork_dyn_begin_mc(ctx->npu, nt, gt.data(), 0);
+                if (hA) { if (ork_dyn_end(hA) < 0) ok = false; }
+                else for (int t = 0; t < nt && ok; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                    if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data()+(size_t) m0*K, g32.data()+(size_t) m0*Nff)) ok = false; } }
+            double tg = (double) ggml_time_us();
+            if (ok) {
+                // up-chain: the dedicated spinner drives it on its OWN core (never leaving the doorbell) while
+                // the CPU pool does silu on the rest — the fix for the sched starvation (was: caller left the
+                // doorbell to do silu, so the chain stalled). Without a driver, falls back to caller-drives.
+                ork_dyn_chain * hB = nullptr;
+                if (driver) driver->run_async(ut.data(), nt);
+                else        hB = ork_dyn_begin_mc(ctx->npu, nt, ut.data(), 0);
+                for (int t = 0; t < nt; t++) {
+                    auto silu = [&, t]{ int m0 = t*TS, mc = std::min(TS, M - m0);
+                        for (int r = 0; r < mc; r++) { const float rs = as_x[m0+r];
+                            float * so = silu_f.data() + (size_t)(m0+r)*Nff; const int32_t * gr = g32.data() + (size_t)(m0+r)*Nff;
+                            for (int n = 0; n < Nff; n++) { float g = (float) gr[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } } };
+                    if (pool) pool->submit(silu); else silu(); }
+                if (driver) { if (driver->wait()) ok = false; }
+                else if (hB) { if (ork_dyn_end(hB) < 0) ok = false; }
+                else for (int t = 0; t < nt && ok; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                    if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data()+(size_t) m0*K, u32.data()+(size_t) m0*Nff)) ok = false; }
+                if (pool) pool->wait();
+                double tu = (double) ggml_time_us();
+                if (ok) { auto deq = [&](int t){ int m0 = t*TS, mc = std::min(TS, M - m0);   // dequant up -> up_f (coherent)
+                        for (int r = 0; r < mc; r++) { const float rs = as_x[m0+r];
+                            float * uo = up_f.data() + (size_t)(m0+r)*Nff; const int32_t * ur = u32.data() + (size_t)(m0+r)*Nff;
+                            for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } };
+                    if (pool) pool->run(nt, deq); else for (int t = 0; t < nt; t++) deq(t); }
+                s_g += tg - t0; s_u += tu - tg; s_l++;
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN SCHED] %s M=%d nt=%d | gate-chain=%.1fms silu∥up-chain=%.1fms || Σ L=%ld g=%.0fms u=%.0fms\n",
+                    Wg->name, M, nt, (tg-t0)/1000, (tu-tg)/1000, s_l, s_g/1000, s_u/1000);
+            }
+        }
+    } else if (pipe && ok && !gu_done) {
+        // ---- ORK_FFN_PIPE: doorbell (ork_dyn_begin_mc) same-thread nonblock M-tile pipeline, tile TS<=64
+        // (the envelope cap). Token rows are independent, so tile t's gate+up run on the NPU while the CPU
+        // does tile t-1's SiLU+up-dequant. Measured net -3% at TS=64: halving the tile vs baseline MT=128
+        // doubles the weight-DMA re-stream (NPU-bound path). Kept for the A/B + lane timing.
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] gate resolve miss %s\n", Wg->name); ok = false; }
+        else {
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            const int TS = 64; const int nt = (M + TS - 1) / TS;
+            std::vector<int32_t> gC0((size_t) TS*Nff), gC1((size_t) TS*Nff);      // ping-pong gate int32 (CPU reads t-1 while NPU writes t)
+            std::vector<int32_t> uC0((size_t) TS*Nff), uC1((size_t) TS*Nff);      // ping-pong up int32
+            int32_t * gCb[2] = { gC0.data(), gC1.data() }; int32_t * uCb[2] = { uC0.data(), uC1.data() };
+            static double s_cpu = 0, s_drain = 0, s_sub = 0; static long s_layers = 0;
+            double l_cpu = 0, l_drain = 0, l_sub = 0;
+            OrkFfnPool * pool = ork_ffn_pool();
+            auto cpu_lane = [&](int t) {
+                int m0 = t*TS, mc = std::min(TS, M - m0), b = t & 1;
+                const int32_t * gc = gCb[b], * uc = uCb[b];
+                auto row = [&](int r) { const float rs = as_x[m0+r];
+                    float * so = silu_f.data() + (size_t)(m0+r)*Nff; float * uo = up_f.data() + (size_t)(m0+r)*Nff;
+                    const int32_t * gr = gc + (size_t) r*Nff, * ur = uc + (size_t) r*Nff;
+                    for (int n = 0; n < Nff; n++) { float g = (float) gr[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); uo[n] = rs * bsu[n] * (float) ur[n]; } };
+                if (pool) pool->run(mc, row); else for (int r = 0; r < mc; r++) row(r);
+            };
+            int prev = -1;
+            for (int t = 0; t < nt && ok; t++) {
+                int m0 = t*TS, mc = std::min(TS, M - m0), b = t & 1;
+                ork_mm_task_i8 tk[2] = { { owg.w, mc, xr_i8.data() + (size_t) m0*K, gCb[b] },
+                                         { owu.w, mc, xr_i8.data() + (size_t) m0*K, uCb[b] } };
+                double ts = (double) ggml_time_us();
+                ork_dyn_chain * dh = ork_dyn_begin_mc(ctx->npu, 2, tk, 0);
+                double tc0 = (double) ggml_time_us(); l_sub += tc0 - ts;
+                if (!dh) {
+                    if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data()+(size_t) m0*K, gCb[b]) ||
+                        ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data()+(size_t) m0*K, uCb[b])) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] blocking fallback FAIL t=%d\n", t); ok = false; break; }
+                    l_drain += (double) ggml_time_us() - tc0;
+                    if (prev >= 0) { double p0 = (double) ggml_time_us(); cpu_lane(prev); l_cpu += (double) ggml_time_us() - p0; }
+                    prev = t; continue;
+                }
+                if (prev >= 0) cpu_lane(prev);
+                double tc1 = (double) ggml_time_us(); l_cpu += tc1 - tc0;
+                if (ork_dyn_end(dh) < 0) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] dyn_end FAIL t=%d\n", t); ok = false; break; }
+                l_drain += (double) ggml_time_us() - tc1;
+                prev = t;
+            }
+            if (ok && prev >= 0) { double p0 = (double) ggml_time_us(); cpu_lane(prev); l_cpu += (double) ggml_time_us() - p0; }
+            s_cpu += l_cpu; s_drain += l_drain; s_sub += l_sub; s_layers++;
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] %s M=%d nt=%d TS=%d | cpu=%.1fms drain=%.1fms sub=%.2fms || Σ L=%ld cpu=%.0fms drain=%.0fms sub=%.0fms\n",
+                Wg->name, M, nt, TS, l_cpu/1000, l_drain/1000, l_sub/1000, s_layers, s_cpu/1000, s_drain/1000, s_sub/1000);
+        }
+    } else if (ok && !gu_done && fc.silu_i16 && silu_i16_fused && fc.wg && ablate < 0) {
+        std::vector<int16_t> gate_i16((size_t) M * Nff);
+        if (ork_mm_run_i8_out16(ctx->npu, fc.wg, M, xi.data(), (short *) gate_i16.data(), fc.gate16_mult, fc.gate16_shift)) {
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN i16-fused] FAIL: mm_out16 %s\n", Wg->name); ok = false;
+        } else {
+            const int NT16 = 8192; const double is = fc.gate16_is;
+            std::vector<int16_t> cin((size_t) M*NT16), cout((size_t) M*NT16);
+            for (int n0 = 0; n0 < Nff && ok; n0 += NT16) { int cw = std::min(NT16, Nff - n0);
+                for (int r = 0; r < M; r++) memcpy(cin.data() + (size_t) r*cw, gate_i16.data() + (size_t) r*Nff + n0, (size_t) cw*2);
+                double us = 0;
+                if (ork_npu_silu_i16(ctx->npu, cin.data(), M, cw, is, is, cout.data(), &us)) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN i16-fused] FAIL: silu_i16 cw=%d\n", cw); ok = false; break; }
+                for (int r = 0; r < M; r++) { float * so = silu_f.data() + (size_t) r*Nff + n0;
+                    for (int n = 0; n < cw; n++) so[n] = (float) cout[(size_t) r*cw+n] * is; } }
+        }
+    } else if (ok && !gu_done && fc.silu_cpu && ablate < 0) {
         // EXACT gate (strategic high-gmax layer): per-channel gate matmul on-NPU + fp32 silu on CPU. Same recipe
         // as the up projection (per-channel weight, per-row x), so quality matches baseline; only the fused-silu
         // stage is skipped for this layer. Reuses xr_i8 + as_x (per-row original x, already computed above).
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
-        if (itg == ctx->wcache.end()) { ok = false; }
+        if (itg == ctx->wcache.end()) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: gate resolve miss %s\n",Wg->name); ok = false; }
         else { const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // NOTE: an earlier single-core pin here (ork_npu_set_core_budget 1) collides with (c)'s NO_BF
             // default — it forces the gate matmul onto the single-core run_loop path which needs the full-K
             // Bf (NULL under NO_BF) -> run_loop wedges (errno 110). Keep the gate MULTI-core (mcworker/Bb).
             // The int16 silu op is single-core; the multi->single transition is handled inside the op.
             for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
-                if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+                if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: gate matmul owg m0=%d\n",m0); ok = false; break; }
                 if (fc.silu_i16) {
                     // on-NPU int16 SiLU: dequant int32 gate -> fp32 (per-row x per-channel scale), quantize to
                     // int16 (uniform scale), run ork_npu_silu_i16, dequant. ~325x more accurate than int8-fused.
@@ -4459,10 +4795,18 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                     double is = gmx/32000.0, os = gmx/32000.0; if (is<=0) is=1e-9; if (os<=0) os=1e-9;   // silu(gmax)~gmax
                     std::vector<int16_t> in16((size_t) mc*Nff), out16((size_t) mc*Nff);
                     for (size_t i = 0; i < (size_t) mc*Nff; i++) { long q = lround(gr[i]/is); if (q>32767) q=32767; if (q<-32768) q=-32768; in16[i] = (int16_t) q; }
-                    double us = 0;
-                    if (ork_npu_silu_i16(ctx->npu, in16.data(), mc, Nff, is, os, out16.data(), &us)) { ok = false; break; }
-                    for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff;
-                        for (int n = 0; n < Nff; n++) so[n] = (float) out16[(size_t) r*Nff+n] * os; }
+                    // N-TILE the int16 SiLU: the standalone SDP op rejects N>nmax(8192) and does NOT tile
+                    // internally, but the FFN intermediate is Nff=18944. SiLU is pointwise, so gather each
+                    // contiguous ≤8192 column-chunk into [mc][cw], run it, scatter back (Nff%8==0 -> cw%8==0).
+                    const int NT16 = 8192;
+                    std::vector<int16_t> cin((size_t) mc*NT16), cout((size_t) mc*NT16);
+                    for (int n0 = 0; n0 < Nff && ok; n0 += NT16) { int cw = std::min(NT16, Nff - n0);
+                        for (int r = 0; r < mc; r++) memcpy(cin.data() + (size_t) r*cw, in16.data() + (size_t) r*Nff + n0, (size_t) cw*2);
+                        double us = 0;
+                        if (ork_npu_silu_i16(ctx->npu, cin.data(), mc, cw, is, os, cout.data(), &us)) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: ork_npu_silu_i16 mc=%d cw=%d is=%.3e\n",mc,cw,is); ok = false; break; }
+                        for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff + n0;
+                            for (int n = 0; n < cw; n++) so[n] = (float) cout[(size_t) r*cw+n] * os; } }
+                    if (!ok) break;
                 } else {
                     for (int r = 0; r < mc; r++) { const int32_t * ar = acc_i32.data() + (size_t) r*Nff;
                         float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
