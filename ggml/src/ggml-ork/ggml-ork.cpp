@@ -278,6 +278,7 @@ struct ggml_backend_ork_context {
                                // sliced doorbell (ork_mm_run_sliced) instead of the M>1 blocking mcworker —
                                // wedge-safe (doorbell owns the submit). Default off; A/B vs the blocking path.
     std::unordered_map<ork_w *, ork_w_sliced *> slice_ws;   // resident wide weight -> its sliced-doorbell pack
+    std::unordered_map<ork_w *, std::unordered_set<int>> slice_forced;   // memo: (weight -> M's) proven wedge-prone this session -> skip the doomed run_i8, go straight to sliced
     bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
@@ -586,7 +587,9 @@ static int ork_domain_advance(ggml_backend_ork_context * ctx) {
 // ORK_SLICE_ROUTE: free + forget a weight's sliced-doorbell twin (if any) whenever its ork_w is freed, so a
 // reused ork_w pointer can never resolve to a stale twin. No-op unless slice_route packed a twin for this w.
 static inline void ork_slice_ws_drop(ggml_backend_ork_context * ctx, ork_w * w) {
-    if (!w || ctx->slice_ws.empty()) return;
+    if (!w) return;
+    ctx->slice_forced.erase(w);   // drop the wedge-prone memo too (a reused ork_w ptr must not mis-skip run_i8)
+    if (ctx->slice_ws.empty()) return;
     auto it = ctx->slice_ws.find(w);
     if (it != ctx->slice_ws.end()) { ork_mm_free_sliced(ctx->npu, it->second); ctx->slice_ws.erase(it); }
 }
@@ -1518,19 +1521,33 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     }
     int rc;
     if (tasks.size() == 1) {
-        const int r = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
-        rc = r ? -1 : 0;
-        // ORK_SLICE_ROUTE — wedge-safety RESCUE, keyed on the SPECIFIC refusal code. run_i8 returns
-        // ORK_RC_WEDGE_PRONE (not the generic -1) only when it declines an out-of-envelope shape rather than
-        // risk a blocking-submit wedge. ONLY that code triggers the rescue: re-run on the all-doorbell sliced
-        // primitive (verified c_base tiles). A shape that SUCCEEDS, or fails for any OTHER reason (bad args,
-        // real fault), never rescues → pure no-op, zero cost for working shapes. Needs a pre-packed sliced
-        // twin for this weight (ORK_SLICE_ROUTE on). No twin / not enabled → the refusal stands.
-        if (r == ORK_RC_WEDGE_PRONE && ctx->slice_route && !ctx->slice_ws.empty()) {
-            auto sit = ctx->slice_ws.find(tasks[0].w);
-            if (sit != ctx->slice_ws.end() && sit->second) {
-                rc = ork_mm_run_sliced(ctx->npu, sit->second, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
-                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused (wedge-prone) -> sliced doorbell rc=%d\n", rc);
+        // ORK_SLICE_ROUTE — wedge-safety RESCUE, keyed on the SPECIFIC refusal code, MEMOIZED per (weight, M).
+        // First time a shape is out-of-envelope, run_i8 returns ORK_RC_WEDGE_PRONE (not the generic -1) — it
+        // declined rather than risk a blocking-submit wedge — and we rescue on the all-doorbell sliced primitive
+        // (verified c_base tiles) AND remember (w, M) as wedge-prone. Since that verdict is stable for the
+        // session, every later call for the same (w, M) skips the doomed run_i8 attempt (and its refusal spam)
+        // and goes straight to sliced. A shape that SUCCEEDS, or fails for any OTHER reason, never rescues and is
+        // never memoized → pure no-op, zero cost for working shapes. Needs a pre-packed twin (ORK_SLICE_ROUTE on).
+        ork_w_sliced * ws_memo = nullptr;
+        if (ctx->slice_route && !ctx->slice_forced.empty()) {
+            auto mit = ctx->slice_forced.find(tasks[0].w);
+            if (mit != ctx->slice_forced.end() && mit->second.count(tasks[0].M)) {
+                auto sit = ctx->slice_ws.find(tasks[0].w);
+                if (sit != ctx->slice_ws.end()) ws_memo = sit->second;
+            }
+        }
+        if (ws_memo) {                                   // memoized wedge-prone (w,M): skip run_i8, straight to sliced
+            rc = ork_mm_run_sliced(ctx->npu, ws_memo, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
+        } else {
+            const int r = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+            rc = r ? -1 : 0;
+            if (r == ORK_RC_WEDGE_PRONE && ctx->slice_route && !ctx->slice_ws.empty()) {
+                auto sit = ctx->slice_ws.find(tasks[0].w);
+                if (sit != ctx->slice_ws.end() && sit->second) {
+                    rc = ork_mm_run_sliced(ctx->npu, sit->second, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
+                    if (rc == 0) ctx->slice_forced[tasks[0].w].insert(tasks[0].M);   // memoize ONLY a successful rescue
+                    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused (wedge-prone) -> sliced doorbell rc=%d (memoized M=%d)\n", rc, tasks[0].M);
+                }
             }
         }
     } else {
