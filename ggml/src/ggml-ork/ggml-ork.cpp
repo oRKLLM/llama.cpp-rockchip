@@ -292,7 +292,7 @@ struct ggml_backend_ork_context {
     void * dma_in = nullptr;  size_t dma_in_sz = 0;
     void * dma_up = nullptr;  size_t dma_up_sz = 0;
     void * dma_gt = nullptr;  size_t dma_gt_sz = 0;
-    void * dma_moeC[16] = {}; size_t dma_moeC_sz[16] = {};   // #14 multi-core NONBLOCK: per-domain resident MoE output (in-domain -> begin_mc direct-writes, no copy-back)
+    void * dma_moeC[64] = {}; size_t dma_moeC_sz[64] = {};   // #14 multi-core NONBLOCK: per-domain resident MoE output. Sized to the system domain ceiling (orkd owned_dom is a 64-bit mask -> 63 domains, ~155 GiB, beyond any RK3588); the auto-sizer picks the actual count. No small fixed cap.
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
@@ -503,7 +503,7 @@ struct ggml_backend_ork_context {
     size_t domain_fill_cap = (size_t) 3000 * 1024 * 1024;  // per-domain fill ceiling (ork_domain_for); auto = EVEN
                                  // inflated_total/n_domains so domains fill uniformly with equal IOVA headroom,
                                  // instead of greedily to 3.0 GiB (which packs early domains tight + overflows last)
-    size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
+    size_t domain_bytes[64] = {0};   // resident NPU bytes placed in each domain (report). Sized to the 64-domain system ceiling (see dma_moeC).
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
@@ -1325,7 +1325,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
                 it->second.bytes = ork_w_bytes(it->second.w);
                 ctx->wcache_bytes += it->second.bytes;
-                if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
+                if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += it->second.bytes;
                 ctx->persist_hits++;
                 if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
                     e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
@@ -1420,7 +1420,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     it = ctx->wcache.emplace(x, std::move(ow)).first;
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
-    if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
+    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += it->second.bytes;
     if (ctx->slice_route && !ctx->spool && (K > 4096 || N > 8192)) {   // wide int8: pack a sliced-doorbell twin (A/B; +resident bytes; not under spool, whose ork_w is remapped)
         ork_w_sliced * ws = ork_mm_pack_sliced(ctx->npu, K, N, bi, ORK_DT_I8);   // bi = int8 weight bytes (still valid until ork_evict_src below)
         if (ws) ctx->slice_ws[it->second.w] = ws;
@@ -2164,7 +2164,7 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
             ork_persist_write(ctx, gname, K, Ntot, ow, nullptr, g[0]->src[0]->type, bi);   // .orkpack: persist the fused weight (int8 tier) so read-back loads it — complete + budgeted pack
         }
         ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
-        if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
@@ -2274,7 +2274,7 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
         while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
         if (!ow.w) return false;
         ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
-        if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
@@ -2478,7 +2478,7 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
     if (ctx->dma_up) ork_dma_free(ctx->npu, ctx->dma_up);
     if (ctx->dma_gt) ork_dma_free(ctx->npu, ctx->dma_gt);
-    for (int d = 0; d < 16; d++) if (ctx->dma_moeC[d]) ork_dma_free(ctx->npu, ctx->dma_moeC[d]);
+    for (int d = 0; d < 64; d++) if (ctx->dma_moeC[d]) ork_dma_free(ctx->npu, ctx->dma_moeC[d]);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
@@ -4004,7 +4004,7 @@ static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) { ork_npu_set_pack_domain(ctx->npu, dom);
         w = ork_mm_pack_i8_import(ctx->npu, K, N, bi.data()); }
     if (!w) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());   // last-resort native (single-domain / import unavailable)
-    if (w && dom >= 0 && dom < 16) ctx->domain_bytes[dom] += fcwg_bytes;
+    if (w && dom >= 0 && dom < 64) ctx->domain_bytes[dom] += fcwg_bytes;
     if (w && out_scale) *out_scale = scale;
     return w;
 }
@@ -6319,17 +6319,17 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // Bf costs the chain nothing. Set BEFORE the domain sizing below (which now honors NO_BF). Opt out with
     // ORK_KEEP_BF=1; an explicit ORK_NO_BF (either value) also wins.
     if (ork_ffn_chain_on() && !getenv("ORK_KEEP_BF") && !getenv("ORK_NO_BF")) setenv("ORK_NO_BF", "1", 1);
-    // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
-    // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
-    // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
-    // residence never evicts.
-    { const char * nd = getenv("ORK_DOMAINS");
-      // ORK_DOMAINS is DEPRECATED: the auto-sizer below computes the domain count from the resident orkpack
-      // footprint. It is honored ONLY as a CLAMP-UP (force MORE domains than auto, never fewer) — a value BELOW
-      // the auto count under-provisions IOVA -> last-domain overflow -> Bf PRIME-fail -> warmup wedge (hit at
-      // DOMAINS=2, =4), so it can never lower the count; but the auto footprint calc can itself UNDER-count the
-      // import path (observed: 7B import auto=5 overflowed; needed more), so raising it stays a valid escape
-      // hatch. Applied AFTER the auto block (below). ORK_DOMAIN_LAYERS remains for manual layer->domain control.
+    // MULTI-DOMAIN RESIDENCE: weights spread across as many IOMMU domains as the AUTO-SIZER computes (each
+    // with its own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. The
+    // domain count is auto-only (no ORK_DOMAINS env, no fixed cap); ORK_DOMAIN_LAYERS is a manual layout knob.
+    // Pass a large ORK_WCACHE_BUDGET_MB so the residence never evicts.
+    {
+      // The auto-sizer below is the SOLE authority for the IOMMU domain count — computed from the resident
+      // orkpack footprint. The old ORK_DOMAINS env override is gone (it was only ever a clamp-UP escape hatch
+      // for an auto UNDER-count; the under-count root cause — unbudgeted fused-group weights + missing orkd
+      // domain ownership — is fixed, so the auto count is trustworthy). There is NO fixed domain cap: the
+      // driver arrays grow dynamically (ork_npu_set_ndomains) and the daemon hands out up to its 64-bit
+      // owned_dom width. ORK_DOMAIN_LAYERS remains a manual layer->domain LAYOUT knob (default 0 = auto).
       if (!ctx->persist_idx.empty()) {
           // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate for the resident Bb+Bf footprint,
           // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
@@ -6389,7 +6389,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // (~2.7 GiB observed) — keep each domain's byte-balanced fill well clear of that edge.
           const size_t cap = (size_t) 2500 * 1024 * 1024;
           long nd = (long) ((inflated + cap - 1) / cap);
-          ctx->n_domains = nd < 1 ? 1 : (nd > 16 ? 16 : (int) nd);
+          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // no small cap; 63 = the system's owned_dom bitmask ceiling (~155 GiB, beyond any RK3588)
           if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
           if (getenv("ORK_VERBOSE"))
               fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom, byte-balanced) from %.2f GiB resident footprint\n",
@@ -6400,26 +6400,13 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
           ctx->n_domains = 8;
       }
-      // DEPRECATED ORK_DOMAINS, applied as a CLAMP-UP only (see the block header). Raising n_domains alone is
-      // safe: ork_weight_domain fills each domain to the (unchanged) fill cap and simply uses more of them, so
-      // the extra domains add IOVA headroom and no domain overflows — the fix for an auto under-count.
-      if (nd) {
-          int req = atoi(nd); if (req < 1) req = 1; if (req > 16) req = 16;
-          if (req > ctx->n_domains) {
-              fprintf(stderr, "[ork] WARNING: ORK_DOMAINS is deprecated; auto sized %d domains, clamping UP to %d "
-                              "(auto can under-count the import footprint; raising is the only honored direction)\n",
-                      ctx->n_domains, req);
-              ctx->n_domains = req;
-          } else {
-              fprintf(stderr, "[ork] WARNING: ORK_DOMAINS=%d is deprecated and <= the auto-safe %d; ignored "
-                              "(auto wins — lowering would under-provision IOVA and wedge)\n", req, ctx->n_domains);
-          }
-      }
-      // ORK_DOMAIN_LAYERS: explicit override ONLY. domain_layers stays 0 (its default) unless set — the auto
-      // branch above sizes domains by byte-balanced fill (ork_weight_domain), NOT layer-alignment, so there is
-      // no computed value to preserve. Guard on `dl` (don't `= dl ? atoi(dl) : 0`) so an unset var can't clobber
-      // an explicit ORK_DOMAIN_LAYERS that a caller set for per-domain fusion experiments.
+      // ORK_DOMAIN_LAYERS: explicit LAYOUT override ONLY (layers-per-domain). domain_layers stays 0 (its
+      // default) unless set — the auto branch sizes by byte-balanced fill (ork_weight_domain), not layer
+      // alignment. Guard on `dl` so an unset var can't clobber an explicit value set for a fusion experiment.
       const char * dl = getenv("ORK_DOMAIN_LAYERS"); if (dl) ctx->domain_layers = atoi(dl); }
+    // Pre-size the driver's per-domain arrays to the auto-sized count (grows on demand otherwise; this just
+    // avoids a mid-load realloc). The driver has NO fixed domain cap — the count is whatever we computed above.
+    ork_npu_set_ndomains(ctx->npu, ctx->n_domains);
     // ORKD DOMAIN OWNERSHIP (the multi-domain 7B OOM fix). Under orkd the daemon REJECTS any pack/import into a
     // domain the client does not OWN (handle_import → "domain not owned by client"), so a weight the auto-sizer
     // placed in logical domain 1..n_domains-1 fails to import, the client ork_domain_advance()s through the rest,
