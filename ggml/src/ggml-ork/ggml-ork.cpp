@@ -1518,19 +1518,19 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     }
     int rc;
     if (tasks.size() == 1) {
-        rc = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
-        // ORK_SLICE_ROUTE — wedge-safety RESCUE, not a re-route. It fires ONLY when the normal path REFUSED the
-        // shape (rc != 0: an out-of-envelope / wedge-prone shape run_i8 declines rather than risk a blocking-submit
-        // wedge). Then re-run it on the all-doorbell sliced primitive, which decomposes into verified c_base tiles.
-        // A shape that SUCCEEDS above never reaches this branch → pure no-op, zero throughput cost for working
-        // shapes; it only converts a would-be failure/wedge into a correct (somewhat slower) result. Requires the
-        // driver to REFUSE wedge-prone shapes cleanly (task #15) for the rescue to catch them, and a pre-packed
-        // sliced twin for this weight (flag on). No twin / not enabled → rc stands (unchanged behavior).
-        if (rc != 0 && ctx->slice_route && !ctx->slice_ws.empty()) {
+        const int r = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+        rc = r ? -1 : 0;
+        // ORK_SLICE_ROUTE — wedge-safety RESCUE, keyed on the SPECIFIC refusal code. run_i8 returns
+        // ORK_RC_WEDGE_PRONE (not the generic -1) only when it declines an out-of-envelope shape rather than
+        // risk a blocking-submit wedge. ONLY that code triggers the rescue: re-run on the all-doorbell sliced
+        // primitive (verified c_base tiles). A shape that SUCCEEDS, or fails for any OTHER reason (bad args,
+        // real fault), never rescues → pure no-op, zero cost for working shapes. Needs a pre-packed sliced
+        // twin for this weight (ORK_SLICE_ROUTE on). No twin / not enabled → the refusal stands.
+        if (r == ORK_RC_WEDGE_PRONE && ctx->slice_route && !ctx->slice_ws.empty()) {
             auto sit = ctx->slice_ws.find(tasks[0].w);
             if (sit != ctx->slice_ws.end() && sit->second) {
                 rc = ork_mm_run_sliced(ctx->npu, sit->second, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
-                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused a shape -> sliced doorbell rc=%d\n", rc);
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused (wedge-prone) -> sliced doorbell rc=%d\n", rc);
             }
         }
     } else {
