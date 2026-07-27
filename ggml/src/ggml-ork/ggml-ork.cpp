@@ -274,6 +274,10 @@ struct ggml_backend_ork_context {
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
+    bool slice_route = false;  // ORK_SLICE_ROUTE=1: route wide int8 matmuls (K>4096 / N>8192) through the
+                               // sliced doorbell (ork_mm_run_sliced) instead of the M>1 blocking mcworker —
+                               // wedge-safe (doorbell owns the submit). Default off; A/B vs the blocking path.
+    std::unordered_map<ork_w *, ork_w_sliced *> slice_ws;   // resident wide weight -> its sliced-doorbell pack
     bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
@@ -579,6 +583,14 @@ static int ork_domain_advance(ggml_backend_ork_context * ctx) {
     return d;
 }
 
+// ORK_SLICE_ROUTE: free + forget a weight's sliced-doorbell twin (if any) whenever its ork_w is freed, so a
+// reused ork_w pointer can never resolve to a stale twin. No-op unless slice_route packed a twin for this w.
+static inline void ork_slice_ws_drop(ggml_backend_ork_context * ctx, ork_w * w) {
+    if (!w || ctx->slice_ws.empty()) return;
+    auto it = ctx->slice_ws.find(w);
+    if (it != ctx->slice_ws.end()) { ork_mm_free_sliced(ctx->npu, it->second); ctx->slice_ws.erase(it); }
+}
+
 // Evict least-recently-used weights (reclaiming IOVA via ork_mm_free) until `need` more bytes fit under
 // the budget. Only per-tile-owned weights (int8 / per-channel int4) actually return IOVA; the current
 // op's weight is never in the cache yet, so it is never evicted.
@@ -592,6 +604,7 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
             if (!ctx->wcache_pin.count(it->first) &&                    // never evict a weight the active op still references
                 (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
         if (lru == ctx->wcache.end()) break;   // all remaining entries are pinned by the active op — can't free more
+        ork_slice_ws_drop(ctx, lru->second.w);
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
         ctx->wcache.erase(lru);
@@ -670,8 +683,20 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (fd >= 0) {
         off_t sz = lseek(fd, 0, SEEK_END);
         if (sz > (off_t) sizeof(orkpack_footer)) {
-            void * m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            // AGGRESSIVE LOAD (default): pull the whole orkpack off disk NOW, sequentially — MAP_POPULATE
+            // prefaults every page at mmap time (one big sequential read, ~disk-bandwidth-bound) so the
+            // per-weight domain fills below hit warm page-cache instead of demand-paging random faults
+            // interleaved with the first forward pass (the slow load). fadvise SEQUENTIAL primes readahead.
+            // Opt back into lazy demand-paging with ORK_PERSIST_MMAP_LAZY=1 (the old mmap-view behavior).
+            int mflags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+            const bool lazy_mmap = getenv("ORK_PERSIST_MMAP_LAZY") != nullptr;
+            if (!lazy_mmap) mflags |= MAP_POPULATE;
+#endif
+            posix_fadvise(fd, 0, sz, POSIX_FADV_SEQUENTIAL);
+            void * m = mmap(nullptr, sz, PROT_READ, mflags, fd, 0);
             if (m != MAP_FAILED) {
+                posix_fadvise(fd, 0, sz, POSIX_FADV_WILLNEED);   // kick readahead for the whole file (belt-and-suspenders w/ MAP_POPULATE)
                 orkpack_footer f; memcpy(&f, (char *) m + sz - sizeof f, sizeof f);
                 // Reject (=> regenerate below) if the ork-driver pack format is incompatible: an older
                 // footer schema (< v3, no ork_fmt) or a different pack-compat token (a tiling/quant
@@ -1205,6 +1230,7 @@ static bool ork_spool_install(ggml_backend_ork_context * ctx,
     if (!se) return false;    // fall back to ow.w (still resident & counted)
     // free the temp IOVA weight (it was counted in wcache_bytes by the caller); the RAM entry replaces it
     ctx->wcache_bytes -= ow.bytes;
+    ork_slice_ws_drop(ctx, ow.w);
     ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; ow.bytes = 0;
     ow.se = se; ow.ram_bytes = ork_stream_entry_bytes(se); ctx->spool_ram_bytes += ow.ram_bytes;
     ork_spool_iova_evict(ctx, ow.ram_bytes);
@@ -1392,6 +1418,11 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
     if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
+    if (ctx->slice_route && !ctx->spool && (K > 4096 || N > 8192)) {   // wide int8: pack a sliced-doorbell twin (A/B; +resident bytes; not under spool, whose ork_w is remapped)
+        ork_w_sliced * ws = ork_mm_pack_sliced(ctx->npu, K, N, bi, ORK_DT_I8);   // bi = int8 weight bytes (still valid until ork_evict_src below)
+        if (ws) ctx->slice_ws[it->second.w] = ws;
+        else if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice_route: sliced pack failed K=%d N=%d (IOVA?) -> blocking path\n", K, N);
+    }
     ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type, bi);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier; bi = int8 CPU-dump fallback if NPU busy)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
     // STREAM-POOL: move the just-packed int8 weight into the RAM tier (cheap remaps on future hits).
@@ -1488,6 +1519,20 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     int rc;
     if (tasks.size() == 1) {
         rc = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
+        // ORK_SLICE_ROUTE — wedge-safety RESCUE, not a re-route. It fires ONLY when the normal path REFUSED the
+        // shape (rc != 0: an out-of-envelope / wedge-prone shape run_i8 declines rather than risk a blocking-submit
+        // wedge). Then re-run it on the all-doorbell sliced primitive, which decomposes into verified c_base tiles.
+        // A shape that SUCCEEDS above never reaches this branch → pure no-op, zero throughput cost for working
+        // shapes; it only converts a would-be failure/wedge into a correct (somewhat slower) result. Requires the
+        // driver to REFUSE wedge-prone shapes cleanly (task #15) for the rescue to catch them, and a pre-packed
+        // sliced twin for this weight (flag on). No twin / not enabled → rc stands (unchanged behavior).
+        if (rc != 0 && ctx->slice_route && !ctx->slice_ws.empty()) {
+            auto sit = ctx->slice_ws.find(tasks[0].w);
+            if (sit != ctx->slice_ws.end() && sit->second) {
+                rc = ork_mm_run_sliced(ctx->npu, sit->second, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused a shape -> sliced doorbell rc=%d\n", rc);
+            }
+        }
     } else {
         bool same_dom = true; const int d0 = ork_w_domain(tasks[0].w);
         for (size_t t = 1; t < tasks.size(); t++) if (ork_w_domain(tasks[t].w) != d0) { same_dom = false; break; }
@@ -2042,38 +2087,65 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
     const void * key = g[0]->src[0]->data;
     auto it = ctx->wcache.find(key);
-    if (it == ctx->wcache.end()) {                       // build + pack the fused weight once
+    if (it == ctx->wcache.end()) {                       // load-or-(build+pack)+persist the fused weight once
         ork_weight ow; ow.bscale.resize(Ntot);
-        ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
-        for (int i = 0; i < ng; i++) {
-            const struct ggml_tensor * w = g[i]->src[0];
-            const int Ni = (int) w->ne[1];
-            const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
-            ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
-            const char * x = (const char *) w->data;
-            if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
-            else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
-            for (int n = 0; n < Ni; n++) {
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-                float s = mx / 127.0f; ow.bscale[off[i]+n] = s;
-                for (int k = 0; k < K; k++) {            // fused B[k][off+n] = src0_i[n][k]
-                    int q = (int) lrintf(f32[(size_t) n*K + k] / s);
-                    bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+        // Synthetic name for the FUSED (concatenated) group weight — stable across runs (grouping is
+        // deterministic from the graph), distinct from the individual member names. This makes the fused
+        // weight a FIRST-CLASS .orkpack entry: it is PERSISTED on the write pass and LOADED back on read, so
+        // (a) a generated pack is COMPLETE (grouped gate/up are no longer silently dropped — the 3.8 GiB vs
+        // 11 GiB gap) and (b) the auto-sizer BUDGETS it (it's now in persist_idx), fixing the multi-domain
+        // OOM where the fused weight was re-JIT-packed at read into domains no one reserved.
+        char gname[256];
+        snprintf(gname, sizeof gname, "%s#grp%dx%d", g[0]->src[0]->name, ng, Ntot);
+        int _dom = 0;
+        bool loaded = false;
+        if (ctx->persist_mode == 1) {                    // READ: load the fused weight from the .orkpack if present
+            auto pit = ctx->persist_idx.find(gname);
+            if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K &&
+                pit->second.N == (uint32_t) Ntot && pit->second.dtype == ORKPACK_DT_I8) {
+                const orkpack_entry & e = pit->second;
+                const char * blob = (const char *) ctx->persist_map + e.blob_off;
+                _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
+                ork_npu_set_pack_domain(ctx->npu, _dom);
+                for (;;) {                               // import (zero-copy view of the mmap'd pack, or orkd dma-buf), spill on IOVA overflow
+                    if (ctx->via_orkd) { size_t blob_n = (size_t) e.blob_size + e.bf_size;
+                        ow.w = ork_mm_import_i8(ctx->npu, K, Ntot, blob, blob_n, e.bf_size ? (size_t) e.blob_size : 0); }
+                    else { ow.w = ork_mm_load_i8_import(ctx->npu, K, Ntot, blob, e.blob_size);
+                           if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, Ntot, blob, e.blob_size); }
+                    if (ow.w || (_dom = ork_domain_advance(ctx)) < 0) break;
                 }
+                if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                            ow.bscale.assign(bs, bs + e.bscale_n); loaded = true; }
             }
         }
-        // Multi-domain placement + spill: the fused concatenated weight (K x Ntot) is packed FRESH here and
-        // is NOT in persist_idx, so the auto-sizer never budgeted it (it duplicates the q/k/v or gate/up tiles
-        // that are already persist-resident — ~1.7x the model on a dense >4 GiB load). Like EVERY other pack
-        // site, pick a byte-balanced domain first, then spill to the next domain on IOVA overflow rather than
-        // hard-failing into domain 0 (the Bb[k] bcreate failure this fixes). Falls back to CPU only if ALL
-        // domains are exhausted.
-        int _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
-        ork_npu_set_pack_domain(ctx->npu, _dom);
-        ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
-        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
-        if (!ow.w) return false;
+        if (!loaded) {                                   // build the fused int8 weight from the members, pack, then persist
+            ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
+            for (int i = 0; i < ng; i++) {
+                const struct ggml_tensor * w = g[i]->src[0];
+                const int Ni = (int) w->ne[1];
+                const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
+                ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
+                const char * x = (const char *) w->data;
+                if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
+                else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
+                for (int n = 0; n < Ni; n++) {
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+                    float s = mx / 127.0f; ow.bscale[off[i]+n] = s;
+                    for (int k = 0; k < K; k++) {        // fused B[k][off+n] = src0_i[n][k]
+                        int q = (int) lrintf(f32[(size_t) n*K + k] / s);
+                        bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                    }
+                }
+            }
+            // Byte-balanced domain first, spill to the next on IOVA overflow (same as every other pack site).
+            _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
+            ork_npu_set_pack_domain(ctx->npu, _dom);
+            ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+            while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+            if (!ow.w) return false;
+            ork_persist_write(ctx, gname, K, Ntot, ow, nullptr, g[0]->src[0]->type, bi);   // .orkpack: persist the fused weight (int8 tier) so read-back loads it — complete + budgeted pack
+        }
         ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
         if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
@@ -2382,6 +2454,8 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         fprintf(stderr, "[ork STREAM-POOL] entries=%zu | RAM held=%.2f GiB | IOVA mapped=%.2f GiB | remaps(cheap)=%ld IOVA-unmaps=%ld RAM-evicts=%ld\n",
             ctx->wcache.size(), ctx->spool_ram_bytes/(1024.0*1024.0*1024.0), ctx->wcache_bytes/(1024.0*1024.0*1024.0),
             ctx->spool_remaps, ctx->spool_iova_unmaps, ctx->spool_ram_evicts);
+    for (auto & kv : ctx->slice_ws) if (kv.second) ork_mm_free_sliced(ctx->npu, kv.second);   // ORK_SLICE_ROUTE sliced-doorbell twins
+    ctx->slice_ws.clear();
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
     if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
@@ -6213,6 +6287,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
+    ctx->slice_route = getenv("ORK_SLICE_ROUTE") != nullptr && !ctx->via_orkd;   // wide int8 via sliced doorbell (fd-local only)
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     // Hadamard engages under global int4 (ORK_QUANT=4) OR per-tensor mixed W4A4 (ORK_MIXED_DISPATCH +
     // ORK_MIXED_W4A4): both route the 4-bit tier to mul_mat_i4_hadamard (per-channel, single submit, the
@@ -6328,6 +6403,23 @@ ggml_backend_t ggml_backend_ork_init(void) {
       // no computed value to preserve. Guard on `dl` (don't `= dl ? atoi(dl) : 0`) so an unset var can't clobber
       // an explicit ORK_DOMAIN_LAYERS that a caller set for per-domain fusion experiments.
       const char * dl = getenv("ORK_DOMAIN_LAYERS"); if (dl) ctx->domain_layers = atoi(dl); }
+    // ORKD DOMAIN OWNERSHIP (the multi-domain 7B OOM fix). Under orkd the daemon REJECTS any pack/import into a
+    // domain the client does not OWN (handle_import → "domain not owned by client"), so a weight the auto-sizer
+    // placed in logical domain 1..n_domains-1 fails to import, the client ork_domain_advance()s through the rest,
+    // and residency collapses into domain 0 only (measured: 7B loaded ~2 GiB/dom then OOM at layer ~10, vs direct
+    // mode's 2.53 GiB × 5 = full model). So ACQUIRE ownership of each non-zero logical domain up front. The
+    // daemon's dom_alloc_explicit hands out contiguous ids 1,2,3,… to a fresh client ⇒ physical == logical, no
+    // remap needed; warn if that breaks (multi-client / pool exhaustion). Direct mode owns every domain implicitly.
+    if (ctx->via_orkd && ctx->n_domains > 1) {
+        for (int d = 1; d < ctx->n_domains; d++) {
+            int got = ork_npu_domain_alloc(ctx->npu);
+            if (got != d)
+                fprintf(stderr, "[ork] WARNING: orkd domain acquire: logical %d -> physical %d (non-contiguous or pool exhausted); "
+                                "multi-domain residency may still reject — a single fresh client should map 1:1\n", d, got);
+            else if (getenv("ORK_VERBOSE"))
+                fprintf(stderr, "[ork] orkd: acquired domain %d\n", got);
+        }
+    }
     // Residency = ork-driver's MULTI-DOMAIN mechanism (weights resident across up to 16 IOMMU domains,
     // each its own ~4 GiB IOVA window; dom_activate zero-copy-swaps the active domain per submit). This
     // resides up to ~64 GiB with no streaming — every practical model. The stream pool (RAM-hold + dma-buf
