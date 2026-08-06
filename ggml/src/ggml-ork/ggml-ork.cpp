@@ -6251,43 +6251,42 @@ ggml_backend_t ggml_backend_ork_init(void) {
         GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
                       g_ork_cfg_silu_int8fused ? "int8-fused(through)" : "int16-coherent", g_ork_cfg_dflash ? "on" : "off");
     }
-    // orkd is the DEFAULT NPU path: the daemon owns the single-stream NPU and serializes every submit, so
-    // concurrent processes can't wedge the IOMMU (a dev-time safety property, not a separate architecture).
-    // ork_npu_init() activates the orkd CLIENT via these env vars (the daemon itself sets ORKD_IS_DAEMON, which
-    // we never do here). The lib (direct) path is behaviorally IDENTICAL to orkd — same op set + shapes, proven
-    // by test_api_parity and the direct-vs-orkd A/B — differing only in transport; orkd just adds the socket +
-    // single-stream serialization. ORK_DIRECT=1 opts into the in-process lib path (single-process runs /
-    // profiling, where the daemon's serialization isn't needed and the socket round-trips aren't wanted).
-    const bool want_direct = getenv("ORK_DIRECT") != nullptr;
-    if (!want_direct) {
-        setenv("ORK_USE_ORKD", "1", 1);   // FORCE (overwrite) so nothing silently drops orkd mode back to direct
-        setenv("ORK_ORKD_RING", "1", 1);  // the low-latency decode transport async ork_mm_submit/collect ride
+    // DIRECT (in-process lib) is the DEFAULT NPU path — it is what oRKLLM and any single-process run get with
+    // no extra env. The lib and orkd paths are behaviorally IDENTICAL (same op set + shapes, proven by
+    // test_api_parity and the direct-vs-orkd A/B), differing only in transport. orkd (the daemon that owns the
+    // single-stream NPU and serializes every submit, so concurrent processes can't wedge the IOMMU — a dev-time
+    // safety property, not a separate architecture) is OPT-IN via the single env ORK_USE_ORKD=1.
+    // Transport is selected by CHOOSING the ork-driver entry point (not by env magic): ork_npu_init() = direct
+    // (the DEFAULT), ork_npu_init_orkd() = orkd client. orkd is OPT-IN via ORK_USE_ORKD=1; unset (the common
+    // case, incl. oRKLLM) = direct in-process NPU. (There is no ORK_DIRECT any more — direct being the default
+    // makes an opt-in-to-direct switch redundant.)
+    const char * uo = getenv("ORK_USE_ORKD");
+    const bool want_orkd = uo && atoi(uo) != 0;
+    ork_npu * npu;
+    if (want_orkd) {
+        setenv("ORK_ORKD_RING", "1", 1);   // the low-latency decode transport async ork_mm_submit/collect ride
+        npu = ork_npu_init_orkd();         // explicit orkd client; NULL (no silent fallback) if the daemon can't connect
+        if (!npu) {
+            GGML_LOG_ERROR("%s: ORK_USE_ORKD=1 but orkd did not connect — check ORKD_BIN points at the orkd binary "
+                           "and it is spawnable, or unset ORK_USE_ORKD to use the default in-process lib path "
+                           "(single-stream: do not run concurrent NPU processes).\n", __func__);
+            return NULL;
+        }
     } else {
+        unsetenv("ORK_USE_ORKD");   // neutralize the driver's legacy env override so ork_npu_init() stays direct
         // In-process direct mode shares the 4 big cores with llama.cpp's compute threadpool (-t 4). Pinning the
         // NPU-driver worker threads to those same cores (the default) OVERSUBSCRIBES them against the threadpool
         // and drags prefill (measured: 136 -> 213 t/s at M=228, i.e. faster than orkd's 168 once unpinned). orkd
         // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
         // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
         setenv("ORK_NO_AFFINITY", "1", 0);
+        npu = ork_npu_init();       // DEFAULT: direct in-process NPU
+        if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
+        GGML_LOG_INFO("%s: in-process lib NPU path (direct — default; single-stream, no concurrent NPU procs)\n", __func__);
     }
-    ork_npu * npu = ork_npu_init();
-    if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
-    // In the DEFAULT (orkd) mode, direct-NPU is not a silent fallback: if the daemon didn't connect
-    // (missing/unspawnable ORKD_BIN, socket refused) the routing would silently drop to the single-stream direct
-    // path mid-load — the footgun the orkd migration removes. Fail loudly so a misconfigured daemon is caught at
-    // load, not as a mid-run IOMMU wedge. When ORK_DIRECT=1 the direct path is the DELIBERATE choice, so allow it.
-    if (!want_direct && !ork_npu_uses_orkd(npu)) {
-        GGML_LOG_ERROR("%s: NOT routed through orkd (daemon connect failed) — check ORKD_BIN points at the orkd "
-                       "binary and it is spawnable, or set ORK_DIRECT=1 to deliberately use the in-process lib "
-                       "path (single-stream: do not run concurrent NPU processes).\n", __func__);
-        ork_npu_free(npu);
-        return NULL;
-    }
-    if (want_direct)
-        GGML_LOG_INFO("%s: ORK_DIRECT=1 — in-process lib NPU path (no orkd daemon; single-stream, no concurrent NPU procs)\n", __func__);
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
-    ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // always true here (init hard-fails above otherwise) — gates the orkd-routed weight/matmul path
+    ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // true iff ORK_USE_ORKD opted in and the daemon connected; false in the default direct path — gates the orkd-routed weight/matmul path
     g_ork_ctx = ctx;
     ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
     // (b) load the persisted gmax sidecar (<ORK_PERSIST>.gmax) if present: a known model's per-layer gate
@@ -6430,11 +6429,11 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // map/unmap) is only needed BEYOND that; leave it off (NULL) so the domain path is used.
     ctx->spool = nullptr;
     fprintf(stderr, "[ork] residency: multi-domain (up to %d domains x ~4 GiB IOVA, dom_activate swap)\n", ctx->n_domains);
-    // orkd routing (ork-driver >=1.0.0): every NPU submit routes through the orkd daemon (serialized — the
-    // safe way to share the single-stream NPU; direct concurrent access wedges the IOMMU). This is the
-    // committed path — init already hard-failed above if the daemon didn't connect — so ork_npu_uses_orkd()
-    // is true here; report it for the run log.
-    fprintf(stderr, "[ork] routing: orkd daemon (serialized) + shm ring\n");
+    // NPU routing: DIRECT (in-process lib) by default, or through the orkd daemon when ORK_USE_ORKD=1 opted in
+    // (serialized — the safe way to share the single-stream NPU across concurrent processes; direct concurrent
+    // access wedges the IOMMU). Report whichever is actually in effect for the run log.
+    fprintf(stderr, "[ork] routing: %s\n", ctx->via_orkd ? "orkd daemon (serialized) + shm ring"
+                                                          : "direct in-process lib (single-stream)");
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
