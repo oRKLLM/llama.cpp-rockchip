@@ -105,6 +105,11 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <sched.h>
+#include <pthread.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -112,6 +117,8 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
 extern "C" {
 #include "ork_npu.h"
+#include "ork_spine.h"   // generalized heterogeneous CPU<->NPU DAG dispatcher (ORK_FFN_SPINE path)
+#include "ork_native_cpu.h"   // #12: CPU-side NEON GEMV over the ork-native tiered format (shared with the NPU)
 }
 
 #include <sys/mman.h>
@@ -156,11 +163,14 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 3u   // v3 adds ork_fmt (ork-driver pack-compat token = its MAJOR ver) to the footer
+#define ORKPACK_VERSION 4u   // v4 adds bf_size to each entry (the full-K Bf blob stored right after the Bb blob,
+                             // so the orkd import maps Bf directly — no runtime rebuild); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
-struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off; };
+// bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
+// blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; };
 // ork_fmt = ork_pack_format_version() at write time. A tile-layout / quant change bumps ork-driver's
 // MAJOR version, so a stored ork_fmt != this build's => the tiled bytes are incompatible; the file is
 // rejected on read and regenerated (the read path falls through to write mode). magic stays last so it
@@ -240,12 +250,35 @@ struct ork_moe_slot {
     const void * key = nullptr;       // host ptr of the expert currently packed here (nullptr = empty)
 };
 
+// Fused-attention (GGML_OP_FLASH_ATTN_EXT) scratch. PER-CONTEXT (was the process-global g_attnp) so two ork
+// backends can run real attention graphs concurrently without clobbering each other's QK^T/scores/softmax
+// buffers. Pool = NPU scratch weights (wqk/wav/wet) + host densify/score buffers, warm-reused across calls of
+// the same shape. attn_sm = the softmax scratch (int8 scores, per-row max, exp/reduce/normalize buffers).
+struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav, **wet;
+    ork_f16 *Qf, *KT, *Vf, *Pf, *Oh16; float *scores, *outf, *invS; ork_mm_task_f16 *tk; };
+struct ork_attn_sm {
+    int16_t *xi=nullptr,*ei=nullptr; float *mx=nullptr,*ss=nullptr; ork_f16 *e=nullptr; size_t cap=0;
+    int8_t *q8=nullptr; size_t cap2=0; int8_t maxq[8192];
+    ork_f16 *invf=nullptr; int invf_n=0;
+    ork_w *ones=nullptr; int ones_n=0;
+};
+
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
+    bool via_orkd = false;     // true = NPU access routed through the orkd daemon (ork_npu_uses_orkd). In this
+                               // mode the client has NO local NPU fd, so weight residency + matmuls must use the
+                               // ORKD-ROUTED driver APIs only (ork_mm_pack_i8 / ork_mm_run_i8 — the daemon owns
+                               // the buffers). The zero-copy .orkpack import, DMA activation buffers, and the
+                               // fused/stream/chain/MoE runners are fd-local (not routed) and are gated OFF here.
     int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
     int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
+    bool slice_route = false;  // ORK_SLICE_ROUTE=1: route wide int8 matmuls (K>4096 / N>8192) through the
+                               // sliced doorbell (ork_mm_run_sliced) instead of the M>1 blocking mcworker —
+                               // wedge-safe (doorbell owns the submit). Default off; A/B vs the blocking path.
+    std::unordered_map<ork_w *, ork_w_sliced *> slice_ws;   // resident wide weight -> its sliced-doorbell pack
+    std::unordered_map<ork_w *, std::unordered_set<int>> slice_forced;   // memo: (weight -> M's) proven wedge-prone this session -> skip the doomed run_i8, go straight to sliced
     bool hybrid = false;       // use hybrid loading (FFN 4-bit, Attn 8-bit)
     std::vector<float>    f32;   // dequantized src0 plane [N*K] (cache-miss scratch)
     std::vector<int8_t>   bi;    // weights quantized int8 B[K*N] (cache-miss scratch)
@@ -259,9 +292,15 @@ struct ggml_backend_ork_context {
     void * dma_in = nullptr;  size_t dma_in_sz = 0;
     void * dma_up = nullptr;  size_t dma_up_sz = 0;
     void * dma_gt = nullptr;  size_t dma_gt_sz = 0;
+    void * dma_moeC[64] = {}; size_t dma_moeC_sz[64] = {};   // #14 multi-core NONBLOCK: per-domain resident MoE output. Sized to the system domain ceiling (orkd owned_dom is a 64-bit mask -> 63 domains, ~155 GiB, beyond any RK3588); the auto-sizer picks the actual count. No small fixed cap.
     // model weights are constant during inference, so pack+quantize each once (NPU-resident) and
     // reuse, keyed by the weight plane's host pointer. The transformer pattern ork-driver is for.
     std::unordered_map<const void *, ork_weight> wcache;
+    // Keys the ACTIVE multi-weight op (e.g. the FFN SwiGLU chain) still holds references to. A multi-weight
+    // op resolves several weights up-front and uses them across later phases; a subsequent resolve's LRU
+    // ork_wcache_evict must NOT free one it still references (would dangle the held ork_weight& -> the
+    // ffn_swiglu_chain use-after-free, ASAN-confirmed 2026-07-25). Pinned keys are skipped by eviction.
+    std::unordered_set<const void *> wcache_pin;
     size_t   wcache_bytes = 0;   // resident NPU bytes across wcache — streaming LRU budget tracker
     // ORK_FFN_CHAIN: PER-TENSOR (scalar-scale) packed weights for the round-trip-free SwiGLU chain (the
     // fused SiLU stage's scalar R can't carry per-channel scale). Keyed by weight host ptr. Separate from
@@ -303,6 +342,11 @@ struct ggml_backend_ork_context {
         // on-NPU int16 op (ork_npu_silu_i16, ~325x more accurate than the int8 fused LUT: 0.28 vs 92 err
         // @gmax132) instead of CPU fp32 — the coherent, integer-datapath replacement for the fragile fp16 gate.
         bool silu_i16 = false;
+        // ORK_FFN_SILU_I16_FUSED: FUSED int16 — fc.wg int8-mm -> int16-out (set_i16_out, on-device, no host
+        // int32->fp32->int16 round-trip, no separate per-channel gate matmul) feeding the int16 SiLU resident.
+        // Scale-bridge: gate_i16 = acc*(gate16_mult>>gate16_shift) ≈ g/gate16_is (g=acc*s_x*sg, is=gmax/32000).
+        int gate16_mult = 0, gate16_shift = 0;
+        double gate16_is = 0;
         double gmax = 0;                               // this layer's calibrated max|gate| (the sensitivity signal)
         // ORK_FFN_F16_JIT: IOVA-headroom variant of the all-fp16 path. Instead of RESIDING fp16 gate/up/down
         // (2x IOVA -> only ~5 layers fit a 4GiB domain), keep each weight host-side as compact int8 +
@@ -396,6 +440,36 @@ struct ggml_backend_ork_context {
     // MUL_MAT_ID kernel (NOT the per-expert vec_dot loop) on a compacted sub-graph. Created lazily.
     ggml_backend_t cpu_backend = nullptr;          // ggml_backend_cpu_init() (lazy)
     int      pathb_cpu_threads = 0;                // ORK_MOE_CPU_THREADS (default 4)
+    // ---- ASYNC CROSS-STREAM (ORK_ASYNC / ggml_backend_ork_graph_compute_async) ----
+    // A per-context worker thread runs the (blocking) graph_compute body so the launching stream can do CPU
+    // work while this stream's NPU submits are in flight. At most ONE in-flight job per backend. The worker
+    // holds the process-global g_npu_queue_mu (the RKNPU is single-stream) so cross-context NPU work serializes.
+    std::thread async_thr;
+    bool        async_inflight = false;
+    enum ggml_status async_status = GGML_STATUS_SUCCESS;
+    // Per-context fused-attention scratch (moved off the old process-global g_attnp / softmax statics) so
+    // concurrent ork backends don't corrupt each other's attention buffers. Freed in ggml_backend_ork_free.
+    struct ork_attn_pool attnp = {};
+    struct ork_attn_sm   attn_sm = {};
+    // Resident-KV for the int8 DECODE attention path (ORK_ATTN_KV): pack K^T/V ONCE per (layer, kv-head)
+    // then append one key/value per token (no per-call repack — the perf lever, vs the default repack path).
+    // Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Fixed per-head int8
+    // scales chosen at the first pack. Freed in ggml_backend_ork_free / on a sequence reset (nkv shrink).
+    struct ork_kv_layer {
+        std::vector<ork_kv_resident *> kv;   // [Hkv] resident K^T/V bundles
+        std::vector<float> ks, vs;            // [Hkv] fixed int8 scales (from first pack)
+        int packed = 0;                       // keys packed so far (== last nkv)
+        int Lmax = 0, Hkv = 0, DK = 0, DV = 0;
+        ork_w *ones = nullptr;                // ORK_ATTN_FUSED: resident ones[Lmax,32] reduce weight (Σ = e·ones)
+        int fused = -1;                       // -1 uninit; 0/1 = this layer's resident scales are per-head/global
+    };
+    std::unordered_map<const void *, ork_kv_layer> attn_kv;
+    // Per-layer DECODE FFN calibration cache (ORK_FFN_DEC): route the SwiGLU inner through the fused orkd
+    // chain (ork_mm_ffn_orkd — one submit) at decode. Per-tensor int8; the intermediate int8 scales (is/os/
+    // us/gs) are calibrated ONCE per layer on the first real decode activation (representative), then reused;
+    // the activation scale + gate/up requant are recomputed live per token. Keyed on the gate weight ptr.
+    struct ork_ffn_dec { bool ready=false; float is=1,os=1,us=1,gs=1, wg_s=1,wu_s=1,wd_s=1; int K=0,Nff=0,Kd=0; };
+    std::unordered_map<const void *, ork_ffn_dec> ffndec;
     // Repacked CPU-share weights: per src0->data, a repack-buffer-backed copy of the full experts tensor
     // (the SAME tiled layout the native fused MUL_MAT_ID uses) so the CPU share is a fair fight vs the
     // repacked baseline. Built once on first touch (ORK_MOE_PATHB_REPACK=1). ctx+buffer kept alive here.
@@ -429,7 +503,7 @@ struct ggml_backend_ork_context {
     size_t domain_fill_cap = (size_t) 3000 * 1024 * 1024;  // per-domain fill ceiling (ork_domain_for); auto = EVEN
                                  // inflated_total/n_domains so domains fill uniformly with equal IOVA headroom,
                                  // instead of greedily to 3.0 GiB (which packs early domains tight + overflows last)
-    size_t domain_bytes[16] = {0};   // resident NPU bytes placed in each domain (report)
+    size_t domain_bytes[64] = {0};   // resident NPU bytes placed in each domain (report). Sized to the 64-domain system ceiling (see dma_moeC).
     long   mem_create_runtime = 0;   // # of weight packs/loads AFTER the load phase (must stay ~0 = no churn)
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
@@ -510,6 +584,16 @@ static int ork_domain_advance(ggml_backend_ork_context * ctx) {
     return d;
 }
 
+// ORK_SLICE_ROUTE: free + forget a weight's sliced-doorbell twin (if any) whenever its ork_w is freed, so a
+// reused ork_w pointer can never resolve to a stale twin. No-op unless slice_route packed a twin for this w.
+static inline void ork_slice_ws_drop(ggml_backend_ork_context * ctx, ork_w * w) {
+    if (!w) return;
+    ctx->slice_forced.erase(w);   // drop the wedge-prone memo too (a reused ork_w ptr must not mis-skip run_i8)
+    if (ctx->slice_ws.empty()) return;
+    auto it = ctx->slice_ws.find(w);
+    if (it != ctx->slice_ws.end()) { ork_mm_free_sliced(ctx->npu, it->second); ctx->slice_ws.erase(it); }
+}
+
 // Evict least-recently-used weights (reclaiming IOVA via ork_mm_free) until `need` more bytes fit under
 // the budget. Only per-tile-owned weights (int8 / per-channel int4) actually return IOVA; the current
 // op's weight is never in the cache yet, so it is never evicted.
@@ -518,9 +602,12 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
     // pack). This makes conversion fit ANY model size (≤1 weight in the 4 GiB window) and avoids thrash.
     const size_t budget = ctx->persist_mode == 2 ? 0 : ork_wcache_budget();
     while (ctx->wcache_bytes + need > budget && !ctx->wcache.empty()) {
-        auto lru = ctx->wcache.begin();
+        auto lru = ctx->wcache.end();
         for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
-            if (it->second.last_use < lru->second.last_use) lru = it;
+            if (!ctx->wcache_pin.count(it->first) &&                    // never evict a weight the active op still references
+                (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
+        if (lru == ctx->wcache.end()) break;   // all remaining entries are pinned by the active op — can't free more
+        ork_slice_ws_drop(ctx, lru->second.w);
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
         ctx->wcache.erase(lru);
@@ -587,14 +674,32 @@ static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
 // Open ORK_PERSIST: if the file exists and validates, mmap it for READ (load weights by name); otherwise
 // open a <path>.tmp for WRITE (this run packs the model and dumps it, then finalize renames it in).
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
+    // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
+    // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_mm_import_i8),
+    // which maps it into the client's IOMMU domain — the client manages its own IOVA, the daemon never tiles
+    // or owns weights. WRITE mode (packing a fresh .orkpack) still needs a resident NPU tile to dump, which is
+    // fd-local, so under orkd we only support READ; if the file is absent, fall back to the live-pack path
+    // (write mode is a one-time offline step — generate the .orkpack in a direct-NPU run, then run under orkd).
     const char * p = getenv("ORK_PERSIST");
     if (!p || !*p) return;
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
         off_t sz = lseek(fd, 0, SEEK_END);
         if (sz > (off_t) sizeof(orkpack_footer)) {
-            void * m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            // AGGRESSIVE LOAD (default): pull the whole orkpack off disk NOW, sequentially — MAP_POPULATE
+            // prefaults every page at mmap time (one big sequential read, ~disk-bandwidth-bound) so the
+            // per-weight domain fills below hit warm page-cache instead of demand-paging random faults
+            // interleaved with the first forward pass (the slow load). fadvise SEQUENTIAL primes readahead.
+            // Opt back into lazy demand-paging with ORK_PERSIST_MMAP_LAZY=1 (the old mmap-view behavior).
+            int mflags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+            const bool lazy_mmap = getenv("ORK_PERSIST_MMAP_LAZY") != nullptr;
+            if (!lazy_mmap) mflags |= MAP_POPULATE;
+#endif
+            posix_fadvise(fd, 0, sz, POSIX_FADV_SEQUENTIAL);
+            void * m = mmap(nullptr, sz, PROT_READ, mflags, fd, 0);
             if (m != MAP_FAILED) {
+                posix_fadvise(fd, 0, sz, POSIX_FADV_WILLNEED);   // kick readahead for the whole file (belt-and-suspenders w/ MAP_POPULATE)
                 orkpack_footer f; memcpy(&f, (char *) m + sz - sizeof f, sizeof f);
                 // Reject (=> regenerate below) if the ork-driver pack format is incompatible: an older
                 // footer schema (< v3, no ork_fmt) or a different pack-compat token (a tiling/quant
@@ -624,6 +729,9 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         }
         close(fd);
     }
+    // WRITE mode (build the .orkpack) works under orkd too: the tiling is done PURE-CPU (ork_w_dump_i8_cpu for
+    // Bb + ork_w_dump_bf_i8_cpu for Bf) from the live-converted raw int8 — no resident NPU tile, no daemon. So a
+    // missing/stale .orkpack self-heals: this run rebuilds it (one-time), future runs READ + import it.
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
@@ -850,8 +958,8 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
             if (tb) {
                 std::vector<char> tmp(tb);
                 ork_w_dump_i4a8(w4, tmp.data(), tb);
-                orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
-                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;
+                orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
                 fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
                 ctx->persist_built.emplace_back(std::string(name), e);
                 ork_mm_free(ctx->npu, w4);
@@ -865,15 +973,28 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     // int8 tier: tile on the CPU from the raw int8 weights when forced CPU-only or when there's no
     // NPU-packed weight (hybrid CPU route — no NPU/IOVA); otherwise dump the NPU-packed tiles. Both
     // produce byte-identical blobs.
-    const bool cpu_dump = (ork_orkpack_cpu_only() && bi_i8) || !ow.w;
+    // Under orkd ow.w is a daemon handle (no local Bb to dump) — must CPU-tile from the raw int8; direct mode
+    // may still dump the NPU-packed tiles. Both produce byte-identical Bb blobs.
+    const bool cpu_dump = ctx->via_orkd ? true : ((ork_orkpack_cpu_only() && bi_i8) || !ow.w);
+    if (cpu_dump && !bi_i8) {   // no raw int8 available for the CPU dump (only under orkd would we get here) — can't persist
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] skip %s (no raw int8 for CPU dump)\n", name);
+        return;
+    }
     size_t tb = cpu_dump ? ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, nullptr, 0)
                          : ork_w_dump(ow.w, nullptr, 0);
     std::vector<char> tmp(tb);
     if (cpu_dump) ork_w_dump_i8_cpu(ctx->npu, K, N, bi_i8, tmp.data(), tb);
     else          ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
-    e.blob_off = ctx->persist_off; e.blob_size = tb;
+    // Bf (full-K re-tiled) blob, from the raw int8, stored RIGHT AFTER Bb (contiguous) so the orkd import maps
+    // it directly with no runtime rebuild. Only within the Bf run envelope (K%512==0 && K<=4096); else bf==0
+    // and the loader/daemon leaves Bf NULL (wide-K weights run the Bb K-split path). Needs bi_i8 (have it here).
+    size_t bf = bi_i8 ? ork_w_dump_bf_i8_cpu(ctx->npu, K, N, bi_i8, nullptr, 0) : 0;
+    std::vector<char> bftmp(bf);
+    if (bf) ork_w_dump_bf_i8_cpu(ctx->npu, K, N, bi_i8, bftmp.data(), bf);
+    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I8; e.bscale_n = (uint32_t) ow.bscale.size();
+    e.blob_off = ctx->persist_off; e.blob_size = tb; e.bf_size = bf;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+    if (bf) { fwrite(bftmp.data(), 1, bf, ctx->persist_out); ctx->persist_off += bf; }
     e.bscale_off = ctx->persist_off;
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
@@ -890,7 +1011,7 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     size_t tb = ork_w_dump(ow.w, nullptr, 0);
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
     e.bscale_off = ctx->persist_off;
@@ -1015,7 +1136,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
             }
             const std::string key = ork_expert_key(src0->name, e);
             const int tier = ork_orkpack_tier(src0->name, K, N, type);
-            orkpack_entry ent; ent.K = K; ent.N = N;
+            orkpack_entry ent{}; ent.K = K; ent.N = N;
             if (tier == 4) {
                 const float * im = ork_imatrix_lookup(src0->name, K);
                 size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nullptr, 0);
@@ -1112,6 +1233,7 @@ static bool ork_spool_install(ggml_backend_ork_context * ctx,
     if (!se) return false;    // fall back to ow.w (still resident & counted)
     // free the temp IOVA weight (it was counted in wcache_bytes by the caller); the RAM entry replaces it
     ctx->wcache_bytes -= ow.bytes;
+    ork_slice_ws_drop(ctx, ow.w);
     ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; ow.bytes = 0;
     ow.se = se; ow.ram_bytes = ork_stream_entry_bytes(se); ctx->spool_ram_bytes += ow.ram_bytes;
     ork_spool_iova_evict(ctx, ow.ram_bytes);
@@ -1181,8 +1303,18 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                     if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
                 } else {
                     const double _l0 = ctx->profile ? ork_now_us_e() : 0;
-                    if (!no_import) ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
-                    if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // copy (import off / unavailable)
+                    if (ctx->via_orkd) {
+                        // orkd: the client allocs a dma-buf, copies the pre-tiled blob (Bb, then the contiguous
+                        // Bf region) in, and hands the fd to the daemon (ORKD_IMPORT) which maps it into this
+                        // client's domain — no daemon tiling/ownership. Bf sits right after Bb (relative offset
+                        // = blob_size), so the daemon lays base matmuls' fast-path Bf as views; bf_size==0 =>
+                        // no Bf (wide-K weights run the Bb K-split path).
+                        size_t blob_n = (size_t) e.blob_size + (size_t) e.bf_size;
+                        ow.w = ork_mm_import_i8(ctx->npu, K, N, blob, blob_n, e.bf_size ? (size_t) e.blob_size : 0);
+                    } else {
+                        if (!no_import) ow.w = ork_mm_load_i8_import(ctx->npu, K, N, blob, e.blob_size);     // ZERO-COPY: map .orkpack page-cache pages into IOVA
+                        if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, N, blob, e.blob_size); // copy (import off / unavailable)
+                    }
                     if (ctx->profile) { ctx->s_load += ork_now_us_e() - _l0; ctx->n_loadhit++; }
                     if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
                                 ow.bscale.assign(bs, bs + e.bscale_n); }
@@ -1193,7 +1325,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
                 it->second.bytes = ork_w_bytes(it->second.w);
                 ctx->wcache_bytes += it->second.bytes;
-                if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
+                if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += it->second.bytes;
                 ctx->persist_hits++;
                 if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] %s %s K=%d N=%d\n",
                     e.dtype == ORKPACK_DT_I4 ? "int4-load" : "int8-load", src0->name, K, N);
@@ -1288,7 +1420,12 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     it = ctx->wcache.emplace(x, std::move(ow)).first;
     it->second.bytes = ork_w_bytes(it->second.w);
     ctx->wcache_bytes += it->second.bytes;
-    if (ctx->n_domains > 1 && _dom < 16) ctx->domain_bytes[_dom] += it->second.bytes;
+    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += it->second.bytes;
+    if (ctx->slice_route && !ctx->spool && (K > 4096 || N > 8192)) {   // wide int8: pack a sliced-doorbell twin (A/B; +resident bytes; not under spool, whose ork_w is remapped)
+        ork_w_sliced * ws = ork_mm_pack_sliced(ctx->npu, K, N, bi, ORK_DT_I8);   // bi = int8 weight bytes (still valid until ork_evict_src below)
+        if (ws) ctx->slice_ws[it->second.w] = ws;
+        else if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice_route: sliced pack failed K=%d N=%d (IOVA?) -> blocking path\n", K, N);
+    }
     ork_persist_write(ctx, src0->name, K, N, it->second, ctx->f32.data(), type, bi);   // .orkpack: dump for next time (f32 plane enables int4 tier; src type drives tier; bi = int8 CPU-dump fallback if NPU busy)
     ork_evict_src(x, (size_t) N * nb01);   // source plane now dead weight (custom loader)
     // STREAM-POOL: move the just-packed int8 weight into the RAM tier (cheap remaps on future hits).
@@ -1322,11 +1459,97 @@ static inline double ork_now_us(void) { struct timespec t; clock_gettime(CLOCK_M
 //                           only valid within a domain; layer-aligned placement keeps a chain co-domain)
 //   • N, cross-domain     → ork_mm_run_chain_i8 (single-core chain; cross-domain concurrency unsupported)
 // On any error, falls back to sequential per-task run_i8. Returns true on success.
+// Shared NEON f32->int8 per-row activation quant: amr[k]=round(yr[k]*127/absmax), returns scale=absmax/127.
+// Round-half-away-from-zero via copysignf(0.5) — BIT-IDENTICAL to the scalar and to the dense mul_mat_i8
+// NEON path. Used to vectorize the MoE chain-path act-quant (was scalar — the profiled ~385ms on 35B decode).
+static inline float ork_quant_row_i8(const float * yr, int K, int8_t * amr) {
+    float mx = 1e-9f;
+#if defined(__ARM_NEON)
+    int k = 0;
+    float32x4_t v_mx0 = vdupq_n_f32(mx), v_mx1 = vdupq_n_f32(mx);
+    for (; k <= K - 8; k += 8) {
+        v_mx0 = vmaxq_f32(v_mx0, vabsq_f32(vld1q_f32(yr + k)));
+        v_mx1 = vmaxq_f32(v_mx1, vabsq_f32(vld1q_f32(yr + k + 4)));
+    }
+    mx = vmaxvq_f32(vmaxq_f32(v_mx0, v_mx1));
+    for (; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
+    const float inv = 127.0f / mx;
+    const float32x4_t v_inv = vdupq_n_f32(inv), v_half = vdupq_n_f32(0.5f);
+    const uint32x4_t  v_sign = vdupq_n_u32(0x80000000u);
+    const int32x4_t   v_hi = vdupq_n_s32(127), v_lo = vdupq_n_s32(-127);
+    k = 0;
+    for (; k <= K - 8; k += 8) {
+        float32x4_t v_q0 = vmulq_f32(vld1q_f32(yr + k),     v_inv);
+        float32x4_t v_q1 = vmulq_f32(vld1q_f32(yr + k + 4), v_inv);
+        float32x4_t v_h0 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q0), v_sign), vreinterpretq_u32_f32(v_half)));
+        float32x4_t v_h1 = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(v_q1), v_sign), vreinterpretq_u32_f32(v_half)));
+        int32x4_t v_i0 = vcvtq_s32_f32(vaddq_f32(v_q0, v_h0));
+        int32x4_t v_i1 = vcvtq_s32_f32(vaddq_f32(v_q1, v_h1));
+        v_i0 = vmaxq_s32(vminq_s32(v_i0, v_hi), v_lo);
+        v_i1 = vmaxq_s32(vminq_s32(v_i1, v_hi), v_lo);
+        int16x8_t v_s16 = vcombine_s16(vmovn_s32(v_i0), vmovn_s32(v_i1));
+        vst1_s8(amr + k, vmovn_s16(v_s16));
+    }
+    for (; k < K; k++) {
+        float q = yr[k] * inv;
+        int qi = (int) (q + copysignf(0.5f, q));
+        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+    }
+#else
+    for (int kk = 0; kk < K; kk++) { float v = fabsf(yr[kk]); mx = v > mx ? v : mx; }
+    const float inv = 127.0f / mx;
+    for (int kk = 0; kk < K; kk++) {
+        float q = yr[kk] * inv;
+        int qi = (int) (q + copysignf(0.5f, q));
+        amr[kk] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
+    }
+#endif
+    return mx / 127.0f;
+}
+
 static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
     if (tasks.empty()) return true;
+    // orkd: run_i8 AND run_chain_i8 are daemon-routed (run_stream_i8 is fd-local). Chain N tasks into ONE
+    // routed round-trip (orkd_run_chain_i8 — needs daemon-resident is_orkd weights, which the routed pack
+    // guarantees here); if the chain declines (rc!=0), fall back to sequential routed run_i8.
+    if (ctx->via_orkd) {
+        if (tasks.size() > 1 && ork_mm_run_chain_i8(ctx->npu, (int) tasks.size(), tasks.data()) == 0)
+            return true;
+        for (size_t t = 0; t < tasks.size(); t++)
+            if (ork_mm_run_i8(ctx->npu, tasks[t].w, tasks[t].M, tasks[t].A, tasks[t].C)) return false;
+        return true;
+    }
     int rc;
     if (tasks.size() == 1) {
-        rc = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C) ? -1 : 0;
+        // ORK_SLICE_ROUTE — wedge-safety RESCUE, keyed on the SPECIFIC refusal code, MEMOIZED per (weight, M).
+        // First time a shape is out-of-envelope, run_i8 returns ORK_RC_WEDGE_PRONE (not the generic -1) — it
+        // declined rather than risk a blocking-submit wedge — and we rescue on the all-doorbell sliced primitive
+        // (verified c_base tiles) AND remember (w, M) as wedge-prone. Since that verdict is stable for the
+        // session, every later call for the same (w, M) skips the doomed run_i8 attempt (and its refusal spam)
+        // and goes straight to sliced. A shape that SUCCEEDS, or fails for any OTHER reason, never rescues and is
+        // never memoized → pure no-op, zero cost for working shapes. Needs a pre-packed twin (ORK_SLICE_ROUTE on).
+        ork_w_sliced * ws_memo = nullptr;
+        if (ctx->slice_route && !ctx->slice_forced.empty()) {
+            auto mit = ctx->slice_forced.find(tasks[0].w);
+            if (mit != ctx->slice_forced.end() && mit->second.count(tasks[0].M)) {
+                auto sit = ctx->slice_ws.find(tasks[0].w);
+                if (sit != ctx->slice_ws.end()) ws_memo = sit->second;
+            }
+        }
+        if (ws_memo) {                                   // memoized wedge-prone (w,M): skip run_i8, straight to sliced
+            rc = ork_mm_run_sliced(ctx->npu, ws_memo, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
+        } else {
+            const int r = ork_mm_run_i8(ctx->npu, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+            rc = r ? -1 : 0;
+            if (r == ORK_RC_WEDGE_PRONE && ctx->slice_route && !ctx->slice_ws.empty()) {
+                auto sit = ctx->slice_ws.find(tasks[0].w);
+                if (sit != ctx->slice_ws.end() && sit->second) {
+                    rc = ork_mm_run_sliced(ctx->npu, sit->second, tasks[0].M, tasks[0].A, tasks[0].C, 0) ? -1 : 0;
+                    if (rc == 0) ctx->slice_forced[tasks[0].w].insert(tasks[0].M);   // memoize ONLY a successful rescue
+                    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] slice-rescue: run_i8 refused (wedge-prone) -> sliced doorbell rc=%d (memoized M=%d)\n", rc, tasks[0].M);
+                }
+            }
+        }
     } else {
         bool same_dom = true; const int d0 = ork_w_domain(tasks[0].w);
         for (size_t t = 1; t < tasks.size(); t++) if (ork_w_domain(tasks[t].w) != d0) { same_dom = false; break; }
@@ -1341,6 +1564,24 @@ static bool ork_dispatch_i8(ggml_backend_ork_context * ctx, std::vector<ork_mm_t
     }
     return true;
 }
+
+// ===================== UNIFIED NPU SUBMIT ROUTER =====================
+// One chokepoint for every NPU int8 matmul submit. The split's async/blocking choice — and (next) the
+// SRAM-backed doorbell — lives HERE, not scattered across the handlers. Three primitives so the caller
+// controls the overlap window:
+//   ork_submit_async(): try the NON-BLOCKING multi-core doorbell (ork_dyn_begin_mc). Returns a live chain
+//     the caller MUST ork_submit_end() AFTER its overlapping CPU work — or NULL if ineligible (M>1 / K not
+//     %512 / K>4096 / C not resident / mixed domain), in which case the caller falls back to ork_submit_sync.
+//   ork_submit_sync():  blocking dispatch (1->run_i8 / N same-domain->run_stream / N cross->run_chain).
+//   ork_submit_end():   rendezvous + writeback + free the async chain. 0=ok, <0=error.
+// Canonical split pattern:  h = ork_submit_async(...);  <CPU-complete work>;  rc = h ? ork_submit_end(h) : ork_submit_sync(...);
+static inline ork_dyn_chain * ork_submit_async(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
+    return tasks.empty() ? nullptr : ork_dyn_begin_mc(ctx->npu, (int) tasks.size(), tasks.data(), 0 /*all cores*/);
+}
+static inline int ork_submit_sync(ggml_backend_ork_context * ctx, std::vector<ork_mm_task_i8> & tasks) {
+    return ork_dispatch_i8(ctx, tasks) ? 0 : -1;
+}
+static inline int ork_submit_end(ork_dyn_chain * h) { return h ? (ork_dyn_end(h) < 0 ? -1 : 0) : 0; }
 
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
@@ -1504,7 +1745,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 if (ork_stream_pool_run(ctx->spool, task_se[t], tasks[t].M, tasks[t].A, tasks[t].C)) { ok = -1; break; }
             if (ok != 0) return false;
         } else {
-            if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
+            if (ork_submit_sync(ctx, tasks)) return false;   // unified router: 1→run_i8 · N same-dom→run_stream · N cross→run_chain
             ok = 0;
         }
 
@@ -1863,29 +2104,67 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
     const void * key = g[0]->src[0]->data;
     auto it = ctx->wcache.find(key);
-    if (it == ctx->wcache.end()) {                       // build + pack the fused weight once
+    if (it == ctx->wcache.end()) {                       // load-or-(build+pack)+persist the fused weight once
         ork_weight ow; ow.bscale.resize(Ntot);
-        ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
-        for (int i = 0; i < ng; i++) {
-            const struct ggml_tensor * w = g[i]->src[0];
-            const int Ni = (int) w->ne[1];
-            const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
-            ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
-            const char * x = (const char *) w->data;
-            if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
-            else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
-            for (int n = 0; n < Ni; n++) {
-                float mx = 1e-9f;
-                for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
-                float s = mx / 127.0f; ow.bscale[off[i]+n] = s;
-                for (int k = 0; k < K; k++) {            // fused B[k][off+n] = src0_i[n][k]
-                    int q = (int) lrintf(f32[(size_t) n*K + k] / s);
-                    bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+        // Synthetic name for the FUSED (concatenated) group weight — stable across runs (grouping is
+        // deterministic from the graph), distinct from the individual member names. This makes the fused
+        // weight a FIRST-CLASS .orkpack entry: it is PERSISTED on the write pass and LOADED back on read, so
+        // (a) a generated pack is COMPLETE (grouped gate/up are no longer silently dropped — the 3.8 GiB vs
+        // 11 GiB gap) and (b) the auto-sizer BUDGETS it (it's now in persist_idx), fixing the multi-domain
+        // OOM where the fused weight was re-JIT-packed at read into domains no one reserved.
+        char gname[256];
+        snprintf(gname, sizeof gname, "%s#grp%dx%d", g[0]->src[0]->name, ng, Ntot);
+        int _dom = 0;
+        bool loaded = false;
+        if (ctx->persist_mode == 1) {                    // READ: load the fused weight from the .orkpack if present
+            auto pit = ctx->persist_idx.find(gname);
+            if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K &&
+                pit->second.N == (uint32_t) Ntot && pit->second.dtype == ORKPACK_DT_I8) {
+                const orkpack_entry & e = pit->second;
+                const char * blob = (const char *) ctx->persist_map + e.blob_off;
+                _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
+                ork_npu_set_pack_domain(ctx->npu, _dom);
+                for (;;) {                               // import (zero-copy view of the mmap'd pack, or orkd dma-buf), spill on IOVA overflow
+                    if (ctx->via_orkd) { size_t blob_n = (size_t) e.blob_size + e.bf_size;
+                        ow.w = ork_mm_import_i8(ctx->npu, K, Ntot, blob, blob_n, e.bf_size ? (size_t) e.blob_size : 0); }
+                    else { ow.w = ork_mm_load_i8_import(ctx->npu, K, Ntot, blob, e.blob_size);
+                           if (!ow.w) ow.w = ork_mm_load_i8(ctx->npu, K, Ntot, blob, e.blob_size); }
+                    if (ow.w || (_dom = ork_domain_advance(ctx)) < 0) break;
                 }
+                if (ow.w) { const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                            ow.bscale.assign(bs, bs + e.bscale_n); loaded = true; }
             }
         }
-        ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
-        if (!ow.w) return false;
+        if (!loaded) {                                   // build the fused int8 weight from the members, pack, then persist
+            ctx->bi.resize((size_t) K * Ntot); int8_t * bi = ctx->bi.data();
+            for (int i = 0; i < ng; i++) {
+                const struct ggml_tensor * w = g[i]->src[0];
+                const int Ni = (int) w->ne[1];
+                const auto * tt = ggml_get_type_traits(w->type); ggml_to_float_t to_float = tt->to_float;
+                ctx->f32.resize((size_t) Ni * K); float * f32 = ctx->f32.data();
+                const char * x = (const char *) w->data;
+                if (w->type == GGML_TYPE_F32) for (int n = 0; n < Ni; n++) memcpy(f32 + (size_t) n*K, x + (size_t) n*w->nb[1], (size_t) K*sizeof(float));
+                else                          for (int n = 0; n < Ni; n++) to_float(x + (size_t) n*w->nb[1], f32 + (size_t) n*K, K);
+                for (int n = 0; n < Ni; n++) {
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(f32[(size_t) n*K + k]); if (v > mx) mx = v; }
+                    float s = mx / 127.0f; ow.bscale[off[i]+n] = s;
+                    for (int k = 0; k < K; k++) {        // fused B[k][off+n] = src0_i[n][k]
+                        int q = (int) lrintf(f32[(size_t) n*K + k] / s);
+                        bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q);
+                    }
+                }
+            }
+            // Byte-balanced domain first, spill to the next on IOVA overflow (same as every other pack site).
+            _dom = ork_weight_domain(ctx, (size_t) K * Ntot, ork_layer_of(g[0]->src[0]->name));
+            ork_npu_set_pack_domain(ctx->npu, _dom);
+            ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+            while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i8(ctx->npu, K, Ntot, bi);
+            if (!ow.w) return false;
+            ork_persist_write(ctx, gname, K, Ntot, ow, nullptr, g[0]->src[0]->type, bi);   // .orkpack: persist the fused weight (int8 tier) so read-back loads it — complete + budgeted pack
+        }
+        ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
@@ -1988,8 +2267,14 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
                     bi[(size_t) k*Ntot + off[i]+n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
             }
         }
+        // Multi-domain placement + spill (see mul_mat_group_i8): pick a byte-balanced domain, spill on overflow.
+        int _dom = ork_weight_domain(ctx, (size_t) K * Ntot / 2, ork_layer_of(g[0]->src[0]->name));   // int4 nibble tile
+        ork_npu_set_pack_domain(ctx->npu, _dom);
         ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = ork_mm_pack_i4(ctx->npu, K, Ntot, bi);
         if (!ow.w) return false;
+        ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+        if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
         it = ctx->wcache.emplace(key, std::move(ow)).first;
     }
     const ork_weight & ow = it->second;
@@ -2112,8 +2397,12 @@ static void ork_profile_dump(ggml_backend_ork_context * ctx) {
 }
 // LEVER3: atexit shim — fires the profile dump even when llama-bench never calls backend free.
 static void ork_profile_atexit(void) { ork_profile_dump(g_ork_ctx); }
+static void attn_pool_free(ggml_backend_ork_context * ctx);   // fwd decl (defined with the attention path below)
+
 static void ggml_backend_ork_free(ggml_backend_t backend) {
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight && ctx->async_thr.joinable()) ctx->async_thr.join();   // drain any in-flight async NPU graph first
+    ctx->async_inflight = false;
     ork_profile_dump(ctx);
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK DEBUG] ggml_backend_ork_free called!\n");
     ork_persist_finalize(ctx);   // .orkpack: write index+footer, rename .tmp into place (write mode)
@@ -2182,17 +2471,29 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         fprintf(stderr, "[ork STREAM-POOL] entries=%zu | RAM held=%.2f GiB | IOVA mapped=%.2f GiB | remaps(cheap)=%ld IOVA-unmaps=%ld RAM-evicts=%ld\n",
             ctx->wcache.size(), ctx->spool_ram_bytes/(1024.0*1024.0*1024.0), ctx->wcache_bytes/(1024.0*1024.0*1024.0),
             ctx->spool_remaps, ctx->spool_iova_unmaps, ctx->spool_ram_evicts);
+    for (auto & kv : ctx->slice_ws) if (kv.second) ork_mm_free_sliced(ctx->npu, kv.second);   // ORK_SLICE_ROUTE sliced-doorbell twins
+    ctx->slice_ws.clear();
     if (ctx->persist_map) munmap(ctx->persist_map, ctx->persist_map_sz);
     if (ctx->spool) ork_stream_pool_free(ctx->spool);   // frees all stream entries' RAM dma-bufs
     if (ctx->dma_in) ork_dma_free(ctx->npu, ctx->dma_in);    // static-graph DMA scratch (ORK_GU_CHAIN)
     if (ctx->dma_up) ork_dma_free(ctx->npu, ctx->dma_up);
     if (ctx->dma_gt) ork_dma_free(ctx->npu, ctx->dma_gt);
+    for (int d = 0; d < 64; d++) if (ctx->dma_moeC[d]) ork_dma_free(ctx->npu, ctx->dma_moeC[d]);
     for (auto & kv : ctx->wcache) ork_w_free(kv.second.w);   // w is NULL for stream-pool entries (no-op)
     for (auto & kv : ctx->f16_scratch) if (kv.second) ork_mm_free(ctx->npu, kv.second);   // ORK_FFN_F16_JIT shared scratches
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
     for (auto & kv : ctx->pathb_repack) { if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf); if (kv.second.gctx) ggml_free(kv.second.gctx); }
+    attn_pool_free(ctx);                                         // per-context fused-attention pool (needs ctx->npu)
+    { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
+      free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
+      if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
+    for (auto & e : ctx->attn_kv) {                              // resident-KV decode buffers (ORK_ATTN_KV)
+        for (ork_kv_resident * r : e.second.kv) if (r) ork_kv_resident_free(ctx->npu, r);
+        if (e.second.ones) ork_mm_free(ctx->npu, e.second.ones);   // ORK_ATTN_FUSED resident ones[Lmax,32]
+    }
+    ctx->attn_kv.clear();
     if (ctx->npu) ork_npu_free(ctx->npu);
     delete ctx;
     g_ork_ctx = nullptr;
@@ -2573,21 +2874,11 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
-            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (SCALAR — lever2 NEON not applied here!)
+            const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (now NEON via ork_quant_row_i8)
             #pragma omp parallel for if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
-                    const float * yr = y + (size_t) m*K;
-                    int8_t * amr = task_A + (size_t) m*K;
-                    float mx = 1e-9f;
-                    for (int k = 0; k < K; k++) { float v = fabsf(yr[k]); mx = v > mx ? v : mx; }
-                    task_as[m] = mx / 127.0f;
-                    const float inv = 127.0f / mx;
-                    for (int k = 0; k < K; k++) {
-                        float q = yr[k] * inv;
-                        int qi = (int) (q + copysignf(0.5f, q));
-                        amr[k] = (int8_t) (qi > 127 ? 127 : qi < -127 ? -127 : qi);
-                    }
+                    task_as[m] = ork_quant_row_i8(y + (size_t) m*K, K, task_A + (size_t) m*K);
                 } else {
                     memset(task_A + (size_t) m*K, 0, K);
                     task_as[m] = 0.0f;
@@ -2614,7 +2905,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8 chain submit: tasks=%zu\n", tasks.size());
     fflush(stderr);
     
-    if (!ork_dispatch_i8(ctx, tasks)) return false;   // 1→run_i8 · N same-domain→run_stream (RR) · N cross→run_chain
+    if (ork_submit_sync(ctx, tasks)) return false;   // unified router: 1→run_i8 · N same-dom→run_stream · N cross→run_chain
 
     const double t2 = ctx->profile ? ork_now_us() : 0;
 
@@ -2714,6 +3005,7 @@ static void ork_moe_deq_row(void * vctx, int n, float * dst, int K) {
     else           c->to_float(c->x + (size_t) n * c->nb01, dst, K);
 }
 
+static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need);   // defined below; used by the #14 multi-core NONBLOCK path
 // MoE expert matmul (GGML_OP_MUL_MAT_ID), int8 path. Handles any n_tokens.
 // dst[N, n_used, n_tokens] = for each (token t, slot j): W[ids[j,t]] (K x N) @ x_t (K).
 // We GROUP tokens by their selected expert and run ONE M=count matmul per active expert (M-padded to 32
@@ -2860,15 +3152,60 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // Collect cold (expert, entries) pairs; run them all in one threaded fan-out after the split.
     std::vector<std::pair<int, std::vector<std::pair<int,int>> *>> cold;
     auto cpu_expert = [&](int e, std::vector<std::pair<int,int>> & ent) { cold.push_back({e, &ent}); };
-    // One cold work-item: dot output rows [n0,n1) of expert e's weight against the quantized activation
-    // for (token t, slot j). We split the N output rows into blocks so the thread pool fans across ROWS,
-    // not just across experts — critical at decode, where there may be only a few cold experts but each
-    // has N=1792..2048 independent output rows. (vec_dot writes dr[n] from the raw quant weight row.)
-    struct cold_item { int e, t, j, n0, n1; size_t qoff; };
+
+    // #12 FEATURE-DETECT (no env flag): if the loaded orkpack stores THIS tensor's experts as int4/NF4,
+    // compute cold experts from the ork-native Bi4 (the single shared format, ork_native_cpu.h) instead of
+    // ggml Q4_K. Driven purely by the orkpack (persist_mode==1) + each expert's O4N1 entry (20B hdr
+    // {magic,ver,K,N,quant_kind} + bscale[N] f32 + Bi4[K*N/2] channel-contiguous). Activations -> int8.
+    const int n_expert_c = (int) src0->ne[2];
+    std::vector<const uint8_t*> onib(n_expert_c, nullptr);
+    std::vector<const float*>   obsc(n_expert_c, nullptr);
+    ork_cpu_fmt ofmt = ORK_CPU_I4; bool ork_native = false;
+    static int8_t ork_nf4_lut[16]; static int ork_lut_done = 0;
+    if (!ork_lut_done) { for (int i=0;i<16;i++) ork_nf4_lut[i]=(int8_t)lrintf(ORK_NF4_LVL[i]*127.0f); ork_lut_done=1; }
+    int8x16_t ork_lutv = vld1q_s8(ork_nf4_lut);
+    if (ctx->persist_mode == 1 && ctx->persist_map) {
+        auto p0 = ctx->persist_idx.find(ork_expert_key(src0->name, 0));
+        if (p0 != ctx->persist_idx.end() && p0->second.dtype == ORKPACK_DT_I4) {
+            ork_native = true;
+            for (int e = 0; e < n_expert_c; e++) {
+                auto pe = ctx->persist_idx.find(ork_expert_key(src0->name, e));
+                if (pe == ctx->persist_idx.end()) { ork_native = false; break; }
+                const char * blob = (const char *) ctx->persist_map + pe->second.blob_off;
+                uint32_t qk; memcpy(&qk, blob + 16, 4);                 // O4N1 hdr: [magic,ver,K,N,quant_kind]
+                if (e == 0) ofmt = (qk == 1u) ? ORK_CPU_NF4 : ORK_CPU_I4;   // 1=CODEBOOK_NF4, 0=UNIFORM
+                obsc[e] = (const float *)(blob + 20);
+                onib[e] = (const uint8_t *)(blob + 20 + (size_t) N * sizeof(float));
+            }
+        }
+    }
+    // int8 activation cache for the ork-native path (absmax/127 per token), keyed like tok_q. Built
+    // single-threaded in the dispatch loop below (ai8 stable — no resize — before the threaded run).
+    std::unordered_map<int,int> tok_i8; std::vector<int8_t> ai8; std::vector<float> ai8sc;
+    auto quant_tok_i8 = [&](int t, int jslot) -> int {
+        const int key = bcast ? t : (t * 100000 + jslot);
+        auto it = tok_i8.find(key); if (it != tok_i8.end()) return it->second;
+        const int idx = (int) ai8sc.size(); ai8.resize((size_t)(idx + 1) * K); ai8sc.resize(idx + 1);
+        const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jslot)*src1->nb[1] + (size_t) t*src1->nb[2]);
+        float mx = 1e-9f; for (int k=0;k<K;k++){ float v=fabsf(y[k]); if(v>mx)mx=v; } float inv = 127.0f/mx;
+        int8_t * a = ai8.data() + (size_t) idx * K;
+        for (int k=0;k<K;k++){ int q=(int)lrintf(y[k]*inv); a[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+        ai8sc[idx] = mx/127.0f; tok_i8[key] = idx; return idx;
+    };
+
+    // One cold work-item: output rows [n0,n1) of expert e for (token t, slot j). ork-native path uses the
+    // shared Bi4 (int8 activation); else ggml vec_dot on the raw Q4_K row.
+    struct cold_item { int e, t, j, n0, n1; size_t qoff; int i8idx; };
     auto run_cold_item = [&](const cold_item & ci) {
+        float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
+        if (ork_native) {
+            ork_cpu_w w; w.fmt = ofmt; w.nibble = onib[ci.e]; w.bit4 = nullptr; w.bit5 = nullptr; w.bit6 = nullptr;
+            w.i8 = nullptr; w.bscale = obsc[ci.e]; w.nf4_lut = ork_lutv; w.K = K; w.N = N;
+            ork_cpu_gemv_m1(&w, ai8.data() + (size_t) ci.i8idx * K, ai8sc[ci.i8idx], dr, ci.n0, ci.n1);
+            return;
+        }
         const char * xw = (const char *) src0->data + (size_t) ci.e * src0->nb[2];
         const void * qa = qact.data() + ci.qoff;
-        float * dr = (float *)(dbase + (size_t) ci.j * dst->nb[1] + (size_t) ci.t * dst->nb[2]);
         for (int n = ci.n0; n < ci.n1; n++)
             vec_dot(K, dr + n, 0, xw + (size_t) n * row_bytes, 0, qa, 0, 1);
     };
@@ -3241,6 +3578,18 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     const size_t eff_cap = batched ? (size_t) -1 /*budget-limited only*/ : hot_K;
     std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
+    // STEP B — DECODE CPU/NPU SPLIT. At decode (max_Me < batch_minM) route a FRACTION of the active experts
+    // to the NON-BLOCKING async doorbell (ork_submit_async, which overlaps run_cold) instead of all-CPU. The
+    // blocking #14 rendezvous lost net (profiled); the thread-free doorbell should overlap for free. Knob:
+    //   ORK_SPLIT_FRAC (default 0.0) = CPU-only baseline;  0.5 = half the experts to the NPU async share.
+    // Prefill (max_Me >= batch_minM) admits all as before; ORK_M1_NPU forces all-decode-on-NPU (old A/B).
+    static const bool  m1_npu     = env_enabled("ORK_M1_NPU");
+    static const float split_frac = getenv("ORK_SPLIT_FRAC") ? (float) atof(getenv("ORK_SPLIT_FRAC")) : 0.0f;
+    const bool prefill_phase = ((int) max_Me >= batch_minM);
+    const int  n_active_e    = (int) buckets.size();
+    const int  npu_budget    = prefill_phase ? n_active_e
+                             : (m1_npu ? n_active_e : (int) lrintf(split_frac * (float) n_active_e));
+    int npu_admitted = 0;
     for (auto & kv : buckets) {
         const int e = kv.first;
         const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
@@ -3249,10 +3598,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
         const int M_e = (int) kv.second.size();
         const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
-        // admit to NPU if the shape conforms AND (resident, or the pool has headroom under eff_cap)
+        const bool npu_phase_ok = (npu_admitted < npu_budget);   // split budget (decode: split_frac share; prefill: all)
+        // admit to NPU if the shape conforms, we're within the NPU budget, AND (resident, or headroom)
         ggml_backend_ork_context::ork_hot_slot * s =
-            (npu_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
-        if (s) { hot_e.push_back(e); hot_s.push_back(s); }
+            (npu_ok && npu_phase_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
+        if (s) { hot_e.push_back(e); hot_s.push_back(s); npu_admitted++; }
         else   { cpu_expert(e, kv.second); }   // non-conforming or budget/cap-full -> CPU (deferred; run threaded below)
     }
 
@@ -3261,7 +3611,10 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // each expert's N output rows into ROW_BLK-sized blocks keeps every thread busy even when only one or
     // two experts went cold this step (the decode case) — the old per-expert fan-out left N-row parallelism
     // on the table and serialized a lone cold expert's 1792 vec_dot calls onto a single core.
-    if (!cold.empty()) {
+    // #14 swap-hidden pipeline: wrap the CPU cold bulk (ork-native #12 / vec_dot) as a callable so it can
+    // run CONCURRENTLY with the NPU hot submit below (the NPU int8 chain hides behind the CPU window).
+    auto run_cold = [&]() {
+        if (cold.empty()) return;
         const double cd0 = ctx->profile ? ork_now_us() : 0;
         const int n_cold = (int) cold.size();
         std::vector<cold_item> items;
@@ -3269,32 +3622,43 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         for (auto & ce : cold) {
             const int e = ce.first;
             for (auto & pr : *ce.second) {
-                const size_t qoff = quant_tok(pr.first, pr.second);   // populate qact (single-threaded)
+                // ork-native path uses int8 acts (quant_tok_i8); else Q8_K for ggml vec_dot. Single-threaded.
+                const size_t qoff  = ork_native ? 0 : quant_tok(pr.first, pr.second);
+                const int    i8idx = ork_native ? quant_tok_i8(pr.first, pr.second) : 0;
                 for (int n0 = 0; n0 < N; n0 += ROW_BLK)
-                    items.push_back(cold_item{ e, pr.first, pr.second, n0, n0+ROW_BLK<N ? n0+ROW_BLK : N, qoff });
+                    items.push_back(cold_item{ e, pr.first, pr.second, n0, n0+ROW_BLK<N ? n0+ROW_BLK : N, qoff, i8idx });
             }
         }
         const int n_items = (int) items.size();
         unsigned hw = std::thread::hardware_concurrency();
         int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
         if (nthr < 1) nthr = 1; if (nthr > n_items) nthr = n_items;
+        // (a) FUSED CPU MoE: pin the cold-expert workers to the A76 BIG cluster (RK3588 cores 4-7) so the
+        // ork-native CPU GEMV runs on the fast cores like ggml's -t4, instead of scattering onto the slow A55
+        // little cores (the measured ork-CPU < ggml-CPU gap). Gated by ORK_NO_AFFINITY (default: pin).
+        static const bool cold_pin = !env_enabled("ORK_NO_AFFINITY");
         if (nthr <= 1) {
             for (auto & ci : items) run_cold_item(ci);
         } else {
+            cpu_set_t saved; bool have_saved = cold_pin && sched_getaffinity(0, sizeof saved, &saved) == 0;
             std::atomic<int> next(0);
-            auto worker = [&]() { int i; while ((i = next.fetch_add(1)) < n_items) run_cold_item(items[i]); };
+            auto worker = [&]() {
+                if (cold_pin) { cpu_set_t s; CPU_ZERO(&s); for (int c = 4; c < 8; c++) CPU_SET(c, &s); sched_setaffinity(0, sizeof s, &s); }
+                int i; while ((i = next.fetch_add(1)) < n_items) run_cold_item(items[i]);
+            };
             std::vector<std::thread> th; th.reserve(nthr-1);
             for (int w = 0; w < nthr-1; w++) th.emplace_back(worker);
             worker();
             for (auto & t : th) t.join();
+            if (have_saved) sched_setaffinity(0, sizeof saved, &saved);   // restore main-thread affinity
         }
         ctx->moe_cold_cpu += n_cold;
         if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
-    }
+    };
 
     if (ctx->profile && ctx->moe_calls < 4) fprintf(stderr, "[ork MoE-DIM] K=%d N=%d S=%d type=%d (chain-envelope K%%512==0&&K<=4096: %s)\n", K, N, (int)hot_e.size(), (int)type, (K%512==0&&K<=4096)?"YES":"no");
     const int S = (int) hot_e.size();
-    if (S == 0) { if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
+    if (S == 0) { run_cold(); if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
 
     // Pack the hot experts' routed rows into one chained submit (run_chain_i8; per-task run_i8 fallback
     // for the K=1792 down-proj that sits outside the chain envelope).
@@ -3304,6 +3668,32 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     std::vector<float>   as_row(total_rows);
     std::vector<ork_mm_task_i8> tasks(S);
     std::vector<size_t> offs(S);
+    // #14 multi-core NONBLOCK path (ORK_DYN_MC): if every hot expert has exactly one routed row (M==1, the
+    // decode case) and K conforms (K%512==0 && K<=4096), fire the int8 share across all 3 cores NONBLOCK via
+    // ork_dyn_begin_mc (doorbell rendezvous, thread-free — beats the blocking stream 1.38-2.3x) and overlap
+    // run_cold. That requires the output resident, so point tasks[x].C into a reused DMA buffer. Else fall
+    // back to the std::thread + blocking-stream path (handles M>1 / non-conforming K via per-task run_i8).
+    static const int dyn_mc = getenv("ORK_DYN_MC") ? atoi(getenv("ORK_DYN_MC")) : 0;
+    bool dyn_ok = dyn_mc && (K % 512 == 0 && K <= 4096) && (total_rows == (size_t) S);
+    // Multi-domain-safe: ork_dyn_begin_mc outputs to its own in-domain per-core scratch and copies back, and
+    // requires all experts in one domain (a MoE node's experts share the layer's domain) — it returns NULL
+    // (=> fall back) if that's ever violated. So no n_domains gate is needed here.
+    int32_t * Cbuf = bigC.data();
+    if (dyn_ok) {
+        // Lever 1: place the output buffer in the HOT EXPERTS' domain (a node's experts share one — layer-based
+        // residence) so begin_mc direct-writes it in place (no copy-back) even in a non-0 domain. ork_dma_alloc
+        // uses the pack domain, so set it to the node's domain for the (re)alloc, then RESTORE it (else a later
+        // weight resolve/pack would land in the wrong domain).
+        int nd = ork_w_domain(hot_s[0]->w); if (nd < 0) nd = 0; if (nd > 15) nd = 15;
+        int saved_pd = ork_npu_pack_domain(ctx->npu);
+        ork_npu_activate_domain(ctx->npu, nd);   // a non-0 domain buffer must be allocated with THAT domain active
+        ork_npu_set_pack_domain(ctx->npu, nd);
+        int32_t * d = (int32_t *) ork_dma_grow(ctx->npu, &ctx->dma_moeC[nd], &ctx->dma_moeC_sz[nd], (size_t) total_rows * N * 4);
+        ork_npu_set_pack_domain(ctx->npu, saved_pd);
+        if (d) Cbuf = d; else dyn_ok = false;
+    }
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14] S=%d K=%d N=%d total_rows=%zu dyn_mc=%d Kconform=%d oneRow=%d dyn_ok=%d\n",
+        S, K, N, total_rows, dyn_mc, (int)(K%512==0 && K<=4096), (int)(total_rows==(size_t)S), (int)dyn_ok);
     size_t off = 0;
     for (int x = 0; x < S; x++) {
         const int e = hot_e[x]; std::vector<std::pair<int,int>> & ent = buckets[e];
@@ -3320,7 +3710,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 for (int k=0;k<K;k++){ int qi=(int)lrintf(y[k]*ainv); ar[k]=(int8_t)(qi>127?127:qi<-127?-127:qi); }
             }
         }
-        tasks[x].w = hot_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = bigC.data() + off * N;
+        tasks[x].w = hot_s[x]->w; tasks[x].M = cnt; tasks[x].A = Ae; tasks[x].C = Cbuf + off * N;
         offs[x] = off; off += cnt;
     }
     // M2 change #2: dispatch the S independent hot experts via the ASYNC ROUND-ROBIN STREAM
@@ -3330,12 +3720,33 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // per-task run_i8 path below — same correctness, just no cross-core dispatch for those.
     // ORK_MOE_STREAM=0 reverts to the chain path (A/B comparison).
     static const bool use_stream = !(getenv("ORK_MOE_STREAM") && atoi(getenv("ORK_MOE_STREAM")) == 0);
+    // #14 SWAP-HIDDEN PIPELINE: fire the NPU hot chain on a dedicated thread (its kernel-wait parks the
+    // thread, freeing the core) CONCURRENTLY with the CPU cold bulk (run_cold), then join — the NPU int8
+    // share hides behind the CPU int4/NF4 window (validated: tools/hybrid_decode_probe ~1.07x @M=1). Uses
+    // the chained/stream submit (NOT the batched mcworker path that errno=110's at M=1).
     const double ch0 = ctx->profile ? ork_now_us() : 0;
-    int crc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
-                         : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
-    const double ch1 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] split stream/chain vs fallback
-    if (crc) { crc = 0; for (int x = 0; x < S && crc == 0; x++) crc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C);
-               if (ctx->profile) { ctx->moe_fallback_t += ork_now_us() - ch1; ctx->moe_fallback_calls++; } }
+    int crc;
+    if (dyn_ok) {
+        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[#14-mc] begin_mc S=%d K=%d N=%d\n", S, K, N);
+        // multi-core NONBLOCK: fire the int8 share across 3 cores, run the CPU bulk in parallel, rendezvous
+        // on the output doorbells (thread-free). Cbuf is the resident DMA output ork_dyn_end writes back.
+        ork_dyn_chain * h = ork_submit_async(ctx, tasks);     // NON-BLOCKING doorbell (NULL if ineligible)
+        run_cold();                                            // CPU cold bulk ‖ NPU
+        crc = h ? ork_submit_end(h) : ork_submit_sync(ctx, tasks);   // rendezvous, or sync fallback AFTER cold
+    } else {
+        // #14 SWAP-HIDDEN (default): NPU hot chain on a dedicated thread ‖ CPU cold bulk, then join.
+        std::atomic<int> crc_a(0);
+        auto npu_submit = [&]() {
+            int rc = use_stream ? ork_mm_run_stream_i8(ctx->npu, S, tasks.data())
+                                : ork_mm_run_chain_i8 (ctx->npu, S, tasks.data());
+            if (rc) { rc = 0; for (int x = 0; x < S && rc == 0; x++) rc = ork_mm_run_i8(ctx->npu, tasks[x].w, tasks[x].M, tasks[x].A, tasks[x].C); }
+            crc_a.store(rc);
+        };
+        std::thread t_npu(npu_submit);
+        run_cold();                   // CPU cold bulk (ork-native #12) — overlaps the NPU submit
+        t_npu.join();
+        crc = crc_a.load();
+    }
     if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id partition run FAIL rc=%d S=%d K=%d N=%d\n", crc, S, K, N); return false; }
 
@@ -3346,7 +3757,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         const float * bs = hot_s[x]->bscale.data();
         for (int i = 0; i < cnt; i++) {
             const int t = ent[i].first, j = ent[i].second;
-            const int32_t * cr = bigC.data() + (o + i) * N;
+            const int32_t * cr = Cbuf + (o + i) * N;
             float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
             const float as = as_row[o + i];
             for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
@@ -3593,7 +4004,7 @@ static ork_w * ork_pack_pt_f32(ggml_backend_ork_context * ctx, const float * f32
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) { ork_npu_set_pack_domain(ctx->npu, dom);
         w = ork_mm_pack_i8_import(ctx->npu, K, N, bi.data()); }
     if (!w) w = ork_mm_pack_i8(ctx->npu, K, N, bi.data());   // last-resort native (single-domain / import unavailable)
-    if (w && dom >= 0 && dom < 16) ctx->domain_bytes[dom] += fcwg_bytes;
+    if (w && dom >= 0 && dom < 64) ctx->domain_bytes[dom] += fcwg_bytes;
     if (w && out_scale) *out_scale = scale;
     return w;
 }
@@ -3716,6 +4127,15 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     if (getenv("ORK_FFN_SILU_I16")) { const char * t = getenv("ORK_FFN_SILU_I16_GMAX");
         if (!t || gmax_gate > atof(t)) { fc.silu_cpu = true; fc.silu_i16 = true; }   // outlier -> int16 (all-NPU, coherent)
         else { fc.silu_cpu = false; fc.silu_i16 = false; } }                          // low-gmax -> int8 FUSED silu (fast)
+    // ORK_FFN_SILU_I16_FUSED scale-bridge (used by the fused int16 handler branch): fc.wg int8-mm -> int16-out
+    // via set_i16_out feeding the int16 SiLU resident. gate g = acc*s_x*sg; int16 SiLU wants gate_i16 = g/is
+    // with is = gmax/32000. So set_i16_out mult/shift encodes s_x*sg/is = s_x*sg*32000/gmax (fixed point,
+    // mult<=32767, shift<=31), scaled up to ~[16384,32767] for precision.
+    { double is = fc.gmax / 32000.0; if (!(is > 0)) is = 1e-9; fc.gate16_is = is;
+      double r = (fc.s_x * (double) fc.sg) / is; int sh = 0; double m = r > 0 ? r : 1e-9;
+      while (m < 16384.0 && sh < 31) { m *= 2.0; sh++; }
+      long mult = lround(m); if (mult > 32767) mult = 32767; if (mult < 1) mult = 1;
+      fc.gate16_mult = (int) mult; fc.gate16_shift = sh; }
     // ORK_FFN_F16_GMAX: PER-LAYER all-fp16 selection. all-fp16 removes the CPU int8 quant/dequant but fp16
     // weights are 2x int8 RAM — ALL layers fp16 overflows one 4GiB domain -> ORK_DOMAINS=2 -> per-submit
     // overhead. Selecting only the MOST-SENSITIVE layers (gate gmax > threshold) keeps the fp16 footprint
@@ -3751,7 +4171,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
             if (cw % 16) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GATE-F16] Nff=%d chunk unaligned at %d (cw=%d)\n", Nff, n0, cw); return false; }
             for (int n = 0; n < cw; n++) for (int k = 0; k < K; k++)
                 wgh[(size_t) k*cw + n] = cpusilu ? (ork_f16) wgf[(size_t) (n0+n)*K + k]           // raw Wg (CPU silu)
-                                                 : (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);  // -S*Wg (fused LUT)
+                                                 : (ork_f16) (-(double) S * wgf[(size_t) (n0+n)*K + k]);  // -S*Wg (dead fused-LUT run path)
             if (jit) {   // host int8 store (no resident fp16); inflated into a shared scratch at run
                 fc.jg.emplace_back(); auto & j = fc.jg.back(); j.N = cw;
                 ork_quant_f16_i8_perchan(wgh.data(), K, cw, j.i8, j.bs); continue; }
@@ -3815,6 +4235,229 @@ static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need)
     *buf = ork_dma_alloc(npu, need);
     *sz  = *buf ? need : 0;
     return *buf;
+}
+
+// ratio r -> fixed-point (mult>>shift), mult kept precise in [2^13, 2^15).
+static inline void ork_ratio_to_ms(double r, int * mult, int * shift) {
+    if (r <= 0) { *mult = 1; *shift = 14; return; }
+    int sh = 14; double m = r * (double)(1 << sh);
+    while (m >= 32767.0 && sh > 0)  { sh--; m = r * (double)(1 << sh); }
+    while (m <  8192.0  && sh < 30) { sh++; m = r * (double)(1 << sh); }
+    int mi = (int) lrint(m); if (mi > 32767) mi = 32767; if (mi < 1) mi = 1;
+    *mult = mi; *shift = sh;
+}
+
+// ORK_FFN_DEC: run the DECODE (M==1) SwiGLU FFN inner on the NPU against the orkpack's ALREADY-RESIDENT
+// PER-CHANNEL int8 weights (ork_resolve_weight_i8 — NO second per-tensor copy, so no double-pack, no IOVA
+// wedge, and full per-channel quality; the weights are SHARED with the prefill path). gate+up batch into ONE
+// run_chain_i8 submit (shared input x, K<=4096); SiLU/GLU run on the host (fp32, per-channel dequant via
+// bscale[n]); down is one wide-K ork_mm_run_i8 submit. 2 NPU submits/layer. Falls through on any miss.
+static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
+        struct ggml_tensor * gate_n, struct ggml_tensor * up_n,
+        struct ggml_tensor * glu_n, struct ggml_tensor * down_n) {
+    (void) glu_n;
+    const struct ggml_tensor * Wg = gate_n->src[0], * Wu = up_n->src[0], * Wd = down_n->src[0];
+    const struct ggml_tensor * x  = gate_n->src[1];
+    const int K = (int) Wg->ne[0], Nff = (int) Wg->ne[1], Kd = (int) Wd->ne[1], M = (int) x->ne[1];
+    if (M != 1 || x->type != GGML_TYPE_F32) return false;              // decode only, fp32 activation
+    if (K % 32 || Nff % 32 || Kd % 16 || K > 4096) return false;       // gate/up chain tile (K<=4096); down wide-K via run_i8
+    // resolve the 3 per-channel weights from the orkpack wcache (resident is_orkd; shared with prefill -> no
+    // extra IOVA). A stream-pool tier entry (w==null) can't feed the chain -> fall through to per-node.
+    auto tof = [](const struct ggml_tensor * W){ return ggml_get_type_traits(W->type)->to_float; };
+    auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, tof(Wg), true);
+    auto itu = ork_resolve_weight_i8(ctx, Wu, K, Nff, Wu->nb[1], Wu->type, tof(Wu), true);
+    auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, tof(Wd), true);
+    if (itg==ctx->wcache.end() || itu==ctx->wcache.end() || itd==ctx->wcache.end()) return false;
+    ork_w *wg=itg->second.w, *wu=itu->second.w, *wd=itd->second.w;
+    if (!wg || !wu || !wd) return false;
+    const float *bsg=itg->second.bscale.data(), *bsu=itu->second.bscale.data(), *bsd=itd->second.bscale.data();
+    // ORK_FFN_PROF: TRUE per-hop timers + bytes moved -> achieved weight-DMA GB/s. The decode wall is
+    // bandwidth: gb/s here vs the LPDDR4X peak (~30) says whether we're at the ceiling or moving data
+    // suboptimally (K-slice re-reads, socket copies). run() time = socket + submit(5us) + HW + return.
+    static int fprof=-1; if(fprof<0) fprof=getenv("ORK_FFN_PROF")?1:0;
+    static double p_q=0,p_gu=0,p_host=0,p_dn=0,p_deq=0; static long p_n=0; double _t;
+    const float * xf = (const float *) x->data;
+    float amx=1e-9f; for (int k=0;k<K;k++){ float a=fabsf(xf[k]); if(a>amx)amx=a; }
+    const float a_scale=amx/127.0f, ainv=127.0f/amx;
+    int8_t  *xi  =(int8_t*) malloc((size_t)K);
+    int32_t *gi  =(int32_t*)malloc((size_t)Nff*4), *ui=(int32_t*)malloc((size_t)Nff*4);
+    int8_t  *glu8=(int8_t*) malloc((size_t)Nff);
+    int32_t *di  =(int32_t*)malloc((size_t)Kd*4);
+    float   *glf =(float*)  malloc((size_t)Nff*4);
+    bool ok=false;
+    if (!xi||!gi||!ui||!glu8||!di||!glf) goto done;
+    _t=fprof?ork_now_us():0;
+    for (int k=0;k<K;k++){ int q=(int)lrintf(xf[k]*ainv); xi[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+    if(fprof){ p_q+=ork_now_us()-_t; _t=ork_now_us(); }
+    { ork_mm_task_i8 t[2]={{wg,1,xi,gi},{wu,1,xi,ui}}; if (ork_mm_run_chain_i8(ctx->npu,2,t)) goto done; }  // gate+up: ONE submit
+    if(fprof){ p_gu+=ork_now_us()-_t; _t=ork_now_us(); }
+    { float gmax=1e-9f;                                                                                   // host: per-channel dequant + SiLU*up
+      for (int n=0;n<Nff;n++){ float g=(float)gi[n]*a_scale*bsg[n], u=(float)ui[n]*a_scale*bsu[n];
+          float v=(g/(1.0f+expf(-g)))*u; glf[n]=v; float av=fabsf(v); if(av>gmax)gmax=av; }
+      const float gs=gmax/127.0f, ginv=127.0f/gmax;
+      for (int n=0;n<Nff;n++){ int q=(int)lrintf(glf[n]*ginv); glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
+      if(fprof){ p_host+=ork_now_us()-_t; _t=ork_now_us(); }
+      if (ork_mm_run_i8(ctx->npu, wd, 1, glu8, di)) goto done;                                            // down: ONE submit (wide-K)
+      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us(); }
+      float * dst=(float*)down_n->data;
+      for (int j=0;j<Kd;j++) dst[j]=(float)((double)di[j]*gs*bsd[j]);
+      if(fprof) p_deq+=ork_now_us()-_t;
+    }
+    ok=true;
+    if(fprof){ p_n++; if(p_n%64==0){ double T=p_q+p_gu+p_host+p_dn+p_deq; if(T<1)T=1;
+        double gub=(double)2*K*Nff, dnb=(double)Nff*Kd;   // resident weight bytes streamed (int8)
+        fprintf(stderr,"[ork-ffn-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus(%.1fGB/s) host-silu %.0fus Down %.0fus(%.1fGB/s) deq %.0fus | %.0fus/layer\n",
+            p_n, p_q/p_n, p_gu/p_n, gub/(p_gu/p_n*1e3), p_host/p_n, p_dn/p_n, dnb/(p_dn/p_n*1e3), p_deq/p_n, T/p_n); } }
+    { static long n=0; if((n++%256)==0) fprintf(stderr,"[ork-ffn-dec] per-channel decode FFN on NPU (call %ld): K=%d Nff=%d Kd=%d\n", n,K,Nff,Kd); }
+done:
+    free(xi);free(gi);free(ui);free(glu8);free(di);free(glf);
+    return ok;
+}
+
+// ==== Inc 1: work-stealing CPU pull-queue for the FFN silu/glu lane ===================================
+// Persistent workers pull row-tiles via an atomic counter (NO per-tile barrier -> little A55 cores contribute
+// their ~1/3 share without dragging, unlike a barrier threadpool; a slow puller just pulls fewer tiles).
+// Workers SLEEP on a CV between jobs (no idle spin to fight the doorbell); only the final join spins briefly.
+// Core set from ORK_FFN_POOL_CORES ("4,5,6"=3 big; "0,1,2,3,4,5,6"=big+little, reserve one big for the caller +
+// doorbell drain). Unset => serial (pool disabled). The NPU keeps its doorbell spinner (on the calling thread).
+struct OrkFfnPool {
+    std::vector<std::thread> ths;
+    std::mutex m; std::condition_variable cv;
+    std::deque<std::function<void()>> q; std::atomic<int> pending{0}; bool stop = false;
+    void worker() {
+        for (;;) {
+            std::function<void()> job;
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stop || !q.empty(); }); if (stop) return; job = std::move(q.front()); q.pop_front(); }
+            job(); pending.fetch_sub(1, std::memory_order_release);
+        }
+    }
+    void start(const std::vector<int> & cores) {
+        for (int c : cores) {
+            ths.emplace_back([this]{ worker(); });
+            cpu_set_t s; CPU_ZERO(&s); CPU_SET(c, &s);
+            pthread_setaffinity_np(ths.back().native_handle(), sizeof s, &s);
+        }
+    }
+    bool empty() const { return ths.empty(); }
+    // async: enqueue one task; workers pull it. Non-blocking (used by the scheduler while the caller polls the doorbell).
+    void submit(std::function<void()> f) { pending.fetch_add(1, std::memory_order_relaxed); { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(f)); } cv.notify_one(); }
+    void wait() { while (pending.load(std::memory_order_acquire) > 0) sched_yield(); }
+    // blocking parallel-for over [0,nt); the calling thread participates (drains the deque too).
+    void run(int nt, const std::function<void(int)> & f) {
+        if (ths.empty() || nt <= 1) { for (int t = 0; t < nt; t++) f(t); return; }
+        for (int t = 0; t < nt; t++) submit([&f, t]{ f(t); });
+        for (;;) { std::function<void()> job;   // calling thread participates
+            { std::lock_guard<std::mutex> lk(m); if (q.empty()) break; job = std::move(q.front()); q.pop_front(); }
+            job(); pending.fetch_sub(1, std::memory_order_release); }
+        wait();
+    }
+};
+static OrkFfnPool * ork_ffn_pool() {
+    static OrkFfnPool * p = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (const char * e = getenv("ORK_FFN_POOL_CORES")) {
+            std::vector<int> cores; for (const char * s = e; *s; ) { cores.push_back(atoi(s)); while (*s && *s != ',') s++; if (*s == ',') s++; }
+            if (!cores.empty()) { p = new OrkFfnPool(); p->start(cores);
+                if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[FFN POOL] started %zu workers on cores:", cores.size()); for (int c : cores) fprintf(stderr, " %d", c); fprintf(stderr, "\n"); } }
+        }
+    }
+    return p;
+}
+
+// Dedicated NPU-DRIVER (spinner) thread: owns the single-stream NPU. Pulls a doorbell chain, arms it, and
+// SPINS in ork_dyn_end driving/collecting it — so the NPU stays continuously driven even while OTHER cores do
+// silu. Fixes the ORK_FFN_SCHED starvation (there the calling thread left the doorbell to do silu, so the
+// chain wasn't advanced). Pinned to a big core (ORK_FFN_DRIVER_CORE, default 7). Only THIS thread touches the
+// NPU during a chain (single-stream). begin_mc NULL => per-task blocking fallback (still on the driver thread).
+struct OrkNpuDriver {
+    std::thread th; std::mutex m; std::condition_variable cv;
+    ork_npu * npu = nullptr;
+    const ork_mm_task_i8 * tasks = nullptr; int ntasks = 0; int K = 0; int nc = 0;   // nc: doorbell colsplit core count (0=all)
+    std::atomic<long> job{0}, done{0}; std::atomic<int> rc{0}; bool stop = false;
+    void driver() {
+        long seen = 0;
+        for (;;) {
+            const ork_mm_task_i8 * tk; int n, kk;
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stop || job.load() != seen; }); if (stop) return; seen = job.load(); tk = tasks; n = ntasks; kk = K; }
+            int r = 0;
+            ork_dyn_chain * h = ork_dyn_begin_mc(npu, n, tk, nc);
+            if (h) { if (ork_dyn_end(h) < 0) r = -1; }
+            else for (int i = 0; i < n && r == 0; i++) if (ork_mm_run_i8(npu, tk[i].w, tk[i].M, tk[i].A, tk[i].C)) r = -1;   // fallback (Bf missing / ineligible)
+            (void) kk; rc.store(r); done.store(seen, std::memory_order_release);
+        }
+    }
+    void start(ork_npu * n, int core) { npu = n; th = std::thread([this]{ driver(); });
+        cpu_set_t s; CPU_ZERO(&s); CPU_SET(core, &s); pthread_setaffinity_np(th.native_handle(), sizeof s, &s); }
+    void run_async(const ork_mm_task_i8 * tk, int n) { { std::lock_guard<std::mutex> lk(m); tasks = tk; ntasks = n; job.fetch_add(1); } cv.notify_one(); }
+    int wait() { long g = job.load(); while (done.load(std::memory_order_acquire) != g) sched_yield(); return rc.load(); }
+};
+static OrkNpuDriver * ork_npu_driver(ork_npu * npu) {
+    static OrkNpuDriver * d = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (getenv("ORK_FFN_DRIVER")) { d = new OrkNpuDriver();
+            int core = getenv("ORK_FFN_DRIVER_CORE") ? atoi(getenv("ORK_FFN_DRIVER_CORE")) : 7;
+            d->nc = getenv("ORK_FFN_DRIVER_NC") ? atoi(getenv("ORK_FFN_DRIVER_NC")) : 0;   // doorbell colsplit cores (0=all -> greedy; 1..3 leaves big cores for silu)
+            d->start(npu, core);
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN DRIVER] dedicated NPU spinner on core %d, doorbell nc=%d\n", core, d->nc);
+        }
+    }
+    return d;
+}
+
+// ==== Generalized ork_spine FFN scheduler (ORK_FFN_SPINE) ============================================
+// The dependency-ordered dual-priority DAG — the general form of the bespoke pool+driver. Units: 1 NPU
+// (blocking ork_mm_run_i8 = kernel-IRQ, frees its core during the matmul, apipe's mechanism) + N CPU units
+// (silu/glu), driven by ork_spine_run. Per M-tile ops: gate,up (NPU) -> silu (CPU, dep gate) -> glu (CPU,
+// dep silu+up) -> down (NPU, dep glu). Placement tags route ops; the scheduler overlaps + self-balances.
+// Op fns are C-style (ork_spine_op.fn = long(*)(void*)); the per-tile context rides in OrkSpineArg.
+struct OrkSpineArg {
+    ggml_backend_ork_context * ctx;
+    ork_w * wg; ork_w * wu; ork_w * wd;
+    const int8_t * xr_i8; const float * as_x; const float * bsg; const float * bsu; const float * bsd;
+    int32_t * g32; int32_t * u32; int32_t * d32;
+    float * silu_f; float * up_f; int8_t * glu_i8; float * as_g; float * dst;
+    int K; int Nff; int Kd; int m0; int mc;
+};
+static long ork_sp_gate(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // NPU: gate matmul -> g32
+    return ork_mm_run_i8(s->ctx->npu, s->wg, s->mc, s->xr_i8 + (size_t) s->m0*s->K, s->g32 + (size_t) s->m0*s->Nff); }
+static long ork_sp_up(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                   // NPU: up matmul -> u32
+    return ork_mm_run_i8(s->ctx->npu, s->wu, s->mc, s->xr_i8 + (size_t) s->m0*s->K, s->u32 + (size_t) s->m0*s->Nff); }
+static long ork_sp_silu(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // CPU: gate int32 -> exact fp32 silu
+    for (int r = 0; r < s->mc; r++) { const float rs = s->as_x[s->m0+r];
+        float * so = s->silu_f + (size_t)(s->m0+r)*s->Nff; const int32_t * gr = s->g32 + (size_t)(s->m0+r)*s->Nff;
+        for (int n = 0; n < s->Nff; n++) { float g = (float) gr[n] * rs * s->bsg[n]; so[n] = g / (1.0f + expf(-g)); } }
+    return 0; }
+static long ork_sp_glu(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                  // CPU: up dequant + glu=silu*up + per-row int8 quant
+    std::vector<float> g(s->Nff);
+    for (int r = 0; r < s->mc; r++) { const int m = s->m0+r; const float rs = s->as_x[m];
+        const int32_t * ur = s->u32 + (size_t) m*s->Nff; float * uo = s->up_f + (size_t) m*s->Nff; const float * so = s->silu_f + (size_t) m*s->Nff;
+        float mx = 1e-9f;
+        for (int n = 0; n < s->Nff; n++) { float u = rs * s->bsu[n] * (float) ur[n]; uo[n] = u; float gg = so[n]*u; g[n]=gg; float av=fabsf(gg); if(av>mx)mx=av; }
+        float sc = mx/127.0f; s->as_g[m] = sc; float iv = 127.0f/mx; int8_t * gi = s->glu_i8 + (size_t) m*s->Nff;
+        for (int n = 0; n < s->Nff; n++) { int q=(int)lrintf(g[n]*iv); gi[n]=(int8_t)(q>127?127:q<-127?-127:q); } }
+    return 0; }
+static long ork_sp_down(void * a){ OrkSpineArg * s = (OrkSpineArg *) a;                 // NPU: down matmul + dequant -> dst
+    if (ork_mm_run_i8(s->ctx->npu, s->wd, s->mc, s->glu_i8 + (size_t) s->m0*s->Nff, s->d32 + (size_t) s->m0*s->Kd)) return -1;
+    for (int r = 0; r < s->mc; r++) { const int m = s->m0+r; const float rs = s->as_g[m];
+        const int32_t * dr = s->d32 + (size_t) m*s->Kd; float * do_ = s->dst + (size_t) m*s->Kd;
+        for (int n = 0; n < s->Kd; n++) do_[n] = rs * s->bsd[n] * (float) dr[n]; }
+    return 0; }
+
+struct OrkSpine { ork_spine_unit * U = nullptr; int nu = 0; };
+static OrkSpine * ork_spine_get() {
+    static OrkSpine * s = nullptr; static bool init = false;
+    if (!init) { init = true;
+        if (getenv("ORK_FFN_SPINE")) {
+            std::vector<int> cc; if (const char * e = getenv("ORK_FFN_SPINE_CPU_CORES")) { for (const char * p=e; *p; ) { cc.push_back(atoi(p)); while(*p&&*p!=',')p++; if(*p==',')p++; } }
+            if (cc.empty()) cc = {4,5,6};
+            int npu_core = getenv("ORK_FFN_SPINE_NPU_CORE") ? atoi(getenv("ORK_FFN_SPINE_NPU_CORE")) : 7;
+            s = new OrkSpine(); s->nu = 1 + (int) cc.size(); s->U = new ork_spine_unit[s->nu];
+            ork_spine_unit_start(&s->U[0], ORK_UNIT_NPU, npu_core);
+            for (size_t i = 0; i < cc.size(); i++) ork_spine_unit_start(&s->U[1+i], ORK_UNIT_CPU, cc[i]);
+            if (getenv("ORK_VERBOSE")) { fprintf(stderr, "[FFN SPINE] NPU unit core %d + %zu CPU units cores:", npu_core, cc.size()); for(int c:cc)fprintf(stderr," %d",c); fprintf(stderr,"\n"); }
+        }
+    }
+    return s;
 }
 
 static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
@@ -3962,12 +4605,18 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(xr[k]); if (v > mx) mx = v; }
         as_x[m] = mx / 127.0f; float iv = 127.0f / mx;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(xr[k]*iv); a[k] = (int8_t)(q>127?127:q<-127?-127:q); } }
-    // resolve per-channel up/down weights (standard wcache path)
+    // resolve per-channel up/down weights (standard wcache path). PIN each against LRU eviction: resolving
+    // `down` (and `gate` in the GU_CHAIN path) can trigger ork_wcache_evict, which under a tight budget would
+    // otherwise free the just-resolved `up` — dangling the held owu/bsu references (ASAN use-after-free at the
+    // phase-1 up matmul, 4421). The guard unpins on EVERY return path.
+    struct WCachePinGuard { std::unordered_set<const void *> & s; ~WCachePinGuard() { s.clear(); } } _wc_pin{ ctx->wcache_pin };
     auto itu = ork_resolve_weight_i8(ctx, Wu, K, Nff, Wu->nb[1], Wu->type, ggml_get_type_traits(Wu->type)->to_float, true);
     if (itu == ctx->wcache.end()) return false;
+    ctx->wcache_pin.insert(itu->first);                  // pin `up` BEFORE resolving `down` (which may evict)
     const ork_weight & owu = itu->second; const float * bsu = owu.bscale.data();
     auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, ggml_get_type_traits(Wd->type)->to_float, true);
     if (itd == ctx->wcache.end()) return false;
+    ctx->wcache_pin.insert(itd->first);
     const ork_weight & owd = itd->second; const float * bsd = owd.bscale.data();
     // NOTE: gate/up/down do NOT need co-residence. Each is a SEPARATE ork_mm_run_* call that goes through
     // run()->dom_activate(w->domain)->a SINGLE-domain submit, so they may live in different domains (the
@@ -3988,7 +4637,53 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     std::vector<int32_t> acc_i32((size_t) M * Nff);   // reused (Nff >= Kd)
     std::vector<float>   up_f((size_t) M * Nff), silu_f((size_t) M * Nff), glu_f((size_t) M * Nff), as_g(M);
     bool ok = true;
+    // ORK_FFN_SPINE: generalized dependency-ordered dual-priority DAG. Runs the WHOLE FFN inner (gate/up/silu/
+    // glu/down -> dst) as an ork_spine op-graph and returns; Phase 1/2/3 below are skipped. Placement tags
+    // (NPU/CPU) route each op; ork_spine_run overlaps independent NPU/CPU work + self-balances free units.
+    if (getenv("ORK_FFN_SPINE") && fc.silu_cpu && !fc.silu_i16 && ablate < 0) {
+        OrkSpine * sp = ork_spine_get();
+        if (sp) {
+            auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+            if (itg == ctx->wcache.end()) return false;
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            // Default nt=1 (TS=M): full-M matmuls (no per-tile weight-DMA re-stream tax) with silu∥up overlap
+            // in the one tile — apipe's shape. Smaller TS pipelines more tiles but re-streams weights (net loss
+            // on this weight-DMA-bound matmul). ORK_FFN_SPINE_TS overrides; capped so nt*5 <= 30 (<32 DAG cap).
+            int TS = getenv("ORK_FFN_SPINE_TS") ? atoi(getenv("ORK_FFN_SPINE_TS")) : M;
+            if (TS < (M + 5) / 6) TS = (M + 5) / 6;   // keep nt <= 6
+            if (TS < 1) TS = 1; const int nt = (M + TS - 1) / TS;
+            std::vector<int32_t> g32((size_t) M*Nff), u32((size_t) M*Nff), d32((size_t) M*Kd);
+            std::vector<int8_t>  glu_i8b((size_t) M*Nff);
+            std::vector<OrkSpineArg> args(nt);
+            std::vector<ork_spine_op> ops((size_t) nt*5);
+            for (int t = 0; t < nt; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                args[t] = OrkSpineArg{ ctx, owg.w, owu.w, owd.w, xr_i8.data(), as_x.data(), bsg, bsu, bsd,
+                    g32.data(), u32.data(), d32.data(), silu_f.data(), up_f.data(), glu_i8b.data(), as_g.data(), (float *) down_n->data, K, Nff, Kd, m0, mc };
+                int b = t*5;
+                ops[b+0] = ork_spine_op{ 0,                       ORK_PL_NPU, ork_sp_gate, &args[t], 0, -1, 0, 0 };
+                ops[b+1] = ork_spine_op{ 0,                       ORK_PL_NPU, ork_sp_up,   &args[t], 0, -1, 0, 0 };
+                ops[b+2] = ork_spine_op{ 1<<(b+0),                ORK_PL_CPU, ork_sp_silu, &args[t], 0, -1, 0, 0 };   // dep gate
+                ops[b+3] = ork_spine_op{ (1<<(b+2))|(1<<(b+1)),   ORK_PL_CPU, ork_sp_glu,  &args[t], 0, -1, 0, 0 };   // dep silu + up
+                ops[b+4] = ork_spine_op{ 1<<(b+3),                ORK_PL_NPU, ork_sp_down, &args[t], 0, -1, 0, 0 };   // dep glu
+            }
+            int rc = ork_spine_run(sp->U, sp->nu, ops.data(), (int)(nt*5));
+            bool oks = rc == 0; for (size_t i = 0; i < ops.size() && oks; i++) if (ops[i].ret) oks = false;
+            if (getenv("ORK_VERBOSE")) { static int o = 0; if (!o++) fprintf(stderr, "[FFN SPINE] %s M=%d nt=%d TS=%d nu=%d rc=%d ok=%d\n", Wg->name, M, nt, TS, sp->nu, rc, oks); }
+            return oks;   // dst written by the down ops; Phase 1/2/3 skipped
+        }
+    }
     bool gu_done = false;
+    // ORK_FFN_PIPE: doorbell same-thread M-tile pipeline for the int8-gate + exact-CPU-SiLU path (fc.silu_cpu,
+    // the shipped-default chain path). Token rows are independent, so the NPU runs tile t's gate+up (one
+    // nonblocking doorbell submit) while the CPU does tile t-1's SiLU+up-dequant. Per-layer lane timing under
+    // ORK_VERBOSE. Superseded by ORK_FFN_SCHED (two-chain) which tunes higher; kept for A/B.
+    const bool pipe = getenv("ORK_FFN_PIPE") && fc.silu_cpu && !fc.silu_i16 && ablate < 0;
+    // ORK_FFN_SCHED: doorbell-native scheduler. gate-chain (one ork_dyn_begin_mc over ALL gate tiles -> the
+    // doorbell SPINS through them, no per-tile submit) -> drain (read-after-drain coherent) -> dispatch all
+    // silu to the CPU pool WHILE the up-chain spins on the NPU -> drain -> glu/down. Realizes the two-priority
+    // dep-ordered queue within the coherency contract (mid-chain reads are NOT coherent; per-chain drain is).
+    const bool sched = getenv("ORK_FFN_SCHED") && fc.silu_cpu && !fc.silu_i16 && ablate < 0;
     // STATIC-GRAPH submit reduction (ORK_GU_CHAIN): HW-chain up+gate into ONE run_chain_i8 submit per
     // M-tile — both read xr_i8 and are independent, so the hardware walks them as task_number=2 in a single
     // ioctl (collapses 2 tiled matmul submits -> 1 for the int16/cpu-silu path). run_chain_i8 is single-core;
@@ -3997,6 +4692,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     if (getenv("ORK_GU_CHAIN") && fc.silu_cpu && ablate < 0) {
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg != ctx->wcache.end()) {
+            ctx->wcache_pin.insert(itg->first);          // pin `gate` — GU_CHAIN uses up+gate co-resident in one submit
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // Stage the shared int8 input + gate/up int32 outputs in cached NPU-coherent DMA scratch so
             // run_chain_i8's dma_find HITS -> no per-task bcreate/memcpy/bsync/bdestroy, and the shared
@@ -4034,26 +4730,153 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
             gu_done = cok;
         }
     }
-    // Phase 1: up (per-channel, per-row) -> up_f fp32  [skipped if the chained fast-path already did up+gate]
-    for (int m0 = 0; !gu_done && m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
-        if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+    // Phase 1: up (per-channel, per-row) -> up_f fp32  [skipped if the chained fast-path already did up+gate,
+    // or if pipe/sched (doorbell) fold up into their overlapped Phase-2 schedule]
+    for (int m0 = 0; !gu_done && !pipe && !sched && m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
+        if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: up matmul owu m0=%d\n",m0); ok = false; break; }
         for (int r = 0; r < mc; r++) { const int32_t * ur = acc_i32.data() + (size_t) r*Nff;
             float * uo = up_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
             for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } }
     // Phase 2: silu_f fp32
-    if (ok && !gu_done && fc.silu_cpu && ablate < 0) {
+    // FUSED int16 (ORK_FFN_SILU_I16_FUSED): fc.wg int8-mm -> int16-out (set_i16_out, on-device, internally
+    // N-tiled) -> int16 SiLU (N-tiled at nmax). No host int32->fp32->int16 round-trip, no separate per-channel
+    // gate matmul. Per-tensor gate (scalar out16) => PPL A/B vs the un-fused per-channel int16 path.
+    static const int silu_i16_fused = getenv("ORK_FFN_SILU_I16_FUSED") != nullptr;
+    if (sched && ok && !gu_done) {
+        // ---- ORK_FFN_SCHED: doorbell-native two-chain scheduler (the dependency-ordered queue, within the
+        // read-after-drain coherency contract). gate-chain: ONE ork_dyn_begin_mc over all gate tiles -> the
+        // doorbell spins through them (no per-tile submit) -> drain (coherent). Then dispatch all silu to the
+        // CPU pool (work-stealing, big+little) WHILE the up-chain spins on the NPU -> drain -> dequant up.
+        // Fills silu_f + up_f; Phase 3 (glu + down) runs unchanged. down (K=Nff>4096) is not doorbell-eligible.
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN SCHED] gate resolve miss %s\n", Wg->name); ok = false; }
+        else {
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            OrkFfnPool * pool = ork_ffn_pool();
+            const int TS = 64; const int nt = (M + TS - 1) / TS;                  // doorbell tile cap (mc M<=64)
+            std::vector<int32_t> g32((size_t) M*Nff), u32((size_t) M*Nff);        // gate/up int32 (read-after-drain coherent)
+            std::vector<ork_mm_task_i8> gt(nt), ut(nt);
+            for (int t = 0; t < nt; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                gt[t] = { owg.w, mc, xr_i8.data() + (size_t) m0*K, g32.data() + (size_t) m0*Nff };
+                ut[t] = { owu.w, mc, xr_i8.data() + (size_t) m0*K, u32.data() + (size_t) m0*Nff }; }
+            static double s_g = 0, s_u = 0; static long s_l = 0; double t0 = (double) ggml_time_us();
+            OrkNpuDriver * driver = ork_npu_driver(ctx->npu);   // dedicated spinner drives the NPU on its own core
+            // gate-chain: driven to completion (drain => coherent). Spinner if enabled, else calling thread.
+            if (driver) { driver->run_async(gt.data(), nt); if (driver->wait()) ok = false; }
+            else { ork_dyn_chain * hA = ork_dyn_begin_mc(ctx->npu, nt, gt.data(), 0);
+                if (hA) { if (ork_dyn_end(hA) < 0) ok = false; }
+                else for (int t = 0; t < nt && ok; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                    if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data()+(size_t) m0*K, g32.data()+(size_t) m0*Nff)) ok = false; } }
+            double tg = (double) ggml_time_us();
+            if (ok) {
+                // up-chain: the dedicated spinner drives it on its OWN core (never leaving the doorbell) while
+                // the CPU pool does silu on the rest — the fix for the sched starvation (was: caller left the
+                // doorbell to do silu, so the chain stalled). Without a driver, falls back to caller-drives.
+                ork_dyn_chain * hB = nullptr;
+                if (driver) driver->run_async(ut.data(), nt);
+                else        hB = ork_dyn_begin_mc(ctx->npu, nt, ut.data(), 0);
+                for (int t = 0; t < nt; t++) {
+                    auto silu = [&, t]{ int m0 = t*TS, mc = std::min(TS, M - m0);
+                        for (int r = 0; r < mc; r++) { const float rs = as_x[m0+r];
+                            float * so = silu_f.data() + (size_t)(m0+r)*Nff; const int32_t * gr = g32.data() + (size_t)(m0+r)*Nff;
+                            for (int n = 0; n < Nff; n++) { float g = (float) gr[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); } } };
+                    if (pool) pool->submit(silu); else silu(); }
+                if (driver) { if (driver->wait()) ok = false; }
+                else if (hB) { if (ork_dyn_end(hB) < 0) ok = false; }
+                else for (int t = 0; t < nt && ok; t++) { int m0 = t*TS, mc = std::min(TS, M - m0);
+                    if (ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data()+(size_t) m0*K, u32.data()+(size_t) m0*Nff)) ok = false; }
+                if (pool) pool->wait();
+                double tu = (double) ggml_time_us();
+                if (ok) { auto deq = [&](int t){ int m0 = t*TS, mc = std::min(TS, M - m0);   // dequant up -> up_f (coherent)
+                        for (int r = 0; r < mc; r++) { const float rs = as_x[m0+r];
+                            float * uo = up_f.data() + (size_t)(m0+r)*Nff; const int32_t * ur = u32.data() + (size_t)(m0+r)*Nff;
+                            for (int n = 0; n < Nff; n++) uo[n] = rs * bsu[n] * (float) ur[n]; } };
+                    if (pool) pool->run(nt, deq); else for (int t = 0; t < nt; t++) deq(t); }
+                s_g += tg - t0; s_u += tu - tg; s_l++;
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN SCHED] %s M=%d nt=%d | gate-chain=%.1fms silu∥up-chain=%.1fms || Σ L=%ld g=%.0fms u=%.0fms\n",
+                    Wg->name, M, nt, (tg-t0)/1000, (tu-tg)/1000, s_l, s_g/1000, s_u/1000);
+            }
+        }
+    } else if (pipe && ok && !gu_done) {
+        // ---- ORK_FFN_PIPE: doorbell (ork_dyn_begin_mc) same-thread nonblock M-tile pipeline, tile TS<=64
+        // (the envelope cap). Token rows are independent, so tile t's gate+up run on the NPU while the CPU
+        // does tile t-1's SiLU+up-dequant. Measured net -3% at TS=64: halving the tile vs baseline MT=128
+        // doubles the weight-DMA re-stream (NPU-bound path). Kept for the A/B + lane timing.
+        auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
+        if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] gate resolve miss %s\n", Wg->name); ok = false; }
+        else {
+            ctx->wcache_pin.insert(itg->first);
+            const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
+            const int TS = 64; const int nt = (M + TS - 1) / TS;
+            std::vector<int32_t> gC0((size_t) TS*Nff), gC1((size_t) TS*Nff);      // ping-pong gate int32 (CPU reads t-1 while NPU writes t)
+            std::vector<int32_t> uC0((size_t) TS*Nff), uC1((size_t) TS*Nff);      // ping-pong up int32
+            int32_t * gCb[2] = { gC0.data(), gC1.data() }; int32_t * uCb[2] = { uC0.data(), uC1.data() };
+            static double s_cpu = 0, s_drain = 0, s_sub = 0; static long s_layers = 0;
+            double l_cpu = 0, l_drain = 0, l_sub = 0;
+            OrkFfnPool * pool = ork_ffn_pool();
+            auto cpu_lane = [&](int t) {
+                int m0 = t*TS, mc = std::min(TS, M - m0), b = t & 1;
+                const int32_t * gc = gCb[b], * uc = uCb[b];
+                auto row = [&](int r) { const float rs = as_x[m0+r];
+                    float * so = silu_f.data() + (size_t)(m0+r)*Nff; float * uo = up_f.data() + (size_t)(m0+r)*Nff;
+                    const int32_t * gr = gc + (size_t) r*Nff, * ur = uc + (size_t) r*Nff;
+                    for (int n = 0; n < Nff; n++) { float g = (float) gr[n] * rs * bsg[n]; so[n] = g / (1.0f + expf(-g)); uo[n] = rs * bsu[n] * (float) ur[n]; } };
+                if (pool) pool->run(mc, row); else for (int r = 0; r < mc; r++) row(r);
+            };
+            int prev = -1;
+            for (int t = 0; t < nt && ok; t++) {
+                int m0 = t*TS, mc = std::min(TS, M - m0), b = t & 1;
+                ork_mm_task_i8 tk[2] = { { owg.w, mc, xr_i8.data() + (size_t) m0*K, gCb[b] },
+                                         { owu.w, mc, xr_i8.data() + (size_t) m0*K, uCb[b] } };
+                double ts = (double) ggml_time_us();
+                ork_dyn_chain * dh = ork_dyn_begin_mc(ctx->npu, 2, tk, 0);
+                double tc0 = (double) ggml_time_us(); l_sub += tc0 - ts;
+                if (!dh) {
+                    if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data()+(size_t) m0*K, gCb[b]) ||
+                        ork_mm_run_i8(ctx->npu, owu.w, mc, xr_i8.data()+(size_t) m0*K, uCb[b])) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] blocking fallback FAIL t=%d\n", t); ok = false; break; }
+                    l_drain += (double) ggml_time_us() - tc0;
+                    if (prev >= 0) { double p0 = (double) ggml_time_us(); cpu_lane(prev); l_cpu += (double) ggml_time_us() - p0; }
+                    prev = t; continue;
+                }
+                if (prev >= 0) cpu_lane(prev);
+                double tc1 = (double) ggml_time_us(); l_cpu += tc1 - tc0;
+                if (ork_dyn_end(dh) < 0) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] dyn_end FAIL t=%d\n", t); ok = false; break; }
+                l_drain += (double) ggml_time_us() - tc1;
+                prev = t;
+            }
+            if (ok && prev >= 0) { double p0 = (double) ggml_time_us(); cpu_lane(prev); l_cpu += (double) ggml_time_us() - p0; }
+            s_cpu += l_cpu; s_drain += l_drain; s_sub += l_sub; s_layers++;
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] %s M=%d nt=%d TS=%d | cpu=%.1fms drain=%.1fms sub=%.2fms || Σ L=%ld cpu=%.0fms drain=%.0fms sub=%.0fms\n",
+                Wg->name, M, nt, TS, l_cpu/1000, l_drain/1000, l_sub/1000, s_layers, s_cpu/1000, s_drain/1000, s_sub/1000);
+        }
+    } else if (ok && !gu_done && fc.silu_i16 && silu_i16_fused && fc.wg && ablate < 0) {
+        std::vector<int16_t> gate_i16((size_t) M * Nff);
+        if (ork_mm_run_i8_out16(ctx->npu, fc.wg, M, xi.data(), (short *) gate_i16.data(), fc.gate16_mult, fc.gate16_shift)) {
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN i16-fused] FAIL: mm_out16 %s\n", Wg->name); ok = false;
+        } else {
+            const int NT16 = 8192; const double is = fc.gate16_is;
+            std::vector<int16_t> cin((size_t) M*NT16), cout((size_t) M*NT16);
+            for (int n0 = 0; n0 < Nff && ok; n0 += NT16) { int cw = std::min(NT16, Nff - n0);
+                for (int r = 0; r < M; r++) memcpy(cin.data() + (size_t) r*cw, gate_i16.data() + (size_t) r*Nff + n0, (size_t) cw*2);
+                double us = 0;
+                if (ork_npu_silu_i16(ctx->npu, cin.data(), M, cw, is, is, cout.data(), &us)) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN i16-fused] FAIL: silu_i16 cw=%d\n", cw); ok = false; break; }
+                for (int r = 0; r < M; r++) { float * so = silu_f.data() + (size_t) r*Nff + n0;
+                    for (int n = 0; n < cw; n++) so[n] = (float) cout[(size_t) r*cw+n] * is; } }
+        }
+    } else if (ok && !gu_done && fc.silu_cpu && ablate < 0) {
         // EXACT gate (strategic high-gmax layer): per-channel gate matmul on-NPU + fp32 silu on CPU. Same recipe
         // as the up projection (per-channel weight, per-row x), so quality matches baseline; only the fused-silu
         // stage is skipped for this layer. Reuses xr_i8 + as_x (per-row original x, already computed above).
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
-        if (itg == ctx->wcache.end()) { ok = false; }
+        if (itg == ctx->wcache.end()) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: gate resolve miss %s\n",Wg->name); ok = false; }
         else { const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // NOTE: an earlier single-core pin here (ork_npu_set_core_budget 1) collides with (c)'s NO_BF
             // default — it forces the gate matmul onto the single-core run_loop path which needs the full-K
             // Bf (NULL under NO_BF) -> run_loop wedges (errno 110). Keep the gate MULTI-core (mcworker/Bb).
             // The int16 silu op is single-core; the multi->single transition is handled inside the op.
             for (int m0 = 0; m0 < M && ok; m0 += MT) { int mc = std::min(MT, M - m0);
-                if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { ok = false; break; }
+                if (ork_mm_run_i8(ctx->npu, owg.w, mc, xr_i8.data() + (size_t) m0*K, acc_i32.data())) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: gate matmul owg m0=%d\n",m0); ok = false; break; }
                 if (fc.silu_i16) {
                     // on-NPU int16 SiLU: dequant int32 gate -> fp32 (per-row x per-channel scale), quantize to
                     // int16 (uniform scale), run ork_npu_silu_i16, dequant. ~325x more accurate than int8-fused.
@@ -4063,10 +4886,18 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
                     double is = gmx/32000.0, os = gmx/32000.0; if (is<=0) is=1e-9; if (os<=0) os=1e-9;   // silu(gmax)~gmax
                     std::vector<int16_t> in16((size_t) mc*Nff), out16((size_t) mc*Nff);
                     for (size_t i = 0; i < (size_t) mc*Nff; i++) { long q = lround(gr[i]/is); if (q>32767) q=32767; if (q<-32768) q=-32768; in16[i] = (int16_t) q; }
-                    double us = 0;
-                    if (ork_npu_silu_i16(ctx->npu, in16.data(), mc, Nff, is, os, out16.data(), &us)) { ok = false; break; }
-                    for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff;
-                        for (int n = 0; n < Nff; n++) so[n] = (float) out16[(size_t) r*Nff+n] * os; }
+                    // N-TILE the int16 SiLU: the standalone SDP op rejects N>nmax(8192) and does NOT tile
+                    // internally, but the FFN intermediate is Nff=18944. SiLU is pointwise, so gather each
+                    // contiguous ≤8192 column-chunk into [mc][cw], run it, scatter back (Nff%8==0 -> cw%8==0).
+                    const int NT16 = 8192;
+                    std::vector<int16_t> cin((size_t) mc*NT16), cout((size_t) mc*NT16);
+                    for (int n0 = 0; n0 < Nff && ok; n0 += NT16) { int cw = std::min(NT16, Nff - n0);
+                        for (int r = 0; r < mc; r++) memcpy(cin.data() + (size_t) r*cw, in16.data() + (size_t) r*Nff + n0, (size_t) cw*2);
+                        double us = 0;
+                        if (ork_npu_silu_i16(ctx->npu, cin.data(), mc, cw, is, os, cout.data(), &us)) { if(getenv("ORK_VERBOSE"))fprintf(stderr,"[FFN i16] FAIL: ork_npu_silu_i16 mc=%d cw=%d is=%.3e\n",mc,cw,is); ok = false; break; }
+                        for (int r = 0; r < mc; r++) { float * so = silu_f.data() + (size_t)(m0+r)*Nff + n0;
+                            for (int n = 0; n < cw; n++) so[n] = (float) cout[(size_t) r*cw+n] * os; } }
+                    if (!ok) break;
                 } else {
                     for (int r = 0; r < mc; r++) { const int32_t * ar = acc_i32.data() + (size_t) r*Nff;
                         float * so = silu_f.data() + (size_t)(m0+r)*Nff; const float rs = as_x[m0+r];
@@ -4261,24 +5092,34 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
     const int64_t r2_1 = src1->ne[2] ? ne2 / src1->ne[2] : 1, r3_1 = src1->ne[3] ? ne3 / src1->ne[3] : 1;
     std::vector<ork_f16> A((size_t) M * K), B((size_t) K * N);
     std::vector<float>   C((size_t) M * N);
-    auto rd = [](const struct ggml_tensor * t, const char * base, size_t j) -> float {
-        return t->type == GGML_TYPE_F16 ? (float) ((const ork_f16 *) base)[j] : ((const float *) base)[j];
+    // strided read of logical element (i0,i1) of a per-head slice — densifies non-contiguous (permuted-view)
+    // attention operands (real QK^T/A·V read permuted-Q / non-contig KV-cache views) into the packed A/B.
+    auto rds = [](const struct ggml_tensor * t, const char * base, int64_t i0, int64_t i1) -> float {
+        const char * p = base + i0 * t->nb[0] + i1 * t->nb[1];
+        return t->type == GGML_TYPE_F16 ? (float) *(const ork_f16 *) p : *(const float *) p;
     };
-    for (int64_t i3 = 0; i3 < ne3; i3++)
-    for (int64_t i2 = 0; i2 < ne2; i2++) {
+    // DETERMINISTIC IOVA fix: reuse ONE persistent scratch weight across all heads (repack in place per
+    // head) instead of ork_bmm_fp16's per-head ork_mm_pack (a fresh ~6MB dma-buf import + cache entry ×
+    // heads×layers -> PRIME_FD / bcreate OOM). Footprint = one K×N weight + reused A/C, constant regardless
+    // of head/layer count — same pool discipline as ork_ssm/gdn_scan. K%32/N%16 already gated by supports_op.
+    ork_w * w = ork_mm_f16_scratch(ctx->npu, K, N);
+    if (!w) return false;
+    bool ok = true;
+    for (int64_t i3 = 0; ok && i3 < ne3; i3++)
+    for (int64_t i2 = 0; ok && i2 < ne2; i2++) {
         const char * s0 = (const char *) src0->data + (i2 / r2_0) * src0->nb[2] + (i3 / r3_0) * src0->nb[3];
         const char * s1 = (const char *) src1->data + (i2 / r2_1) * src1->nb[2] + (i3 / r3_1) * src1->nb[3];
         float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
-        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rd(src0, s0, j);
-        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rd(src1, s1, j);
-        if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] %s x %s  M=%d K=%d N=%d  head(%lld,%lld)/(%lld,%lld) s0t=%d s1t=%d\n",
-                src0->name, src1->name, M, K, N, (long long)i2,(long long)i3,(long long)ne2,(long long)ne3, src0->type, src1->type);
-        if (ork_bmm_fp16(ctx->npu, 1, M, K, N, A.data(), B.data(), C.data())) {
-            if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ WEDGED on the above call\n");
-            return false; }
+        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j % K, j / K);   // src0 [K,N]
+        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
+        if (ork_mm_repack_f16(ctx->npu, w, K, N, B.data()) || ork_mm_run(ctx->npu, w, M, A.data(), C.data())) {
+            if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ FAILED M=%d K=%d N=%d head(%lld,%lld)\n",
+                M, K, N, (long long)i2, (long long)i3);
+            ok = false; break; }
         for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
     }
-    return true;
+    ork_mm_free(ctx->npu, w);
+    return ok;
 }
 
 // 2b: attention softmax on the NPU. ggml GGML_OP_SOFT_MAX is soft_max_ext = softmax(scale*x + mask) per
@@ -4443,12 +5284,50 @@ static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_
 // (O, down), and CPU-delegate steps (norm/rope/residual) between them. This is the front-end the executor +
 // regcmd-precompile build on; here it just emits the plan (diagnostic, no execution change) so the segment
 // structure is verified on real graphs before the executor rewrites how they run.
+// ---- op-capability table: declarative, MEASURED heterogeneous placement / split / overlap -------------------
+// Per-op metadata driving the ork_spine dispatcher (data, not branches — cf. ork-driver's XSPEC + SoC caps).
+//   place   : the op's optimal unit, by MEASURED cost (tools/cpu_gemm_probe + tools/cpu_op_sweep, RK3588 2026-07-24).
+//   split   : if breakable across units, how (NONE everywhere — the CPU is only ~6% of NPU at int8 GEMM, so
+//             relocating matmul columns to the CPU has a ~1.06x ceiling: dead. No op is worth splitting today).
+//   overlap : an IDENTIFIED, MEASURED overlap opportunity (OVL_NONE everywhere — dense prefill is fused +
+//             latency-bound with no independent-work window; never auto-guessed, so it can't regress the fast path).
+// MEASURED PLACEMENT (why each row): matmul = NPU 345 vs CPU 20 GMAC/s (17x) at prefill, but M=1 DECODE -> CPU
+// (submit-bound, NPU no faster per-row). Standalone SDP/activation LUT ops (silu/gelu/rsqrt/exp) = ~106 ms/call
+// on the NPU (per-call LUT calibrate+load) vs ~0.1-19 ms CPU => ~1000x, decisively CPU. add/mul/norm/softmax/rope
+// = CPU (a submit round-trip or NEON-beatable). This CONFIRMS supports_op's current routing (matmul->NPU, rest
+// ->CPU) is optimal; the table records the measured WHY + guards against re-placing a submit-heavy op on the NPU.
+enum ork_place   { ORK_PLACE_CPU = 0, ORK_PLACE_NPU = 1, ORK_PLACE_EITHER = 2 };
+enum ork_split   { ORK_SPLIT_NONE = 0, ORK_SPLIT_NCOLS = 1, ORK_SPLIT_MROWS = 2 };
+enum ork_overlap { ORK_OVL_NONE = 0, ORK_OVL_RELOCATE_CPU = 1 };
+struct ork_op_cap { enum ork_place place; enum ork_split split; enum ork_overlap overlap; };
+
+static struct ork_op_cap ork_op_cap_for(const struct ggml_tensor * node) {
+    struct ork_op_cap c = { ORK_PLACE_CPU, ORK_SPLIT_NONE, ORK_OVL_NONE };
+    switch (node->op) {
+        case GGML_OP_MUL_MAT: case GGML_OP_MUL_MAT_ID:
+            c.place = (node->ne[1] > 1) ? ORK_PLACE_NPU : ORK_PLACE_CPU;   // prefill(M>1)->NPU; decode(M=1)->CPU
+            break;
+        // SDP / activation / norm / elementwise: measured CPU-optimal (NPU LUT-reload ~106ms or a submit floor).
+        case GGML_OP_UNARY: case GGML_OP_GLU: case GGML_OP_RMS_NORM: case GGML_OP_NORM:
+        case GGML_OP_SOFT_MAX: case GGML_OP_ROPE: case GGML_OP_MUL: case GGML_OP_ADD:
+        case GGML_OP_SCALE: case GGML_OP_FLASH_ATTN_EXT:
+            c.place = ORK_PLACE_CPU;
+            break;
+        default:   // metadata (NONE/RESHAPE/VIEW/…) + anything unmeasured -> CPU
+            c.place = ORK_PLACE_CPU;
+            break;
+    }
+    return c;
+}
+static const char * ork_place_name(enum ork_place p){ return p==ORK_PLACE_NPU?"NPU":p==ORK_PLACE_EITHER?"EITHER":"CPU"; }
+
 static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
     fprintf(stderr, "[ORK STATIC-PLAN] %d-node subgraph:\n", cgraph->n_nodes);
     int seg = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * n = cgraph->nodes[i];
         const char * nm = n->src[0] ? n->src[0]->name : "";
+        struct ork_op_cap cap = ork_op_cap_for(n);   // measured optimal placement (op-capability table)
         if (n->op == GGML_OP_MUL_MAT) {
             // look ahead for independent same-input siblings (the HW-chain group)
             int grp = 1;
@@ -4457,9 +5336,10 @@ static void ork_log_static_plan(struct ggml_cgraph * cgraph) {
                 if (nj->op == GGML_OP_MUL_MAT && nj->src[1] == n->src[1] && nj->src[0]->ne[0] == n->src[0]->ne[0]) grp++;
                 else break;
             }
-            fprintf(stderr, "  S%-2d  %-9s x%d  %-26s K=%ld N=%ld M=%ld  [%s]\n", seg++,
+            fprintf(stderr, "  S%-2d  %-9s x%d  %-26s K=%ld N=%ld M=%ld  opt=%s [%s]\n", seg++,
                     grp > 1 ? "HW-CHAIN" : "matmul", grp, nm,
                     (long) n->src[0]->ne[0], (long) n->ne[0], (long) n->ne[1],
+                    ork_place_name(cap.place),
                     grp > 1 ? "run_chain_i8" : "run_i8");
             i += grp - 1;
         } else if (n->op == GGML_OP_SOFT_MAX) {
@@ -4482,6 +5362,478 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
         (const float*)B->data,(const float*)C->data,
         (float*)dst->data,(float*)((char*)dst->data+s_off));
     return rc==0;
+}
+
+// GGML_OP_FLASH_ATTN_EXT -> fused attention on the NPU. Batched QK^T + A·V via the fused-multicore fp16
+// stream (ONE submit each for all heads — slashes the per-op submit floor that sank the per-op path),
+// softmax on CPU (scale+mask). Persistent scratch pool (no per-op bcreate/import -> no IOVA OOM). GQA-aware.
+// Materializes scores (mathematically == the online CPU flash form). nkv padded to %32 (pad cols masked out).
+// v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
+// the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
+// (ork_attn_pool / ork_attn_sm are defined above the context struct; the pool lives PER-CONTEXT in ctx->attnp.)
+static void attn_pool_free(ggml_backend_ork_context * ctx) {
+    ork_npu * c = ctx->npu;
+    struct ork_attn_pool * P = &ctx->attnp;
+    if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); if (P->wet && P->wet[h]) ork_mm_free(c, P->wet[h]); }
+    free(P->wqk); free(P->wav); free(P->wet); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->Oh16);
+    free(P->scores); free(P->outf); free(P->invS); free(P->tk);
+    *P = (struct ork_attn_pool){0};
+}
+static int attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int N, int nkvp, int H) {
+    ork_npu * c = ctx->npu;
+    struct ork_attn_pool * P = &ctx->attnp;
+    if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return 0;   // warm reuse
+    attn_pool_free(ctx);
+    P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*)); P->wet = (ork_w**)calloc(H, sizeof(ork_w*));
+    if (!P->wqk || !P->wav || !P->wet) { attn_pool_free(ctx); return -1; }
+    for (int h=0; h<H; h++) { P->wqk[h] = ork_mm_f16_scratch(c, DK, nkvp); P->wav[h] = ork_mm_f16_scratch(c, nkvp, DV);
+        P->wet[h] = ork_mm_f16_scratch(c, nkvp, N);   // transposed A·V weight = e^T[nkvp][N]
+        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; attn_pool_free(ctx); return -1; } }
+    P->Qf = (ork_f16*)malloc((size_t)H*N*DK*2); P->KT = (ork_f16*)malloc((size_t)H*DK*nkvp*2);
+    P->Vf = (ork_f16*)malloc((size_t)H*nkvp*DV*2); P->Pf = (ork_f16*)malloc((size_t)H*N*nkvp*2);
+    P->Oh16 = (ork_f16*)malloc((size_t)H*DV*N*2);
+    P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*DV*N*4);
+    P->invS = (float*)malloc((size_t)H*N*4);
+    P->tk = (ork_mm_task_f16*)malloc((size_t)H*sizeof(ork_mm_task_f16));
+    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(ctx); return -1; }
+    P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
+}
+// Resident-KV variant of the int8 decode attention (ORK_ATTN_KV): instead of packing K^T/V every call
+// (the O(nkv)/token repack tax that makes the default path perf-negative), pack ONCE per (layer, kv-head)
+// via ork_kv_resident_alloc, then append just the new key/value each token (ork_kv_append — one tile write,
+// no repack). Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Per-head int8
+// scales are FIXED at the first pack (appended keys reuse them — a v1 tradeoff: a later key that exceeds the
+// initial abs-max clips). The matmuls (QK^T, e.V) run against the resident weights; softmax stays host-fp.
+static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
+    const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv_pad=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    const int rk2 = H/Hkv, Kp=512, LmaxCap=2048;   // cap matches the supports_op gate (nkv<=2048); RK3588 nmax=8192
+    if (DK!=DV || DK>Kp || nkv_pad>LmaxCap || nkv_pad<1) return false;   // API bundles ONE HD for K^T & V; single N-tile
+    float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
+    ork_npu *c = ctx->npu;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    // k->ne[1] is the FULL/padded KV-cache width, NOT the live token count — it stays constant as generated
+    // tokens fill the cache, so "append when nkv grows" would never fire and the resident KV would go stale
+    // (the repack path dodges this by re-reading the whole cache every call). Derive the live count from the
+    // mask: valid keys have a finite mask value, padding/future keys are -inf. Valid region is contiguous
+    // [0,nkv) for causal decode. No mask -> assume the whole (padded) width is live.
+    int nkv = nkv_pad;
+    if (mask) {
+        auto mval = [&](int j) -> float { const char * p=(const char*)mask->data + (size_t)j*mask->nb[0];
+            return mask->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+        nkv = 0; for (int j=0;j<nkv_pad;j++) if (mval(j) > -1e30f) nkv = j+1;
+    }
+    if (nkv < 1 || nkv > LmaxCap) return false;
+    { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-kv] resident decode: live_nkv=%d (pad=%d) H=%d Hkv=%d DK=%d\n", nkv, nkv_pad, H, Hkv, DK); }
+    auto & LY = ctx->attn_kv[(const void*)k->data];
+    // ORK_ATTN_FUSED: run the whole attention core as Hkv fused chains fanned RR across cores in ONE orkd
+    // round-trip (vs the 2-submit QK^T + host-softmax + e.V path). Needs GLOBAL K/Q scales (the RR dispatch
+    // shares one exp LUT) + a resident ones[Lmax,32] reduce weight.
+    static int fused_env=-1; if(fused_env<0) fused_env=getenv("ORK_ATTN_FUSED")?1:0;
+    // (re)alloc on first touch, a sequence reset (cache shrank), a head-count change, OR growth past the
+    // current resident width. Lmax is sized to the live nkv rounded to a 512-chunk (NOT the 2048 cap) so the
+    // QK^T/e.V matmuls stream only ~nkv-wide weights (weight-DMA-bound) instead of always 2048 — growth
+    // re-packs all keys but only crosses a 512 boundary a few times over a full generation. Scales refreshed
+    // from the current [0,nkv) abs-max at each (re)pack so all keys quantize consistently.
+    if (LY.kv.empty() || nkv < LY.packed || LY.Hkv != Hkv || nkv > LY.Lmax || LY.fused != fused_env) {
+        for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r);
+        if (LY.ones) { ork_mm_free(c, LY.ones); LY.ones = nullptr; }
+        int Lm = (nkv+511)&~511; if (Lm < 32) Lm = 32; if (Lm > LmaxCap) Lm = LmaxCap;
+        LY.kv.assign(Hkv, nullptr); LY.ks.assign(Hkv, 1.0f); LY.vs.assign(Hkv, 1.0f);
+        LY.packed=0; LY.Lmax=Lm; LY.Hkv=Hkv; LY.DK=DK; LY.DV=DV; LY.fused=fused_env;
+        float kmax_g=1e-6f;
+        for (int hkv=0; hkv<Hkv; hkv++) {
+            LY.kv[hkv] = ork_kv_resident_alloc(c, DV, Lm);
+            if (!LY.kv[hkv]) { for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r); LY.kv.clear(); return false; }
+            float kmax=1e-6f, vmax=1e-6f;
+            for (int j=0;j<nkv;j++){ for(int e=0;e<DK;e++){ float a=fabsf(rdf(k,e,j,hkv,0)); if(a>kmax)kmax=a; }
+                                     for(int e=0;e<DV;e++){ float a=fabsf(rdf(v,e,j,hkv,0)); if(a>vmax)vmax=a; } }
+            LY.ks[hkv]=127.0f/kmax; LY.vs[hkv]=127.0f/vmax; if(kmax>kmax_g)kmax_g=kmax;   // vs stays per-head (host dequant)
+        }
+        if (fused_env) {   // GLOBAL K scale (shared exp LUT ⇒ qs·ks must be constant across chains) + resident ones[Lm,32]
+            float ksg=127.0f/kmax_g; for (int hkv=0; hkv<Hkv; hkv++) LY.ks[hkv]=ksg;
+            std::vector<int8_t> ones((size_t)Lm*32, 1); LY.ones=ork_mm_pack_i8(c, Lm, 32, ones.data());
+            if (!LY.ones) { for (ork_kv_resident * r : LY.kv) if (r) ork_kv_resident_free(c, r); LY.kv.clear(); return false; }
+        }
+    }
+    // per-stage timers (ORK_ATTN_PROF): where the decode-attention wall goes — append(+first-fill) / Q-quant /
+    // QK^T orkd submit / host softmax / e.V orkd submit. Answers pack-bound vs submit(round-trip)-bound.
+    static int aprof=-1; if(aprof<0) aprof=getenv("ORK_ATTN_PROF")?1:0;
+    static double a_app=0,a_qq=0,a_qk=0,a_sm=0,a_av=0; static long a_n=0,a_appk=0; double _pt;
+    // append newly-cached keys [packed, nkv) to each kv-head (1/step steady state; the whole prompt at first touch)
+    _pt = aprof?ork_now_us():0;
+    if (nkv > LY.packed) {
+        int8_t kcol[512], vrow[512];
+        for (int hkv=0; hkv<Hkv; hkv++) { float ks=LY.ks[hkv], vs=LY.vs[hkv];
+            for (int j=LY.packed; j<nkv; j++) {
+                for (int e=0;e<DK;e++) kcol[e]=(int8_t)lrintf(rdf(k,e,j,hkv,0)*ks);
+                for (int e=0;e<DV;e++) vrow[e]=(int8_t)lrintf(rdf(v,e,j,hkv,0)*vs);
+                if (ork_kv_append(c, LY.kv[hkv], j, kcol, vrow)) return false;
+                if (aprof) a_appk++;
+            } }
+        LY.packed = nkv;
+    }
+    if (aprof) a_app += ork_now_us()-_pt;
+    if (LY.fused && LY.ones) {
+        // ORK_ATTN_FUSED: fan the Hkv attention chains [QK^T→exp((s-bias))→reduce,e·V] across the NPU cores in
+        // ONE orkd round-trip. GLOBAL qs/ks ⇒ one shared exp LUT; in_scale/r_mult derived so score_i8·in_scale ==
+        // the true logit (scale·QK^T), so the exp curve is calibrated from known host scales (no data pass).
+        // max_bias keeps args ≤0 (int8 exp never saturates); padding keys [nkv,Lmax) have QK^T=0 ⇒ a constant
+        // e_pad subtracted from Σ (av is unaffected — padding V=0). Falls through to the 2-submit path on error.
+        const int Kp2=512, Nk=LY.Lmax, dv=DV, Nq=rk2;
+        float qmax_g=1e-6f; for(int h=0;h<H;h++) for(int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax_g)qmax_g=a; }
+        double qs=127.0/qmax_g, ks=LY.ks[0];
+        static double insc=-1, biasv=-1;
+        if(insc<0){ const char*e=getenv("ORK_ATTN_INSCALE"); insc=e?atof(e):0.0625; const char*b=getenv("ORK_ATTN_BIAS"); biasv=b?atof(b):127.0; }
+        double out_scale=1.0/127.0;
+        int r_shift=16; double F=(double)scale/(qs*ks)/insc;        // score_i8 = raw·F ⇒ score·insc = scale·QK^T
+        long rm=llround(F*(double)(1LL<<r_shift));
+        while(rm<64 && r_shift<30){ r_shift++; rm=llround(F*(double)(1LL<<r_shift)); }
+        while(rm>(1L<<22) && r_shift>2){ r_shift--; rm=llround(F*(double)(1LL<<r_shift)); }
+        if(rm<1)rm=1; int r_mult=(int)rm;
+        int8_t  *Qall =(int8_t*) calloc((size_t)Hkv*rk2*Kp2,1);
+        int32_t *ssall=(int32_t*)calloc((size_t)Hkv*rk2*32,4), *avall=(int32_t*)calloc((size_t)Hkv*rk2*dv,4);
+        std::vector<ork_w*> wkt(Hkv), wv(Hkv);
+        if (Qall && ssall && avall) {
+            for(int hkv=0;hkv<Hkv;hkv++){ wkt[hkv]=LY.kv[hkv]->wkt; wv[hkv]=LY.kv[hkv]->wv; }
+            for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; int8_t *dq=Qall+((size_t)hkv*rk2+qh)*Kp2;
+                for(int e=0;e<DK;e++) dq[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*(float)qs); }
+            _pt=aprof?ork_now_us():0;
+            int rc=ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                       r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
+            if(aprof) a_qk+=ork_now_us()-_pt;
+            if(rc==0){
+                double epad=exp((0.0-biasv)*insc)/out_scale; long ep=lround(epad); if(ep<0)ep=0; if(ep>127)ep=127;
+                long padc=(long)Nk-nkv;
+                for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; float vs=LY.vs[hkv];
+                    int32_t *ss=ssall+((size_t)hkv*rk2+qh)*32, *av=avall+((size_t)hkv*rk2+qh)*dv;
+                    double S=(double)ss[0]-(double)padc*ep; if(S<=0)S=1;
+                    for(int e=0;e<dv;e++) ((float*)dst->data)[(size_t)h*dv+e]=(float)((double)av[e]/((double)vs*S)); }
+                free(Qall);free(ssall);free(avall);
+                if(aprof){ a_n++; if(a_n%256==0) fprintf(stderr,"[ork-attn-fused] Hkv=%d Nq=%d Nk=%d r_mult=%d r_shift=%d in_scale=%.4f bias=%.0f\n",Hkv,Nq,Nk,r_mult,r_shift,insc,biasv); }
+                return true;
+            }
+            fprintf(stderr,"[ork-attn-fused] rr rc=%d -> fallback to 2-submit path\n", rc);
+        }
+        free(Qall);free(ssall);free(avall);   // fall through to the batched path (global ks is self-consistent there)
+    }
+    // BATCHED submits: all H heads' QK^T go in ONE ork_mm_run_chain_i8 (one orkd round-trip), then host
+    // softmax, then all H e.V in ONE chain. Collapses the 2*H per-head submits/layer -> 2 — the profiled
+    // 87% submit wall. Per-head buffers are contiguous [H][...]; GQA heads share their kv-head's resident wkt/wv.
+    int8_t  *Qp =(int8_t*) calloc((size_t)H*Kp,1),      *w8  =(int8_t*) calloc((size_t)H*LmaxCap,1);
+    int32_t *scores=(int32_t*)malloc((size_t)H*LmaxCap*4), *attv=(int32_t*)malloc((size_t)H*DV*4);
+    double  *sc =(double*)malloc((size_t)nkv*sizeof(double));
+    float   *qsA=(float*) malloc((size_t)H*4),          *wsA =(float*) malloc((size_t)H*4);
+    ork_mm_task_i8 *t1=(ork_mm_task_i8*)malloc((size_t)H*sizeof(ork_mm_task_i8));
+    ork_mm_task_i8 *t2=(ork_mm_task_i8*)malloc((size_t)H*sizeof(ork_mm_task_i8));
+    bool ok=false;
+    if (!Qp||!w8||!scores||!attv||!sc||!qsA||!wsA||!t1||!t2) goto done;
+    // Phase 1: quantize Q per head + build the QK^T task list
+    _pt=aprof?ork_now_us():0;
+    for (int h=0; h<H; h++) { int hkv=h/rk2;
+        float qmax=1e-6f; for (int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax)qmax=a; }
+        float qs=127.0f/qmax; qsA[h]=qs;
+        int8_t *Qh=Qp+(size_t)h*Kp; for (int e=0;e<DK;e++) Qh[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*qs);
+        t1[h]=(ork_mm_task_i8){LY.kv[hkv]->wkt,1,Qh,scores+(size_t)h*LmaxCap};
+    }
+    if(aprof){ a_qq+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    if (ork_mm_run_chain_i8(c, H, t1)) goto done;                     // ONE submit: all H QK^T
+    if(aprof){ a_qk+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    // Phase 2: host softmax per head (per-head max-subtraction) -> int8 weights + e.V task list
+    for (int h=0; h<H; h++) { int hkv=h/rk2; float qs=qsA[h], ks=LY.ks[hkv];
+        int32_t *sco=scores+(size_t)h*LmaxCap; int8_t *w=w8+(size_t)h*LmaxCap;
+        double mx=-1e300; for(int j=0;j<nkv;j++){ sc[j]=(double)sco[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
+        double Z=0; for(int j=0;j<nkv;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
+        double wmax=0; for(int j=0;j<nkv;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0); wsA[h]=(float)ws;
+        for(int j=0;j<nkv;j++){ int wi=(int)lrint(sc[j]*ws); w[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
+        t2[h]=(ork_mm_task_i8){LY.kv[hkv]->wv,1,w,attv+(size_t)h*DV};
+    }
+    if(aprof){ a_sm+=ork_now_us()-_pt; _pt=ork_now_us(); }
+    if (ork_mm_run_chain_i8(c, H, t2)) goto done;                     // ONE submit: all H e.V
+    if(aprof) a_av+=ork_now_us()-_pt;
+    // Phase 3: dequant + write
+    for (int h=0; h<H; h++) { float ws=wsA[h], vs=LY.vs[h/rk2]; int32_t *av=attv+(size_t)h*DV;
+        for(int e=0;e<DV;e++) ((float*)dst->data)[(size_t)h*DV+e]=(float)((double)av[e]/(ws*vs)); }
+    if (aprof) { a_n++; if (a_n%256==0) { double T=a_app+a_qq+a_qk+a_sm+a_av; if(T<1)T=1;
+        fprintf(stderr,"[ork-attn-kv PROF] layer-calls=%ld total-appends=%ld | append+fill %.0fms(%.0f%%) Qquant %.0fms(%.0f%%) QKT-submit %.0fms(%.0f%%) softmax %.0fms(%.0f%%) AV-submit %.0fms(%.0f%%) | attn-tot %.0fms\n",
+            a_n,a_appk, a_app/1e3,100*a_app/T, a_qq/1e3,100*a_qq/T, a_qk/1e3,100*a_qk/T, a_sm/1e3,100*a_sm/T, a_av/1e3,100*a_av/T, T/1e3); } }
+    ok=true;
+done:
+    free(Qp);free(w8);free(scores);free(attv);free(sc);free(qsA);free(wsA);free(t1);free(t2);
+    return ok;
+}
+// GGML_OP_FLASH_ATTN_EXT, DECODE (N==1) -> int8 attention on the NPU under orkd. The fp16 path above is
+// prefill-only (N>=64) and can't run under orkd (its scratch bcreate needs a direct fd). This fills the decode
+// gap: per query head, QK^T and the weighted e.V run int8 on the NPU (via the orkd-routed matmul), the [1,nkv]
+// softmax runs in fp on the HOST (real per-head max-subtraction -> correct for arbitrary scores). Opt-in
+// ORK_ATTN_DEC; gated to nkv in [256, 2048] (int8 0x1040 sched floor .. single-N-tile). v1 packs K^T/V per call
+// (perf-negative — the resident-KV append via ork_kv_* is the next step); this proves orkd-native decode
+// attention is COHERENT first. Returns true on success (supports_op guarantees the shape is handled).
+static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2];
+    const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    const int rk2 = H/Hkv, Kp=512, Lp=(nkv+511)&~511;
+    if (DK>Kp || Lp>2048) return false;
+    { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-dec] NPU decode attention engaged (call %ld): H=%d Hkv=%d DK=%d DV=%d nkv=%d\n", n, H, Hkv, DK, DV, nkv); }
+    // ORK_ATTN_KV: resident-KV (pack-once + append/token) — the perf path. ORK_ATTN_KV_REPACK forces the
+    // per-call repack below (default) for A/B. Resident needs DK==DV (the ork_kv_* API bundles one HD).
+    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : (getenv("ORK_ATTN_KV") ? 1 : 0);
+    if (kv_res && DK==DV) return ggml_backend_ork_flash_attn_decode_kv(ctx, dst);
+    float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
+    ork_npu *c = ctx->npu;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    int8_t *Qp=(int8_t*)calloc((size_t)Kp,1), *KTp=(int8_t*)calloc((size_t)Kp*Lp,1),
+           *Vp=(int8_t*)calloc((size_t)Lp*DV,1), *w8=(int8_t*)calloc((size_t)Lp,1);
+    int32_t *scores=(int32_t*)malloc((size_t)Lp*4), *attv=(int32_t*)malloc((size_t)DV*4);
+    double *sc=(double*)malloc((size_t)Lp*sizeof(double));
+    bool ok=false;
+    if (!Qp||!KTp||!Vp||!w8||!scores||!attv||!sc) goto done;
+    for (int h=0; h<H; h++) { int hkv=h/rk2;
+        float qmax=1e-6f,kmax=1e-6f,vmax=1e-6f;
+        for (int e=0;e<DK;e++){ float a=fabsf(rdf(q,e,0,h,0)); if(a>qmax)qmax=a; }
+        for (int j=0;j<nkv;j++){ for(int e=0;e<DK;e++){ float a=fabsf(rdf(k,e,j,hkv,0)); if(a>kmax)kmax=a; }
+                                 for(int e=0;e<DV;e++){ float a=fabsf(rdf(v,e,j,hkv,0)); if(a>vmax)vmax=a; } }
+        float qs=127.0f/qmax, ks=127.0f/kmax, vs=127.0f/vmax;
+        for (int e=0;e<DK;e++){ Qp[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*qs); for(int j=0;j<nkv;j++) KTp[(size_t)e*Lp+j]=(int8_t)lrintf(rdf(k,e,j,hkv,0)*ks); }
+        ork_w *wkt=ork_mm_pack_i8(c,Kp,Lp,KTp); if(!wkt) goto done;
+        ork_mm_task_i8 t1={wkt,1,Qp,scores}; int rc=ork_mm_run_chain_i8(c,1,&t1); ork_w_free(wkt); if(rc) goto done;
+        double mx=-1e300; for(int j=0;j<nkv;j++){ sc[j]=(double)scores[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
+        double Z=0; for(int j=0;j<nkv;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
+        double wmax=0; for(int j=0;j<nkv;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0);
+        for(int j=0;j<nkv;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
+        for(int j=0;j<nkv;j++)for(int e=0;e<DV;e++) Vp[(size_t)j*DV+e]=(int8_t)lrintf(rdf(v,e,j,hkv,0)*vs);
+        ork_w *wv=ork_mm_pack_i8(c,Lp,DV,Vp); if(!wv) goto done;
+        ork_mm_task_i8 t2={wv,1,w8,attv}; rc=ork_mm_run_chain_i8(c,1,&t2); ork_w_free(wv); if(rc) goto done;
+        for(int e=0;e<DV;e++) ((float*)dst->data)[(size_t)h*DV+e]=(float)((double)attv[e]/(ws*vs));
+    }
+    ok=true;
+done:
+    free(Qp);free(KTp);free(Vp);free(w8);free(scores);free(attv);free(sc);
+    return ok;
+}
+static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    if ((int)dst->src[0]->ne[1] == 1) return ggml_backend_ork_flash_attn_decode(ctx, dst);   // decode -> int8 orkd path
+    const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
+    const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Bt=(int)q->ne[3];
+    const int nkv=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+    float scale=1.0f,max_bias=0.0f,softcap=0.0f;
+    memcpy(&scale,(char*)dst->op_params+0,4); memcpy(&max_bias,(char*)dst->op_params+4,4); memcpy(&softcap,(char*)dst->op_params+8,4);
+    if (max_bias!=0.0f || softcap!=0.0f) return false;                 // v1: no ALiBi / softcap
+    if (Hkv<1 || H%Hkv) return false;
+    const int rk2 = H/Hkv;
+    const int nkvp = (nkv+31)&~31;                                     // pad KV to %32 for the fp16 stream (K%32/N%16)
+    if (DK%32 || DV%16) return false;
+    if (attn_pool_ensure(ctx, DK, DV, N, nkvp, H)) return false;
+    struct ork_attn_pool * P = &ctx->attnp;
+    auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
+        const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
+        return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
+    static int prof=-1; if(prof<0) prof = getenv("ORK_ATTN_PROF")?1:0;   // per-stage timing for the bottleneck flow chart
+    static double a_dqk=0,a_qk=0,a_sm=0,a_dv=0,a_av=0,a_sc=0; static long a_calls=0; double _t;
+    static double a_smp=0,a_smq=0,a_sme=0,a_smr=0,a_smn=0;                // softmax sub-steps: prep / quant / exp-NPU / reduce-NPU / normalize
+    // PER-CONTEXT softmax scratch (was function-`static` -> aliased into ctx->attn_sm so concurrent ork
+    // backends don't share it). References keep the 42 downstream sm_* uses byte-identical + warm-reused.
+    int16_t *&sm_xi=ctx->attn_sm.xi, *&sm_ei=ctx->attn_sm.ei; float *&sm_mx=ctx->attn_sm.mx, *&sm_ss=ctx->attn_sm.ss; ork_f16 *&sm_e=ctx->attn_sm.e; size_t &sm_cap=ctx->attn_sm.cap;
+    int8_t *&sm_q8=ctx->attn_sm.q8; size_t &sm_cap2=ctx->attn_sm.cap2; int8_t *sm_maxq=ctx->attn_sm.maxq;   // int8 scores + per-row max for on-NPU max-reduce
+    ork_f16 *&sm_invf=ctx->attn_sm.invf; int &sm_invf_n=ctx->attn_sm.invf_n;   // fp16 1/Σ per-head vector for the transposed per-channel normalize
+    ork_w *&sm_ones=ctx->attn_sm.ones; int &sm_ones_n=ctx->attn_sm.ones_n;               // reduce-matmul weight ones[nkvp,16] for the on-NPU Sigma
+    for (int b=0; b<Bt; b++) {
+        // (1) densify per-head fp16 operands + QK^T weights (K^T), batched submit -> scores_h[N,nkvp] f32
+        _t=ork_now_us();
+        for (int h=0; h<H; h++) { int hkv=h/rk2;
+            ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp;
+            for (int m=0;m<N;m++)  for (int e=0;e<DK;e++) Qh[(size_t)m*DK+e]=(ork_f16)rdf(q,e,m,h,b);
+            for (int e=0;e<DK;e++) for (int j=0;j<nkvp;j++) KTh[(size_t)e*nkvp+j]=(j<nkv)?(ork_f16)rdf(k,e,j,hkv,b):(ork_f16)0.0f;
+            if (ork_mm_repack_f16(ctx->npu,P->wqk[h],DK,nkvp,KTh)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wqk[h],N,Qh,P->scores+(size_t)h*N*nkvp}; }
+        if(prof) a_dqk+=ork_now_us()-_t;
+        const char *dbg_e = getenv("ORK_ATTN_CPU"); const int dbg_cpu = dbg_e ? atoi(dbg_e) : 0;   // bit0=QK^T on CPU, bit1=A·V on CPU
+        _t=ork_now_us();
+        if (dbg_cpu & 1) { for (int h=0;h<H;h++){ ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp; float *sc=P->scores+(size_t)h*N*nkvp;
+            for (int m=0;m<N;m++) for (int j=0;j<nkvp;j++){ float a=0; for (int e=0;e<DK;e++) a+=(float)Qh[(size_t)m*DK+e]*(float)KTh[(size_t)e*nkvp+j]; sc[(size_t)m*nkvp+j]=a; } } }
+        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        if(prof) a_qk+=ork_now_us()-_t;
+        // (2) softmax. Default = FUSED softmax-on-NPU chain: scale+mask+max (CPU prep) -> quantize (CPU)
+        // -> exp on the NPU (ork_npu_exp_i16, ONE batched SDP submit over all H*N rows, in-line between
+        // the QK^T and A·V fp16 matmuls = in-chain precision swap) -> sum+normalize (CPU). ORK_ATTN_SM_CPU=1
+        // forces the CPU-softmax path instead. Sub-step timers exposed under ORK_ATTN_PROF.
+        static int sm_npu=-1; if(sm_npu<0) sm_npu = getenv("ORK_ATTN_SM_CPU")?0:1;
+        static int tnorm=-1; if(tnorm<0) tnorm = getenv("ORK_ATTN_TNORM_OFF")?0:1;  // transposed on-NPU normalize (A·V transposed + per-channel 1/Σ)
+        int tnorm_ok=0;
+        _t=ork_now_us();
+        if (sm_npu) {
+            const int MR=H*N; const size_t NB=(size_t)MR*nkvp;
+            if (sm_cap < NB) { free(sm_xi); free(sm_ei); free(sm_mx); free(sm_e); free(sm_ss);
+                sm_xi=(int16_t*)malloc(NB*2); sm_ei=(int16_t*)malloc(NB*2); sm_mx=(float*)malloc((size_t)MR*4);
+                sm_e=(ork_f16*)malloc(NB*2); sm_ss=(float*)malloc(NB*4); sm_cap=NB; }
+            // 2a: scale+mask into scores; per-row max ON NPU (ork_npu_row_max_i8, coarse int8 => softmax
+            // max-invariant so exact-enough); then global min-delta lo. ORK_ATTN_MAX_CPU=1 forces CPU max.
+            static int max_npu=-1; if(max_npu<0) max_npu = getenv("ORK_ATTN_MAX_CPU")?0:1;
+            double _p=ork_now_us(); float lo=0.0f; const int MR2=H*N;
+            // pass 1: scale+mask into scores (mask is data-dependent -> CPU)
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) {
+                const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
+                float *sc=P->scores+(size_t)h*N*nkvp;
+                for (int m=0;m<N;m++){ const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
+                    for (int j=0;j<nkv;j++) sc[(size_t)m*nkvp+j]=scale*sc[(size_t)m*nkvp+j]+(mp?(float)mp[j]:0.0f); }
+            }
+            int have_npu_max=0;
+            if (max_npu && MR2<=8192) {                          // per-row max on the NPU (coarse int8)
+                if (sm_cap2 < NB) { free(sm_q8); sm_q8=(int8_t*)malloc(NB); sm_cap2=NB; }
+                int8_t *maxq=sm_maxq;                             // MR2<=8192
+                #pragma omp parallel for schedule(static)
+                for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; int8_t *q=sm_q8+(size_t)r*nkvp;
+                    for (int j=0;j<nkv;j++){ float s=sc[j]; q[j]=(int8_t)(s<-127.f?-128:s>127.f?127:(int)lrintf(s)); }
+                    for (int j=nkv;j<nkvp;j++) q[j]=-128; }
+                if (ork_npu_row_max_i8(ctx->npu, sm_q8, MR2, nkvp, maxq, NULL)==0){
+                    for (int r=0;r<MR2;r++) sm_mx[r]=(float)maxq[r]; have_npu_max=1; }
+            }
+            if (!have_npu_max) {                                 // CPU max fallback (batch too big, or forced)
+                #pragma omp parallel for schedule(static)
+                for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; float mx=-INFINITY;
+                    for (int j=0;j<nkv;j++) if(sc[j]>mx)mx=sc[j]; sm_mx[r]=mx; }
+            }
+            // global min-delta lo (for the exp int16 quant scale)
+            #pragma omp parallel for schedule(static) reduction(min:lo)
+            for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; float mx=sm_mx[r];
+                for (int j=0;j<nkv;j++){ float d=sc[j]-mx; if(d<lo)lo=d; } }
+            if(prof) a_smp+=ork_now_us()-_p;
+            double in_scale=(-lo)/32000.0; if(in_scale<=0) in_scale=1e-6; double out_scale=1.0/32000.0;
+            // 2b: quantize (x-max) -> int16; masked/pad cols -> -32768 (exp ~ 0)
+            double _q=ork_now_us();
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int m=0;m<N;m++){ float *sc=P->scores+((size_t)h*N+m)*nkvp; int16_t *xi=sm_xi+((size_t)h*N+m)*nkvp; float mx=sm_mx[(size_t)h*N+m];
+                for (int j=0;j<nkv;j++){ long qv=lround((sc[j]-mx)/in_scale); if(qv<-32768)qv=-32768; if(qv>32767)qv=32767; xi[j]=(int16_t)qv; }
+                for (int j=nkv;j<nkvp;j++) xi[j]=-32768; }
+            if(prof) a_smq+=ork_now_us()-_q;
+            // 2c: exp on the NPU (single batched SDP submit, in-chain between the two matmuls)
+            double _e=ork_now_us();
+            int erc = ork_npu_exp_i16(ctx->npu, sm_xi, MR, nkvp, in_scale, out_scale, sm_ei, NULL);
+            if(prof) a_sme+=ork_now_us()-_e;
+            // 2c2: Sigma over the row ON the NPU via reduce-matmul e . ones[nkvp,16] (sum in col 0).
+            // Everything-on-NPU: exp (SDP) -> sum (reduce-matmul) both on device; only max (2a) + the
+            // per-row divide (2d) remain CPU. ORK_ATTN_SM_SUMCPU=1 keeps the sum on CPU for A/B.
+            static int sumnpu=-1; if(sumnpu<0) sumnpu = getenv("ORK_ATTN_SM_SUMCPU")?0:1;
+            int rrc=-1;
+            if(!erc && sumnpu){
+                if(sm_ones_n!=nkvp){ if(sm_ones) ork_mm_free(ctx->npu,sm_ones);
+                    ork_f16 *on=(ork_f16*)malloc((size_t)nkvp*16*2); for(size_t i=0;i<(size_t)nkvp*16;i++) on[i]=(ork_f16)1.0f;
+                    sm_ones=ork_mm_pack(ctx->npu,nkvp,16,on); free(on); sm_ones_n=nkvp; }
+                double _r=ork_now_us();
+                // exp output ei (int16) -> fp16 e for the reduce matmul; pad cols already ~0 (exp of -32768)
+                #pragma omp parallel for schedule(static)
+                for (size_t i=0;i<(size_t)MR*nkvp;i++) sm_e[i]=(ork_f16)((double)sm_ei[i]*out_scale);
+                if(sm_ones) rrc = ork_mm_run(ctx->npu, sm_ones, MR, sm_e, sm_ss);   // sm_ss[MR,16], col0 = Sigma
+                if(prof) a_smr+=ork_now_us()-_r;
+            }
+            // 2d: normalize -> Pf (pad cols 0). Sigma from NPU reduce (sm_ss) if it ran, else CPU sum.
+            double _n=ork_now_us();
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int m=0;m<N;m++){ size_t r=(size_t)h*N+m; float *sc=P->scores+r*nkvp; int16_t *ei=sm_ei+r*nkvp; ork_f16 *Ph=P->Pf+r*nkvp; float mx=sm_mx[r];
+                double sum;
+                if(!rrc){ sum=sm_ss[r*16]; for (int j=0;j<nkv;j++) sc[j]=(float)((double)ei[j]*out_scale); }        // Sigma on NPU
+                else if(!erc){ sum=0; for (int j=0;j<nkv;j++){ double e=(double)ei[j]*out_scale; sc[j]=(float)e; sum+=e; } } // exp NPU, sum CPU
+                else { sum=0; for (int j=0;j<nkv;j++){ float e=expf(sc[j]-mx); sc[j]=e; sum+=e; } }                  // full CPU fallback
+                float inv=(sum>0)?1.0f/(float)sum:0.0f;
+                P->invS[r]=inv;                                    // for the transposed on-NPU normalize (1/Σ per query)
+                for (int j=0;j<nkv;j++)  Ph[j]=(ork_f16)(sc[j]*inv);
+                for (int j=nkv;j<nkvp;j++) Ph[j]=(ork_f16)0.0f; }
+            if(prof) a_smn+=ork_now_us()-_n;
+            tnorm_ok = tnorm && !erc && !rrc;   // transposed path needs unnormalized exp (sm_e) + Σ (sm_ss) from NPU
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) {
+                const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
+                float *sc=P->scores+(size_t)h*N*nkvp; ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp;
+                for (int m=0;m<N;m++) {
+                    const ork_f16 * mp = mbase ? (const ork_f16*)(mbase + (size_t)m*mask->nb[1]) : nullptr;
+                    float mx=-INFINITY;
+                    for (int j=0;j<nkv;j++){ float s=scale*sc[(size_t)m*nkvp+j] + (mp?(float)mp[j]:0.0f); sc[(size_t)m*nkvp+j]=s; if(s>mx)mx=s; }
+                    float sm=0; for (int j=0;j<nkv;j++){ float e=expf(sc[(size_t)m*nkvp+j]-mx); sc[(size_t)m*nkvp+j]=e; sm+=e; }
+                    float inv=(sm>0)?1.0f/sm:0.0f;
+                    for (int j=0;j<nkv;j++)  Ph[(size_t)m*nkvp+j]=(ork_f16)(sc[(size_t)m*nkvp+j]*inv);
+                    for (int j=nkv;j<nkvp;j++) Ph[(size_t)m*nkvp+j]=(ork_f16)0.0f;
+                }
+            }
+        }
+        if(prof) a_sm+=ork_now_us()-_t;
+        if (tnorm_ok) {
+          // (3T) TRANSPOSED A·V: Ô[DV][N] = V^T[DV][nkvp] · e^T[nkvp][N] (queries become the output channel);
+          // weight = e^T (repack per head, from unnormalized exp sm_e), activation = V^T (densified transposed).
+          _t=ork_now_us();
+          for (int h=0; h<H; h++) { int hkv=h/rk2;
+            ork_f16 *VT=P->Vf+(size_t)h*DV*nkvp;                                 // V^T[DV][nkvp] activation
+            for (int d=0;d<DV;d++) for (int j=0;j<nkvp;j++) VT[(size_t)d*nkvp+j]=(j<nkv)?(ork_f16)rdf(v,d,j,hkv,b):(ork_f16)0.0f;
+            ork_f16 *eT=P->Pf+(size_t)h*N*nkvp, *es=sm_e+(size_t)h*N*nkvp;        // reuse Pf slot as e^T[nkvp][N]
+            for (int j=0;j<nkvp;j++) for (int m=0;m<N;m++) eT[(size_t)j*N+m]=es[(size_t)m*nkvp+j];
+            if (ork_mm_repack_f16(ctx->npu,P->wet[h],nkvp,N,eT)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wet[h],DV,VT,P->outf+(size_t)h*DV*N}; } // C[DV][N] = Ô
+          if(prof) a_dv+=ork_now_us()-_t;
+          _t=ork_now_us();
+          if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+          if(prof) a_av+=ork_now_us()-_t;
+          // (3.5) on-NPU per-channel normalize Ô[d][m]*=(1/Σ)[m]. BATCHED across heads into ONE submit:
+          // lay Ô as [DV][H*N] (channel = head*N+query) so a single per-channel scale by invS[H*N] does all
+          // heads. Falls back to per-head when H*N exceeds the op limits (>8192 or not %8).
+          double _sn=ork_now_us();
+          const int HN=H*N; const int batch=(HN<=8192 && (HN&7)==0);
+          if (batch) {
+            if (sm_invf_n < HN) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)HN*2); sm_invf_n=HN; }
+            #pragma omp parallel for schedule(static)
+            for (int d=0; d<DV; d++) for (int h=0;h<H;h++) for (int m=0;m<N;m++)
+              P->Oh16[(size_t)d*HN + (size_t)h*N + m] = (ork_f16)P->outf[(size_t)h*DV*N + (size_t)d*N + m];
+            for (int h=0;h<H;h++) for (int m=0;m<N;m++) sm_invf[(size_t)h*N+m]=(ork_f16)P->invS[(size_t)h*N+m];
+            if (ork_npu_mul_perchan_f16(ctx->npu,P->Oh16,sm_invf,DV,HN,P->Oh16,NULL)) return false;  // ONE submit, all heads
+          } else {
+            if (sm_invf_n < N) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)N*2); sm_invf_n=N; }
+            for (int h=0; h<H; h++) { float *o=P->outf+(size_t)h*DV*N; ork_f16 *o16=P->Oh16+(size_t)h*DV*N;
+              for (size_t i=0;i<(size_t)DV*N;i++) o16[i]=(ork_f16)o[i];
+              for (int m=0;m<N;m++) sm_invf[m]=(ork_f16)P->invS[(size_t)h*N+m];
+              if (ork_npu_mul_perchan_f16(ctx->npu,o16,sm_invf,DV,N,o16,NULL)) return false; }
+          }
+          if(prof) a_smn+=ork_now_us()-_sn;
+          // (4T) scatter: dst(d,h,m,b) = Ô_norm  (layout depends on batch vs per-head)
+          _t=ork_now_us();
+          if (batch) {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
+              ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)d*HN + (size_t)h*N + m];
+          } else {
+            #pragma omp parallel for schedule(static)
+            for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
+              ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)h*DV*N + (size_t)d*N + m];
+          }
+        } else {
+        // (3) A·V: densify V weights, batched submit -> out_h[N,DV] f32
+        _t=ork_now_us();
+        for (int h=0; h<H; h++) { int hkv=h/rk2; ork_f16 *Vh=P->Vf+(size_t)h*nkvp*DV;
+            for (int j=0;j<nkvp;j++) for (int e=0;e<DV;e++) Vh[(size_t)j*DV+e]=(j<nkv)?(ork_f16)rdf(v,e,j,hkv,b):(ork_f16)0.0f;
+            if (ork_mm_repack_f16(ctx->npu,P->wav[h],nkvp,DV,Vh)) return false;
+            P->tk[h]=(ork_mm_task_f16){P->wav[h],N,P->Pf+(size_t)h*N*nkvp,P->outf+(size_t)h*N*DV}; }
+        if(prof) a_dv+=ork_now_us()-_t;
+        _t=ork_now_us();
+        if (dbg_cpu & 2) { for (int h=0;h<H;h++){ ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp, *Vh=P->Vf+(size_t)h*nkvp*DV; float *o=P->outf+(size_t)h*N*DV;
+            for (int m=0;m<N;m++) for (int e=0;e<DV;e++){ float a=0; for (int j=0;j<nkvp;j++) a+=(float)Ph[(size_t)m*nkvp+j]*(float)Vh[(size_t)j*DV+e]; o[(size_t)m*DV+e]=a; } } }
+        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        if(prof) a_av+=ork_now_us()-_t;
+        // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
+        _t=ork_now_us();
+        #pragma omp parallel for schedule(static)
+        for (int h=0; h<H; h++) for (int m=0;m<N;m++) for (int e=0;e<DV;e++)
+            ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+e] = P->outf[(size_t)h*N*DV + (size_t)m*DV + e];
+        }
+        if(prof) a_sc+=ork_now_us()-_t;
+    }
+    if(prof){ a_calls++; fprintf(stderr,
+        "[attnprof] calls=%ld  dqk=%.0f qk=%.0f | SM=%.0f [prep=%.0f quant=%.0f exp-NPU=%.0f red-NPU=%.0f norm=%.0f] | dv=%.0f av=%.0f sc=%.0f  total=%.0f ms | NPU(qk+av+exp+red)=%.0f CPU=%.0f\n",
+        a_calls, a_dqk/1e3,a_qk/1e3, a_sm/1e3, a_smp/1e3,a_smq/1e3,a_sme/1e3,a_smr/1e3,a_smn/1e3, a_dv/1e3,a_av/1e3,a_sc/1e3,
+        (a_dqk+a_qk+a_sm+a_dv+a_av+a_sc)/1e3, (a_qk+a_av+a_sme+a_smr)/1e3, (a_dqk+a_smp+a_smq+a_smn+a_dv+a_sc)/1e3); }
+    return true;
 }
 
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -4541,23 +5893,32 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
     // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
     const bool fuse_force = getenv("ORK_FUSE") != nullptr;
+    // orkd: group fusion is daemon-routed — it packs a CONCATENATED weight via ork_mm_pack_i8 and runs it as
+    // ONE ork_mm_run_i8 (host A/C), so it works through the daemon AND amortizes the per-matmul submit floor
+    // (q/k/v, gate/up -> 1 submit). Enabled under orkd.
     const int  fuse = (ctx->qbits == 8) && !getenv("ORK_NO_FUSE");
     // FUSED FFN chain (gate+SiLU, up, GLU, down). The fused per-tensor gate (fc.wg) is packed as an import
     // co-resident in its own layer's domain (ork_pack_pt_f32), so it works at ANY domain count — single
     // domain (<=4GiB) or many (>4GiB), gate/up/down naturally sharing their layer's domain. Just needs int8.
-    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8;
+    // orkd: the FFN SwiGLU chain stays disabled — it uses fd-local run_i8_silu / run_f16_silu + the GU_CHAIN
+    // DMA scratch (not daemon-routed). The generic MUL_MAT chain (below) IS routed and stays on.
+    const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;
+    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8 && ctx->via_orkd;   // decode FFN via fused orkd chain
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
     if (getenv("ORK_DUMP_GRAPH")) { static int dumped = 0;
-        bool has_ffn = false, has_glu = false;
+        // ORK_LAYER_SPINE recon: dump the FULL assigned span (op + this-node name + src0/src1 names) so the
+        // whole-layer matcher can be written against the real runtime graph and its fragmentation seen.
+        int cap = getenv("ORK_DUMP_ALL") ? 200 : 40;
+        bool has_ffn = getenv("ORK_DUMP_ALL") ? true : false, has_glu = false;
         for (int i = 0; i < cgraph->n_nodes; i++) { struct ggml_tensor * n = cgraph->nodes[i];
             if (n->op == GGML_OP_GLU) has_glu = true;
             if (n->src[0] && (strstr(n->src[0]->name,"ffn_gate")||strstr(n->src[0]->name,"ffn_down"))) has_ffn = true; }
         if ((has_ffn || has_glu) && dumped++ < 3) {
-            fprintf(stderr, "[ORK GRAPH] FFN subgraph, %d nodes (has_ffn=%d has_glu=%d):\n", cgraph->n_nodes, has_ffn, has_glu);
-            for (int i = 0; i < cgraph->n_nodes && i < 40; i++) { struct ggml_tensor * n = cgraph->nodes[i];
-                fprintf(stderr, "  [%2d] %-12s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op),
+            fprintf(stderr, "[ORK GRAPH] span %d nodes (has_ffn=%d has_glu=%d):\n", cgraph->n_nodes, has_ffn, has_glu);
+            for (int i = 0; i < cgraph->n_nodes && i < cap; i++) { struct ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "  [%2d] %-12s %-18s src0=%-28s src1=%-20s ne=[%ld,%ld]\n", i, ggml_op_name(n->op), n->name[0]?n->name:"-",
                         n->src[0]?n->src[0]->name:"-", n->src[1]?n->src[1]->name:"-", (long)n->ne[0], (long)n->ne[1]);
             } fflush(stderr); } }
     // Step 1 (ORK_SCAN_AHEAD): gather INDEPENDENT same-input matmuls that graph order interleaves with movable
@@ -4569,6 +5930,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (scan_ahead && !sa_done.empty() && sa_done.count(node)) continue;   // computed early by a scan-ahead group
+        // ORK_FFN_DEC: DECODE (M==1) SwiGLU inner via the fused orkd chain (one submit against the resident
+        // weights). Fires at the gate node; the matcher takes up from glu->src[1] and consumes glu/down.
+        if (ffn_dec && ctx->via_orkd && node->op == GGML_OP_MUL_MAT && node->src[0] &&
+            strstr(node->src[0]->name, "ffn_gate") && node->ne[1] == 1) {
+            struct ggml_tensor *g,*u,*gl,*dn; int last;
+            if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last) &&
+                ggml_backend_ork_ffn_decode_orkd(ctx, g, u, gl, dn)) { i = last; continue; }
+        }
         // ORK_FFN_CHAIN: recognize the fused-SwiGLU FFN inner and run it as ONE round-trip-free int8 chain
         // (int8 intermediates never touch fp32). Consumes all 4 nodes; falls through to per-node on any miss.
         if (ffn_chain && node->op == GGML_OP_MUL_MAT) {
@@ -4613,6 +5982,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 // STREAM-POOL mode handles each MUL_MAT individually (the per-node int8 path is
                 // stream-pool-aware; the multi-weight chain handler is not — it needs distinct weights
                 // co-resident under allow_evict=false, which the RAM/IOVA tiering can't guarantee).
+                // (orkd: the MUL_MAT chain is routed — ork_resolve_weight_i8 + ork_dispatch_i8 dispatch it
+                // through the daemon's run_chain_i8 / run_i8, so it stays enabled.)
                 if (ctx->spool) type = ORK_CHAIN_NONE;
 
                 if (type != ORK_CHAIN_NONE && node->ne[2] == 1 && node->ne[3] == 1) {
@@ -4776,6 +6147,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (!ggml_backend_ork_ssm_scan(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
+            case GGML_OP_FLASH_ATTN_EXT: {
+                if (!ggml_backend_ork_flash_attn_ext(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                break;
+            }
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
@@ -4794,6 +6169,42 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     } }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
+}
+
+// ---- ASYNC CROSS-STREAM SUBMIT PATH (opt-in; nothing calls these unless a consumer/harness does) ----
+// The RKNPU is single-stream (one hardware command queue), so two streams' NPU submits must serialize — but a
+// stream's CPU work overlaps another stream's NPU work for FREE (measured hidden~100%, ork-driver overlap_prof).
+// These let a driver run one context's NPU graph on a worker thread while the launching thread does other work
+// (e.g. a speculative draft's routing/sampling), then join. g_npu_queue_mu serializes the NPU across contexts;
+// the plain (synchronous) graph_compute does NOT take it, so the default make-test path is unchanged.
+static std::mutex g_npu_queue_mu;
+
+extern "C" enum ggml_status ggml_backend_ork_synchronize(ggml_backend_t backend) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight) {
+        if (ctx->async_thr.joinable()) ctx->async_thr.join();          // join = full memory barrier
+        ctx->async_inflight = false;
+    }
+    return ctx->async_status;
+}
+
+extern "C" void ggml_backend_ork_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
+    if (ctx->async_inflight) ggml_backend_ork_synchronize(backend);    // one in-flight job per backend
+    ctx->async_inflight = true;
+    ctx->async_status   = GGML_STATUS_SUCCESS;
+    ctx->async_thr = std::thread([backend, cgraph, ctx]() {
+        // The NPU worker (matmul dispatch + quant/dequant) belongs on the big cores; without this it would
+        // INHERIT the launcher's affinity, so a launcher pinned elsewhere would drag the whole matmul onto
+        // slow cores. ORK_ASYNC_BIG pins it to the A76 cluster (RK3588: cores 4-7) so a concurrent CPU stream
+        // pinned to the little cores runs on disjoint cores (the core-partitioning path to free overlap).
+        if (getenv("ORK_ASYNC_BIG")) {
+            cpu_set_t s; CPU_ZERO(&s); for (int c = 4; c < 8; c++) CPU_SET(c, &s);
+            pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
+        }
+        std::lock_guard<std::mutex> lk(g_npu_queue_mu);                // single hardware queue: serialize NPU
+        ctx->async_status = ggml_backend_ork_graph_compute(backend, cgraph);
+    });
 }
 
 static struct ggml_backend_i ork_backend_i = {
@@ -4840,10 +6251,43 @@ ggml_backend_t ggml_backend_ork_init(void) {
         GGML_LOG_INFO("%s: load config: silu=%s, dflash=%s\n", __func__,
                       g_ork_cfg_silu_int8fused ? "int8-fused(through)" : "int16-coherent", g_ork_cfg_dflash ? "on" : "off");
     }
+    // orkd is the DEFAULT NPU path: the daemon owns the single-stream NPU and serializes every submit, so
+    // concurrent processes can't wedge the IOMMU (a dev-time safety property, not a separate architecture).
+    // ork_npu_init() activates the orkd CLIENT via these env vars (the daemon itself sets ORKD_IS_DAEMON, which
+    // we never do here). The lib (direct) path is behaviorally IDENTICAL to orkd — same op set + shapes, proven
+    // by test_api_parity and the direct-vs-orkd A/B — differing only in transport; orkd just adds the socket +
+    // single-stream serialization. ORK_DIRECT=1 opts into the in-process lib path (single-process runs /
+    // profiling, where the daemon's serialization isn't needed and the socket round-trips aren't wanted).
+    const bool want_direct = getenv("ORK_DIRECT") != nullptr;
+    if (!want_direct) {
+        setenv("ORK_USE_ORKD", "1", 1);   // FORCE (overwrite) so nothing silently drops orkd mode back to direct
+        setenv("ORK_ORKD_RING", "1", 1);  // the low-latency decode transport async ork_mm_submit/collect ride
+    } else {
+        // In-process direct mode shares the 4 big cores with llama.cpp's compute threadpool (-t 4). Pinning the
+        // NPU-driver worker threads to those same cores (the default) OVERSUBSCRIBES them against the threadpool
+        // and drags prefill (measured: 136 -> 213 t/s at M=228, i.e. faster than orkd's 168 once unpinned). orkd
+        // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
+        // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
+        setenv("ORK_NO_AFFINITY", "1", 0);
+    }
     ork_npu * npu = ork_npu_init();
     if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
+    // In the DEFAULT (orkd) mode, direct-NPU is not a silent fallback: if the daemon didn't connect
+    // (missing/unspawnable ORKD_BIN, socket refused) the routing would silently drop to the single-stream direct
+    // path mid-load — the footgun the orkd migration removes. Fail loudly so a misconfigured daemon is caught at
+    // load, not as a mid-run IOMMU wedge. When ORK_DIRECT=1 the direct path is the DELIBERATE choice, so allow it.
+    if (!want_direct && !ork_npu_uses_orkd(npu)) {
+        GGML_LOG_ERROR("%s: NOT routed through orkd (daemon connect failed) — check ORKD_BIN points at the orkd "
+                       "binary and it is spawnable, or set ORK_DIRECT=1 to deliberately use the in-process lib "
+                       "path (single-stream: do not run concurrent NPU processes).\n", __func__);
+        ork_npu_free(npu);
+        return NULL;
+    }
+    if (want_direct)
+        GGML_LOG_INFO("%s: ORK_DIRECT=1 — in-process lib NPU path (no orkd daemon; single-stream, no concurrent NPU procs)\n", __func__);
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
+    ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // always true here (init hard-fails above otherwise) — gates the orkd-routed weight/matmul path
     g_ork_ctx = ctx;
     ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
     // (b) load the persisted gmax sidecar (<ORK_PERSIST>.gmax) if present: a known model's per-layer gate
@@ -4860,6 +6304,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
     if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
+    ctx->slice_route = getenv("ORK_SLICE_ROUTE") != nullptr && !ctx->via_orkd;   // wide int8 via sliced doorbell (fd-local only)
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
     // Hadamard engages under global int4 (ORK_QUANT=4) OR per-tensor mixed W4A4 (ORK_MIXED_DISPATCH +
     // ORK_MIXED_W4A4): both route the 4-bit tier to mul_mat_i4_hadamard (per-channel, single submit, the
@@ -4874,16 +6319,18 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // Bf costs the chain nothing. Set BEFORE the domain sizing below (which now honors NO_BF). Opt out with
     // ORK_KEEP_BF=1; an explicit ORK_NO_BF (either value) also wins.
     if (ork_ffn_chain_on() && !getenv("ORK_KEEP_BF") && !getenv("ORK_NO_BF")) setenv("ORK_NO_BF", "1", 1);
-    // MULTI-DOMAIN RESIDENCE: ORK_DOMAINS>1 spreads weights across that many IOMMU domains (each with its
-    // own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. ORK_DOMAIN_LAYERS
-    // sets layers-per-domain (0 = auto from a 28-layer assumption). Pass a large ORK_WCACHE_BUDGET_MB so the
-    // residence never evicts.
-    { const char * nd = getenv("ORK_DOMAINS");
-      if (nd) {                                                  // explicit override (debug/pinning)
-          ctx->n_domains = atoi(nd);
-          if (ctx->n_domains < 1)  ctx->n_domains = 1;
-          if (ctx->n_domains > 16) ctx->n_domains = 16;
-      } else if (!ctx->persist_idx.empty()) {
+    // MULTI-DOMAIN RESIDENCE: weights spread across as many IOMMU domains as the AUTO-SIZER computes (each
+    // with its own ~4 GiB IOVA window) so a >4 GiB model stays fully resident with NO streaming/churn. The
+    // domain count is auto-only (no ORK_DOMAINS env, no fixed cap); ORK_DOMAIN_LAYERS is a manual layout knob.
+    // Pass a large ORK_WCACHE_BUDGET_MB so the residence never evicts.
+    {
+      // The auto-sizer below is the SOLE authority for the IOMMU domain count — computed from the resident
+      // orkpack footprint. The old ORK_DOMAINS env override is gone (it was only ever a clamp-UP escape hatch
+      // for an auto UNDER-count; the under-count root cause — unbudgeted fused-group weights + missing orkd
+      // domain ownership — is fixed, so the auto count is trustworthy). There is NO fixed domain cap: the
+      // driver arrays grow dynamically (ork_npu_set_ndomains) and the daemon hands out up to its 64-bit
+      // owned_dom width. ORK_DOMAIN_LAYERS remains a manual layer->domain LAYOUT knob (default 0 = auto).
+      if (!ctx->persist_idx.empty()) {
           // AUTO from .orkpack footprint: sum the int8 blob bytes, inflate for the resident Bb+Bf footprint,
           // and size to the 3.0 GiB per-domain fill cap (matches ork_weight_domain). A model that fits one
           // 4 GiB domain -> n_domains=1 (the single-domain FAST PATH — and the regime the fused FFN chain
@@ -4903,8 +6350,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
           //   W8A8 (qbits==8): int8 tile K*N  (also the resident form for Q4_K/q4_0 sources — the i4a8 storage
           //                    path INFLATES their nibbles to int8; that's why we size from K*N, not the blob).
           //   W4A4 (qbits==4): native int4 tile K*N/2 (nibbles resident, DT_I4).
-          // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). FUSION adds NO volume: the fused
-          // per-tensor gate (fc.wg) REPLACES the per-channel gate 1:1. MEASURED (int8): 7B = 12.26 GiB resident.
+          // Plus a full-K Bf rebuild (another tile for K<=4096, ~all weights). ORK_FFN_CHAIN: the fused
+          // per-tensor gate (fc.wg, ork_pack_pt_f32) COEXISTS with the per-channel gate — ork_ffn_prep
+          // deliberately does NOT evict it (freeing mid-eval fragments the 32-bit IOVA -> import ENOMEM ->
+          // wedge). So fc.wg ADDS a K*Nff int8 tile + its full-K Bf per ffn_gate; it is packed FRESH at
+          // runtime and is NOT in persist_idx, so the loop below must add it explicitly or the byte-balanced
+          // domains have no room -> the runtime fc.wg pack overflows -> OOM (load) / re-pack churn (JIT). (The
+          // old "fc.wg REPLACES the gate 1:1, adds no volume" belief was stale — the code keeps both.)
+          // MEASURED (int8): 7B non-chain = 12.26 GiB resident.
           // ORK_FFN_F16: the FFN gate/up/down may run the fp16 route, whose buffers (resident fp16 tile =
           // 2*K*N, no Bf; or the JIT shared scratch + per-mode-switch Cc realloc) are NOT part of the int8
           // footprint below. Left unaccounted, they overflow near-full domains and a mid-forward alloc
@@ -4912,6 +6365,7 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // fp16 delta per FFN weight so auto-sizing leaves IOVA HEADROOM. gmax subset is unknown at init ->
           // assume all FFN layers (worst case; JIT over-counts but that's safe slack).
           const bool f16route = getenv("ORK_FFN_F16") != nullptr;
+          const bool chain    = ork_ffn_chain_on() && ctx->qbits == 8;   // packs a coexisting per-tensor fc.wg per ffn_gate
           const bool no_bf = getenv("ORK_NO_BF") != nullptr;   // NO_BF sheds the full-K Bf rebuild -> don't size for it
           size_t inflated = 0;
           for (const auto & kv : ctx->persist_idx) {
@@ -4923,13 +6377,19 @@ ggml_backend_t ggml_backend_ork_init(void) {
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
                   inflated += (size_t) 2 * K * N;                      // fp16 tile headroom (no Bf)
+              // ORK_FFN_CHAIN: the fused per-tensor gate fc.wg (packed fresh at runtime, NOT in persist_idx)
+              // coexists with the per-channel gate — add its int8 tile + full-K Bf per ffn_gate so the domains
+              // are sized to hold it (else the runtime fc.wg pack overflows -> OOM/churn — the multi-domain
+              // 7B chain bug). Same tile shape as the gate itself (ork_pack_pt_f32 K*Nff, K<=4096 -> has Bf).
+              if (chain && kv.first.find("ffn_gate") != std::string::npos)
+                  inflated += tile + ((K <= 4096 && !no_bf) ? tile : 0);
           }
           // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
           // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
           // (~2.7 GiB observed) — keep each domain's byte-balanced fill well clear of that edge.
           const size_t cap = (size_t) 2500 * 1024 * 1024;
           long nd = (long) ((inflated + cap - 1) / cap);
-          ctx->n_domains = nd < 1 ? 1 : (nd > 16 ? 16 : (int) nd);
+          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // no small cap; 63 = the system's owned_dom bitmask ceiling (~155 GiB, beyond any RK3588)
           if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
           if (getenv("ORK_VERBOSE"))
               fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom, byte-balanced) from %.2f GiB resident footprint\n",
@@ -4940,23 +6400,47 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
           ctx->n_domains = 8;
       }
-      // ORK_DOMAIN_LAYERS: explicit override ONLY. domain_layers stays 0 (its default) unless set — the auto
-      // branch above sizes domains by byte-balanced fill (ork_weight_domain), NOT layer-alignment, so there is
-      // no computed value to preserve. Guard on `dl` (don't `= dl ? atoi(dl) : 0`) so an unset var can't clobber
-      // an explicit ORK_DOMAIN_LAYERS that a caller set for per-domain fusion experiments.
+      // ORK_DOMAIN_LAYERS: explicit LAYOUT override ONLY (layers-per-domain). domain_layers stays 0 (its
+      // default) unless set — the auto branch sizes by byte-balanced fill (ork_weight_domain), not layer
+      // alignment. Guard on `dl` so an unset var can't clobber an explicit value set for a fusion experiment.
       const char * dl = getenv("ORK_DOMAIN_LAYERS"); if (dl) ctx->domain_layers = atoi(dl); }
+    // Pre-size the driver's per-domain arrays to the auto-sized count (grows on demand otherwise; this just
+    // avoids a mid-load realloc). The driver has NO fixed domain cap — the count is whatever we computed above.
+    ork_npu_set_ndomains(ctx->npu, ctx->n_domains);
+    // ORKD DOMAIN OWNERSHIP (the multi-domain 7B OOM fix). Under orkd the daemon REJECTS any pack/import into a
+    // domain the client does not OWN (handle_import → "domain not owned by client"), so a weight the auto-sizer
+    // placed in logical domain 1..n_domains-1 fails to import, the client ork_domain_advance()s through the rest,
+    // and residency collapses into domain 0 only (measured: 7B loaded ~2 GiB/dom then OOM at layer ~10, vs direct
+    // mode's 2.53 GiB × 5 = full model). So ACQUIRE ownership of each non-zero logical domain up front. The
+    // daemon's dom_alloc_explicit hands out contiguous ids 1,2,3,… to a fresh client ⇒ physical == logical, no
+    // remap needed; warn if that breaks (multi-client / pool exhaustion). Direct mode owns every domain implicitly.
+    if (ctx->via_orkd && ctx->n_domains > 1) {
+        for (int d = 1; d < ctx->n_domains; d++) {
+            int got = ork_npu_domain_alloc(ctx->npu);
+            if (got != d)
+                fprintf(stderr, "[ork] WARNING: orkd domain acquire: logical %d -> physical %d (non-contiguous or pool exhausted); "
+                                "multi-domain residency may still reject — a single fresh client should map 1:1\n", d, got);
+            else if (getenv("ORK_VERBOSE"))
+                fprintf(stderr, "[ork] orkd: acquired domain %d\n", got);
+        }
+    }
     // Residency = ork-driver's MULTI-DOMAIN mechanism (weights resident across up to 16 IOMMU domains,
     // each its own ~4 GiB IOVA window; dom_activate zero-copy-swaps the active domain per submit). This
     // resides up to ~64 GiB with no streaming — every practical model. The stream pool (RAM-hold + dma-buf
     // map/unmap) is only needed BEYOND that; leave it off (NULL) so the domain path is used.
     ctx->spool = nullptr;
     fprintf(stderr, "[ork] residency: multi-domain (up to %d domains x ~4 GiB IOVA, dom_activate swap)\n", ctx->n_domains);
+    // orkd routing (ork-driver >=1.0.0): every NPU submit routes through the orkd daemon (serialized — the
+    // safe way to share the single-stream NPU; direct concurrent access wedges the IOMMU). This is the
+    // committed path — init already hard-failed above if the daemon didn't connect — so ork_npu_uses_orkd()
+    // is true here; report it for the run log.
+    fprintf(stderr, "[ork] routing: orkd daemon (serialized) + shm ring\n");
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
     fprintf(stderr, "[ork] ork-driver %s (W%dA%d%s)\n", ork_npu_version(),
             ctx->qbits, ctx->qbits, ctx->hadamard ? "+Had" : "");
-    GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, %sW%dA%d%s)\n", __func__, ork_npu_version(),
+    GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, orkd %sW%dA%d%s)\n", __func__, ork_npu_version(),
                   ctx->hybrid ? "Hybrid " : "",
                   ctx->qbits, ctx->qbits,
                   ctx->hadamard ? "+Hadamard" : "");
@@ -5098,6 +6582,36 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
 static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
     if (ork_off) return false;
+    // orkd: only MUL_MAT is daemon-routed (ork_mm_pack_i8 + ork_mm_run_i8). The other NPU ops here — MoE
+    // (MUL_MAT_ID), attention (SOFT_MAX/FLASH_ATTN), SDP activations (GLU/UNARY/MUL/ADD), SSM_SCAN — run on
+    // fd-local primitives (run_i8_silu, doorbell, dom_activate, DMA scratch) that break when the daemon owns
+    // the NPU. Decline them so ggml keeps them on the CPU backend (correct; they are all opt-in/experimental
+    // and default-off anyway). Routing these through orkd is the follow-on. MUL_MAT + the metadata ops
+    // (NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE) fall through to the normal per-op logic below.
+    if (g_ork_ctx && g_ork_ctx->via_orkd) {
+        switch (op->op) {
+            case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT:
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                // task #20: the int8 DECODE attention path (ggml_backend_ork_flash_attn_decode) is
+                // orkd-routed (ork_mm_run_chain_i8 / ork_mm_pack_i8), unlike the fp16 prefill path and the
+                // other fd-local primitives this gate declines. Let it through ONLY under ORK_ATTN_DEC so
+                // the real FLASH_ATTN_EXT case below applies the full decode gate (N==1 + shape). Off by
+                // default: without ORK_ATTN_DEC this still declines to CPU, preserving orkd safety.
+                if (getenv("ORK_ATTN_DEC")) break;
+                return false;
+            case GGML_OP_GLU:
+                // ORK_FFN_DEC: the fused DECODE FFN chain (ggml_backend_ork_ffn_decode_orkd) needs the SwiGLU
+                // node in the ORK split so the matcher keeps the gate/up/glu/down subgraph whole. The node's
+                // own compute is consumed (skipped) by the chain; it only needs to be scheduled to ORK.
+                if (getenv("ORK_FFN_DEC")) break;
+                return false;
+            default:
+                return false;
+        }
+    }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     switch (op->op) {
@@ -5119,8 +6633,10 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                     // dynamic KV-cache operand fall into the int8 static-weight resolve path (which packs it
                     // as a weight -> "not in orkpack" slow live-convert) NOR into the M=1 in-graph A·V wedge.
                     // Decode attention is a CPU path anyway (decode-is-cpu-path); the parity target is prefill.
+                    // NOTE: contiguity NOT required — the bmm handler gathers permuted/non-contig operands
+                    // via nb[] strides (rds). This is the densify unblock: real QK^T/A·V read permuted-Q /
+                    // non-contig KV-cache views that ggml_is_contiguous previously declined.
                     return M > 1 && K % 32 == 0 && N % 16 == 0
-                        && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
                         && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)
                         && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
                 }
@@ -5198,7 +6714,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // CONVERT/WRITE mode (persist_mode==2) MUST keep M=1 on the NPU: the .orkpack build is a single
             // 1-token (M=1) forward that packs every weight, so declining M=1 there would pack ZERO weights
             // and produce no .orkpack for >4GiB models. Only SERVING (read/off) routes multi-domain M=1 to CPU.
-            if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1 || g_ork_ctx->persist_mode == 2)) threshold = 1;
+            // CONVERT/WRITE (persist_mode==2) MUST keep M=1 on NPU (packs every weight). For SERVING,
+            // single-domain M=1-on-NPU is submit-floor-bound and LOSES to CPU on MoE models — profiled on
+            // LFM2.5/Qwen3.6-35B: ~1440 M=1 run_i8 submits/decode = 82% of run time, decode 14/6.16 vs ggml
+            // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
+            // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
+            if (target_qbits == 8 && g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;
+            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) && env_enabled("ORK_M1_NPU")) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
             // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
@@ -5207,6 +6729,16 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             {
                 static const int pe = env_enabled("ORK_MOE_PHASE_EVICT");
                 if (pe && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
+            }
+            // ORK_FFN_DEC: admit the DECODE (M==1) FFN gate/up/down to the NPU so the whole gate/up/GLU/down
+            // subgraph is ONE contiguous ORK split (a CPU-side up would fragment it and the matcher couldn't
+            // span the splits). The gate-anchored matcher fuses all 4 (i=last skips up/GLU/down — up never
+            // runs standalone). Scoped by weight name so other decode matmuls (attention proj) stay on CPU.
+            if (getenv("ORK_FFN_DEC") && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
+                op->ne[2] == 1 && op->ne[3] == 1 && src0->name &&
+                (strstr(src0->name, "ffn_gate") || strstr(src0->name, "ffn_up") || strstr(src0->name, "ffn_down"))) {
+                const char * mn = getenv("ORK_FFN_DEC_MIN");   // diagnostic: only fire FFN-dec for layer >= MIN
+                if (!mn || ork_layer_of(src0->name) >= atoi(mn)) return true;
             }
             bool pass_m_threshold = (M >= threshold || (M > 1 && (op->ne[2] > 1 || op->ne[3] > 1)));
 
@@ -5325,7 +6857,9 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GLU: {
             // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
             // ORK_FFN_CHAIN also needs GLU on ork so the FFN's 4 nodes land in one ork subgraph (fused there).
-            if (!ork_ppu_glu_on() && !ork_ffn_chain_on()) return false;
+            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !getenv("ORK_FFN_DEC")) return false;
+            { const char * mn = getenv("ORK_FFN_DEC_MIN");   // match the FFN-matmul layer gate (src0=gate MM node -> its weight)
+              if (mn && src0 && src0->src[0] && ork_layer_of(src0->src[0]->name) < atoi(mn)) return false; }
             if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
             if (!src0 || !src1) return false;                        // split form only (two inputs)
             if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
@@ -5337,7 +6871,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // FFN's gate/up/GLU/down land in ONE ork subgraph and the chain matcher can fuse them — otherwise
             // the 7B's Nff=18944 GLU is rejected, the scheduler splits the FFN across backends, and the 4
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
-            if (ork_ffn_chain_on()) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
+            if (ork_ffn_chain_on() || getenv("ORK_FFN_DEC")) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         case GGML_OP_SSM_SCAN: {
@@ -5356,6 +6890,27 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             if (nc%32 || nr%16 || nh%ng) return false;
             if (ssm_force < 0 && nh < 64) return false;   // AUTO: small Mamba-2 (nh<64 ≈ <1.5B) stays on CPU
             for (int k=0;k<6;k++) if (op->src[k] && !ggml_is_contiguous(op->src[k])) return false;
+            return true;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // NPU attention. PREFILL (N>=64): fp16 batched QK^T+A·V, opt-in ORK_ATTN. DECODE (N==1): int8 path
+            // on the NPU under orkd, opt-in ORK_ATTN_DEC (the fp16 path is prefill-only + can't run under orkd).
+            const struct ggml_tensor *q=op->src[0],*k=op->src[1],*v=op->src[2];
+            if (!q||!k||!v || op->src[4]) return false;              // src[4]=sinks -> CPU (v1)
+            float max_bias=0.0f, softcap=0.0f;
+            memcpy(&max_bias,(char*)op->op_params+4,4); memcpy(&softcap,(char*)op->op_params+8,4);
+            if (max_bias!=0.0f || softcap!=0.0f) return false;      // v1: no ALiBi / softcap
+            const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
+            const int nkv=(int)k->ne[1];
+            { static int nq=0; if (getenv("ORK_ATTN_DEC") && nq++ < 8) fprintf(stderr,"[ork-fa-supp] FLASH_ATTN_EXT queried: N=%d nkv=%d DK=%d DV=%d Hkv=%d\n", N, nkv, DK, DV, Hkv); }
+            if (Hkv<1 || H%Hkv || DK%32 || DV%16) return false;
+            if (N == 1) {                                            // DECODE -> int8 orkd path (ggml_backend_ork_flash_attn_decode)
+                if (getenv("ORK_ATTN_DEC") == nullptr) return false;
+                if (DK > 512 || nkv < 256 || ((nkv+511)&~511) > 2048) return false;  // sched floor .. single-N-tile
+                return true;
+            }
+            if (getenv("ORK_ATTN") == nullptr) return false;
+            if (N < 64) return false;                                // prefill only
             return true;
         }
         default:

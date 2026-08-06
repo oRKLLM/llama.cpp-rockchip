@@ -32,6 +32,7 @@ Before committing any changes, review whether the changes warrant documentation 
 * If you add, remove, or rename features, configuration variables, API endpoints, or workflows -> update the relevant documentation.
 * Minor bug fixes and test-only changes typically do not require extensive doc updates, but always verify.
 * The goal is to keep the documentation reflecting reality in real-time so that future contributors and agents do not have to reverse-engineer recent changes.
+* **NPU op work:** before RE'ing, re-fixing, or building on any NPU op/chain/FFN handler (in `ggml/src/ggml-ork/` or the sibling `ork-driver`), consult **`ork-driver/OPS_REGISTRY.md`** — the probe-anchored index of which ops are `PROVEN`/`PARTIAL`/`DEAD`/`WIP`. It exists to stop re-deriving solved (or known-dead) paths. Changing an op's behavior means re-running its probe and updating its registry row in the same commit.
 
 ---
 
