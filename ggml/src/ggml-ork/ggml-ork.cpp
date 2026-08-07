@@ -53,8 +53,16 @@
 //                        CPU baseline for A/B benchmarks.
 //   (QKV/gate-up group fusion is DEFAULT-ON for M>=2 (ORK_FUSE_MINM): +11% @M2 .. +17% @M64, bit-exact,
 //    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
-//   ORK_QUANT=4          EXPERIMENTAL. int4 W4A4 instead of int8 (incoherent; research only).
-//   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated int4 path (with ORK_QUANT=4).
+//   ORK_QUANT=4          int4: compact int4 STORAGE + W8A8-inflate compute on the NPU (route B — int4 weights
+//                        inflate int4->int8 and run on the robust int8 kernel; coherent, no wedge). The win is the
+//                        .orkpack STORAGE (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4
+//                        (single-row, wedge-prone at prefill) is OPT-IN via ORK_MIXED_W4A4 / ORK_HADAMARD.
+//                        *** RECOMMENDED int4 setup: build the orkpack from the model's UNQUANTIZED (F16/F32/BF16)
+//                        GGUF — the NF4 codebook is then auto-selected (best fidelity; building from an already-
+//                        quantized source is warned and falls back to the lossier uniform int4). Measured Qwen3-1.7B
+//                        @ P=128 (RK3588): NF4-from-F16 = 215 tok/s prefill / 6.77 decode (edges the int8 ref ~178)
+//                        vs uniform-from-Q8 = 172 / 2.96. So: F16 source -> ORK_QUANT=4 -> compact NF4 .orkpack. ***
+//   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated NATIVE W4A4 path (opt-in; prefill wedge-prone).
 //   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
 //                        (q4) sources onto the NPU (instead of CPU) and pick the compute path per tensor by
 //                        source precision. Default: 4-bit tier computes W8A8 (dequant q4->int8, fast +
