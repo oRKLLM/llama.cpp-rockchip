@@ -31,6 +31,14 @@ GGML_BACKEND_API void                ggml_backend_ork_set_hybrid(bool use_hybrid
 //   dflash:                            enable the speculative block-diffusion drafter (off by default).
 GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflash, bool silu_int8_fused);
 
+// ---- .orkpack auto-persist helper ----
+// Returns true iff a usable .orkpack exists at `path` for THIS build: present, footer magic + schema version
+// match, and the ork-driver pack-compat token (ork_pack_format_version) matches — i.e. a read-mode load would
+// succeed with no re-conversion. Returns false when absent OR stale (a tiling/quant change bumped the token).
+// A tool/frontend uses this to decide whether to run a one-time build pass (which packs + writes the .orkpack)
+// BEFORE timing, so the measured run always reads a prebuilt pack instead of JIT-packing into the hot path.
+GGML_BACKEND_API bool                ggml_backend_ork_orkpack_valid(const char * path);
+
 // ---- Async cross-stream submit path ----
 // Run this backend's NPU graph on a worker thread: the launch returns immediately so the caller can do CPU
 // work (e.g. a speculative draft's routing/sampling) while the NPU crunches; synchronize joins and returns the

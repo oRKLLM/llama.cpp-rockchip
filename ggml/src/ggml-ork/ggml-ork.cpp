@@ -163,19 +163,33 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 4u   // v4 adds bf_size to each entry (the full-K Bf blob stored right after the Bb blob,
-                             // so the orkd import maps Bf directly — no runtime rebuild); v3 adds ork_fmt.
+#define ORKPACK_VERSION 5u   // v5 adds quant_sig (build-config precision signature) to the footer; v4 adds bf_size
+                             // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
 struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; };
-// ork_fmt = ork_pack_format_version() at write time. A tile-layout / quant change bumps ork-driver's
-// MAJOR version, so a stored ork_fmt != this build's => the tiled bytes are incompatible; the file is
-// rejected on read and regenerated (the read path falls through to write mode). magic stays last so it
-// remains the final 8 bytes of the file regardless of footer growth.
-struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; char magic[8]; };
+// The footer is the pack's self-describing header metadata (EXIF-style): validation keys on it, NOT the filename.
+//   ork_fmt   = ork_pack_format_version() at write — a tile-layout/quant MAJOR change bumps it => tiled bytes incompatible.
+//   quant_sig = ork_build_sig() at write — the build-config PRECISION signature (forced ORK_QUANT + hybrid + hadamard).
+//               The same (K,N) tensor packs to DIFFERENT bytes under int4 vs int8, and ork_fmt does NOT distinguish
+//               them, so a stored quant_sig != this run's => wrong precision, file rejected + regenerated. The .q4/.q8
+//               filename is only a convenience so both can coexist on disk; THIS field is the authoritative guard.
+// magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
+struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig; char magic[8]; };
+
+// Build-config precision signature stored in the footer (see above). Env-derived so the standalone validity check
+// (pre-init, no ctx) and the write path compute it identically. Encodes the knobs that change PACKED CONTENT:
+// forced quant precision (ORK_QUANT), hybrid split (ORK_HYBRID), hadamard rotation (ORK_HADAMARD).
+static uint32_t ork_build_sig(void) {
+    const char * q = getenv("ORK_QUANT");
+    uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
+    uint32_t hy = (getenv("ORK_HYBRID")   != nullptr) ? 1u : 0u;
+    uint32_t hd = (getenv("ORK_HADAMARD") != nullptr) ? 1u : 0u;
+    return (qb & 0xffu) | (hy << 8) | (hd << 9);
+}
 
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
 // Evicting those mmap'd pages keeps the source's RSS shrinking as packed RSS grows (peak ~max(src,packed)
@@ -682,6 +696,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // (write mode is a one-time offline step — generate the .orkpack in a direct-NPU run, then run under orkd).
     const char * p = getenv("ORK_PERSIST");
     if (!p || !*p) return;
+    bool stale = false;   // present-but-incompatible pack seen -> regenerate + delete the old sidecar
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
         off_t sz = lseek(fd, 0, SEEK_END);
@@ -706,13 +721,20 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 // change bumps ork-driver's MAJOR version). Same-(K,N) blobs from an incompatible major
                 // are the SAME size, so this token is the only thing that catches them.
                 bool magic_ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
-                if (magic_ok && f.version != ORKPACK_VERSION)          // older footer schema (pre-v3, no token)
+                if (magic_ok && f.version != ORKPACK_VERSION) {        // older footer schema (pre-v3, no token)
                     fprintf(stderr, "[ORK PERSIST] %s predates the pack-compat token (footer < v%u) — regenerating\n", p, ORKPACK_VERSION);
-                else if (magic_ok && f.ork_fmt != ork_pack_format_version())   // v3 file, but tiling/quant major differs
+                    stale = true;
+                } else if (magic_ok && f.ork_fmt != ork_pack_format_version()) {  // v3 file, but tiling/quant major differs
                     fprintf(stderr, "[ORK PERSIST] %s is stale (pack-compat token %u != this build's %u) — regenerating\n",
                             p, f.ork_fmt, ork_pack_format_version());
+                    stale = true;
+                } else if (magic_ok && f.quant_sig != ork_build_sig()) {          // right format, but a DIFFERENT precision/config
+                    fprintf(stderr, "[ORK PERSIST] %s was built for a different precision/config (quant_sig %u != this run's %u) — regenerating\n",
+                            p, f.quant_sig, ork_build_sig());
+                    stale = true;
+                }
                 if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
-                    f.ork_fmt == ork_pack_format_version() && f.index_off < (uint64_t) sz) {
+                    f.ork_fmt == ork_pack_format_version() && f.quant_sig == ork_build_sig() && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
@@ -733,9 +755,39 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // Bb + ork_w_dump_bf_i8_cpu for Bf) from the live-converted raw int8 — no resident NPU tile, no daemon. So a
     // missing/stale .orkpack self-heals: this run rebuilds it (one-time), future runs READ + import it.
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
+    // Stale pack: the fresh one is written to <p>.tmp and atomically rename()'d over the old <p> at finalize
+    // (create-new-then-replace-old, crash-safe). The <p>.gmax sidecar is NOT covered by that rename, so delete
+    // the stale one now — it belongs to the old pack and will be rewritten at free.
+    if (stale) { std::string sc = std::string(p) + ".gmax"; unlink(sc.c_str()); }
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
-        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] building %s (one-time conversion this run)\n", ctx->persist_tmp.c_str()); }
+        // Unconditional (not ORK_VERBOSE-gated): building the pack packs weights INLINE this run, so this run's
+        // speed is unrepresentative. Applies to every frontend that hits a missing/stale pack (llama-cli/server/
+        // oRKLLM build it at load-time warmup; ork_bench builds it in a dedicated untimed pass). Warn + advise rerun.
+        fprintf(stderr,
+            "[ORK PERSIST] orkpack absent/stale -> BUILDING %s this run (one-time).\n"
+            "              WARNING: weights are packed inline, so this run's performance/benchmark timing is SKEWED\n"
+            "              and not representative. Re-run once the pack is built for true steady-state numbers.\n",
+            ctx->persist_final.c_str()); }
+}
+
+// Public helper (see ggml-ork.h): does a usable .orkpack exist at `path` for this build? Mirrors the READ-mode
+// validation in ork_persist_init (magic + footer schema + ork-driver pack-compat token) without mapping the whole
+// file — just the footer. Lets a tool run a one-time build pass before timing when this returns false.
+extern "C" bool ggml_backend_ork_orkpack_valid(const char * path) {
+    if (!path || !*path) return false;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = false;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz > (off_t) sizeof(orkpack_footer) && lseek(fd, sz - (off_t) sizeof(orkpack_footer), SEEK_SET) >= 0) {
+        orkpack_footer f;
+        if (read(fd, &f, sizeof f) == (ssize_t) sizeof f)
+            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+                 f.ork_fmt == ork_pack_format_version() && f.quant_sig == ork_build_sig() && f.index_off < (uint64_t) sz;
+    }
+    close(fd);
+    return ok;
 }
 
 // Effective bits-per-weight for a source ggml_type (mirrors tools/gguf_tier_map.c's table). <0 = unknown.
@@ -883,7 +935,7 @@ static const float * ork_imatrix_lookup(const char * name, int K) {
 //
 // int4 needs K%32==0 && N%32==0; tensors that don't satisfy it stay int8 regardless. Returns 4 or 8.
 static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_type) {
-    static int init = 0, i4_ffn = 0, from_src = 1; static long i4_above_bytes = -1;
+    static int init = 0, i4_ffn = 0, from_src = 1, q4_force = 0; static long i4_above_bytes = -1;
     if (!init) {
         init = 1;
         const char * a = getenv("ORK_ORKPACK_I4_ABOVE_MB");
@@ -891,8 +943,11 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
         i4_ffn = getenv("ORK_ORKPACK_I4_FFN") ? 1 : 0;
         const char * fs = getenv("ORK_ORKPACK_TIER_FROM_SRC");   // default ON; "0" disables
         if (fs && fs[0] == '0' && fs[1] == '\0') from_src = 0;
+        const char * q = getenv("ORK_QUANT");                    // ORK_QUANT=4: force compact i4a8 STORAGE for every
+        if (q && q[0] == '4') q4_force = 1;                       // eligible tensor (compute stays W8A8-inflate on the NPU)
     }
     if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
+    if (q4_force) return 4;                                // ORK_QUANT=4 forces int4 storage regardless of source type
 
     // (A0) external tier map (ORK_ORKPACK_TIERMAP) — wins over source-type so an fp16 source can
     // inherit a Q4_K_M's allocation by name. A mapped int4 still respects the shape constraint above.
@@ -943,32 +998,51 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
                               const int8_t * bi_i8 = nullptr) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
+    // Quality NOTE (once per build): quantizing an ALREADY-QUANTIZED source compounds error, and the NF4
+    // codebook can't recover it (it fits the ORIGINAL weight distribution). We route the codebook by the SOURCE,
+    // not an env flag: unquantized source (F16/F32/BF16, bits >= 16) -> NF4; quantized source -> uniform + this
+    // warning. So the fix is a better SOURCE, not a knob.
+    {
+        static int warned_qsrc = 0;
+        double sbits = ork_src_type_bits(src_type);
+        if (!warned_qsrc && sbits > 0.0 && sbits < 16.0) {
+            warned_qsrc = 1;
+            fprintf(stderr,
+                "[ORK PERSIST] NOTE: building this orkpack from an ALREADY-QUANTIZED model (%s, ~%.1f-bit). Re-quantizing\n"
+                "              quantized weights compounds error, and the NF4 codebook only helps from full-precision\n"
+                "              weights. For the best pack (especially int4), regenerate it from the model's UNQUANTIZED\n"
+                "              weights (an F16/F32/BF16 GGUF) — the NF4 codebook is then applied automatically.\n",
+                ggml_type_name(src_type), sbits);
+        }
+    }
 
     int tier = f32_plane ? ork_orkpack_tier(name, K, N, src_type) : 8;   // no f32 plane available → int8 only
     if (getenv("ORK_VERBOSE"))
         fprintf(stderr, "[ORK PERSIST] tier %s K=%d N=%d src=%s -> int%d\n",
                 name, K, N, ggml_type_name(src_type), tier);
-    if (tier == 4 && !ork_orkpack_cpu_only() && !ork_npu_busy(ctx->npu)) {   // int4 uses the NPU packer — only when idle + not CPU-forced
-        std::vector<float> bscale_tmp(N);   // pack_i4a8 always writes bscale_out (no NULL check); the dump
+    if (tier == 4 && f32_plane) {   // int4: PURE-CPU pack straight to the compact i4a8 blob. No NPU packer, no
+                                    // ork_npu_busy() gate — persist_write runs mid-forward while the NPU is busy with
+                                    // the matmul, so the old NPU-packer path (gated !ork_npu_busy) ALWAYS skipped and
+                                    // packed ZERO int4 weights. ork_pack_i4a8_cpu_blob is bit-identical to
+                                    // ork_mm_pack_i4a8_im + ork_w_dump_i4a8 (same on-disk blob), so the read path is unchanged.
         const float * im = ork_imatrix_lookup(name, K);   // per-input-channel importance, length K (or NULL)
         if (im && getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] imatrix %s (K=%d)\n", name, K);
-        ork_w * w4 = ork_mm_pack_i4a8_im(ctx->npu, K, N, f32_plane, im, bscale_tmp.data());   // im=NULL → plain absmax (identical to pack_i4a8)
-        if (w4) {
-            size_t tb = ork_w_dump_i4a8(w4, nullptr, 0);
-            if (tb) {
-                std::vector<char> tmp(tb);
-                ork_w_dump_i4a8(w4, tmp.data(), tb);
-                orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
-                e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
-                fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
-                ctx->persist_built.emplace_back(std::string(name), e);
-                ork_mm_free(ctx->npu, w4);
-                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4 %s K=%d N=%d (%zu B)\n", name, K, N, tb);
-                return;
-            }
-            ork_mm_free(ctx->npu, w4);
+        // Codebook routed by SOURCE (not an env flag): full-precision weights (F16/F32/BF16, >=16 bit) → NF4
+        // non-uniform codebook (fits the original distribution); an already-quantized source → uniform (NF4 can't
+        // recover compounded quant error — the warning above tells the user to rebuild from unquantized weights).
+        int nf4 = ork_src_type_bits(src_type) >= 16.0 ? 1 : 0;
+        size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, nullptr, 0);
+        if (tb) {
+            std::vector<char> tmp(tb);
+            ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, tmp.data(), tb);
+            orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+            e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
+            fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+            ctx->persist_built.emplace_back(std::string(name), e);
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B)\n", name, K, N, tb);
+            return;
         }
-        // int4 pack/dump failed → fall through to int8 (never persist a broken entry)
+        // CPU int4 pack failed → fall through to int8 (never persist a broken entry)
     }
     // int8 tier: tile on the CPU from the raw int8 weights when forced CPU-only or when there's no
     // NPU-packed weight (hybrid CPU route — no NPU/IOVA); otherwise dump the NPU-packed tiles. Both
@@ -1139,8 +1213,9 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
             orkpack_entry ent{}; ent.K = K; ent.N = N;
             if (tier == 4) {
                 const float * im = ork_imatrix_lookup(src0->name, K);
-                size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nullptr, 0);
-                blob.resize(tb); ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, blob.data(), tb);
+                int nf4 = ork_src_type_bits(type) >= 16.0 ? 1 : 0;   // codebook routed by source (full-precision → NF4)
+                size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nf4, nullptr, 0);
+                blob.resize(tb); ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nf4, blob.data(), tb);
                 ent.dtype = ORKPACK_DT_I4; ent.bscale_n = 0; ent.blob_size = tb; ent.bscale_off = 0;
                 #pragma omp critical (ork_persist_flat)
                 if (ctx->persist_dumped.insert(key).second) {
@@ -1197,11 +1272,22 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     orkpack_footer f; memset(&f, 0, sizeof f);
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
     f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
+    f.quant_sig = ork_build_sig();           // stamp the build-config precision signature (authoritative on read)
     memcpy(f.magic, ORKPACK_MAGIC, 8);
     fwrite(&f, sizeof f, 1, ctx->persist_out);
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
     rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
-    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] finalized %s (%u weights)\n", ctx->persist_final.c_str(), f.n_entries);
+    // Unconditional success line: report the full path (directory + filename) and weight count so the user sees
+    // exactly where the pack landed. Split dir/file for clarity when the path is absolute.
+    {
+        const std::string & fp = ctx->persist_final;
+        size_t slash = fp.find_last_of('/');
+        std::string dir  = slash == std::string::npos ? std::string(".") : fp.substr(0, slash);
+        std::string file = slash == std::string::npos ? fp : fp.substr(slash + 1);
+        fprintf(stderr, "[ORK PERSIST] SUCCESS: orkpack written (%u weights, %.1f MiB) -> %s\n"
+                        "              dir: %s  file: %s\n",
+                f.n_entries, (double) ctx->persist_off / (1024.0 * 1024.0), fp.c_str(), dir.c_str(), file.c_str());
+    }
 }
 
 // Resolve the int8 weight plane `x` (= src0->data) to a packed, cached ork_weight, identically for the
@@ -6089,12 +6175,17 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             else if (is_attn) target_qbits = 8;
                         }
 
-                        if (target_qbits == 4
-                               ? (ctx->hadamard ? !ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
-                                                : !ggml_backend_ork_mul_mat_i4(ctx, node))
-                               : !ggml_backend_ork_mul_mat_i8(ctx, node)) {
-                            return GGML_STATUS_FAILED;
-                        }
+                        // int4 COMPUTE routing: native W4A4 (mul_mat_i4 grouped / hadamard) is fragile at prefill
+                        // (grouped M_padded wedges) and only opt-in now — ORK_HADAMARD or ORK_MIXED_W4A4. The DEFAULT
+                        // int4 (incl. ORK_QUANT=4) computes W8A8 via mul_mat_i8 (int4 weights inflated int4->int8 on the
+                        // NPU — robust, no wedge); compact i4a8 STORAGE is chosen separately at persist (ork_orkpack_tier).
+                        static const int w4a4_opt = env_enabled("ORK_MIXED_W4A4");
+                        bool native_w4a4 = (target_qbits == 4) && (ctx->hadamard || w4a4_opt);
+                        bool mm_ok = native_w4a4
+                            ? (ctx->hadamard ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
+                                             : ggml_backend_ork_mul_mat_i4(ctx, node))
+                            : ggml_backend_ork_mul_mat_i8(ctx, node);
+                        if (!mm_ok) return GGML_STATUS_FAILED;
                     }
                 }
                 { const char * nm = node->src[0] ? node->src[0]->name : "";
@@ -6718,7 +6809,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // LFM2.5/Qwen3.6-35B: ~1440 M=1 run_i8 submits/decode = 82% of run time, decode 14/6.16 vs ggml
             // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
             // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
-            if (target_qbits == 8 && g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;
+            if (g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;   // WRITE/convert: force M>=1 on NPU for EVERY dtype (int8 AND int4) so every weight packs — else int4 FFN falls to CPU and packs ZERO
             else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) && env_enabled("ORK_M1_NPU")) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
