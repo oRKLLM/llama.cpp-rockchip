@@ -196,7 +196,8 @@ static uint32_t ork_build_sig(void) {
     uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
     uint32_t hy = (getenv("ORK_HYBRID")   != nullptr) ? 1u : 0u;
     uint32_t hd = (getenv("ORK_HADAMARD") != nullptr) ? 1u : 0u;
-    return (qb & 0xffu) | (hy << 8) | (hd << 9);
+    uint32_t gq = (getenv("ORK_GPTQ")     != nullptr) ? 1u : 0u;   // GPTQ Hessian-error-feedback int4 rounding (W4A4)
+    return (qb & 0xffu) | (hy << 8) | (hd << 9) | (gq << 10);
 }
 
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
@@ -262,6 +263,7 @@ struct ork_weight {
     size_t   bytes = 0;       // resident NPU bytes (for the streaming LRU budget)
     size_t   ram_bytes = 0;   // STREAM-POOL: RAM bytes held by `se` (for the RAM-LRU budget)
     uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
+    bool     is_expert = false;   // MoE STREAM: a routed-expert slice (evicted by ork_wcache_evict_experts; dense stays)
 };
 
 // One reusable slot in the MoE expert pool: a packed weight whose DMA buffer is reused (repack-in-place)
@@ -462,6 +464,15 @@ struct ggml_backend_ork_context {
     // MUL_MAT_ID kernel (NOT the per-expert vec_dot loop) on a compacted sub-graph. Created lazily.
     ggml_backend_t cpu_backend = nullptr;          // ggml_backend_cpu_init() (lazy)
     int      pathb_cpu_threads = 0;                // ORK_MOE_CPU_THREADS (default 4)
+    // ---- BIG.LITTLE proportional CPU MoE dispatcher (ORK_MOE_BIGLITTLE) ----
+    // Two AFFINITY-PINNED CPU backends: bl_big -> A76 cluster (cpu4-7), bl_little -> A55 cluster (cpu0-3).
+    // Prefill MoE splits the active experts by routed-row count into a big share + a proportionally smaller
+    // little share, computed CONCURRENTLY on the two independent threadpools (no shared barrier -> the slow
+    // A55s never stall the A76s), each via ggml's repacked fused MUL_MAT_ID. Created lazily; freed in _free.
+    ggml_backend_t    bl_big = nullptr,    bl_little = nullptr;
+    ggml_threadpool_t bl_tp_big = nullptr, bl_tp_little = nullptr;
+    long   bl_calls = 0, bl_big_e = 0, bl_little_e = 0;
+    double bl_big_t = 0, bl_little_t = 0, bl_wall_t = 0;
     // ---- ASYNC CROSS-STREAM (ORK_ASYNC / ggml_backend_ork_graph_compute_async) ----
     // A per-context worker thread runs the (blocking) graph_compute body so the launching stream can do CPU
     // work while this stream's NPU submits are in flight. At most ONE in-flight job per backend. The worker
@@ -530,6 +541,15 @@ struct ggml_backend_ork_context {
     int    load_phase = 1;           // 1 during initial residence fill; cleared at first decode/steady state
     int    domain_cursor = 0;        // byte-balanced fill: current domain being filled (advances as domains near the IOVA cap)
     int    domain_last_layer = -1;   // last blk.N layer index seen by ork_weight_domain (advance domains only at layer boundaries)
+    // FOOTPRINT-DERIVED RESIDENCE MODE (set once by the auto-sizer from the resident footprint vs a RAM
+    // budget). RESIDENT (0): the whole footprint fits -> load once, NEVER evict, zero per-token churn
+    // (librkllmrt / multi-domain model). STREAM (1): footprint > RAM budget -> stream by layer (co-resident
+    // within a layer's chain, evict the previous layer at each boundary). This REPLACES per-call allow_evict
+    // as the eviction POLICY (allow_evict stays only as the intra-submit co-residence safety; #55 migrates
+    // the dense callers). Consumed by the MoE prefill path; residence_ram_budget is the capacity it compares to.
+    int    residence_stream = 0;         // 0 = RESIDENT (fits), 1 = STREAM-by-layer (oversized)
+    size_t residence_footprint = 0;      // auto-sizer's inflated resident-weight footprint (bytes)
+    size_t residence_ram_budget = 0;     // capacity the footprint is compared against (bytes)
     // PER-DOMAIN FUSION (>4GiB): the fused per-tensor gate (fc.wg) is NOT a separate/extra weight — it REPLACES
     // the per-channel gate 1:1 (same K×N, same Bb+Bf, differs only in scale), so in fused mode the per-channel
     // gate is never packed and fc.wg takes its place in the SAME layer's domain via ork_weight_domain(). It is
@@ -632,6 +652,29 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
         ork_slice_ws_drop(ctx, lru->second.w);
         ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache_bytes -= lru->second.bytes;
+        ctx->wcache.erase(lru);
+    }
+}
+
+// MoE STREAM per-layer evict (task #54): reclaim IOVA from routed-expert entries (is_expert) ONLY, LRU-first,
+// until resident expert bytes fall to `budget`. DENSE weights are never touched (they stay resident every
+// layer). Called once per _exps MUL_MAT_ID BETWEEN grouped runs, so it never frees an expert an in-flight
+// chain still references (eviction is between synchronous calls -> no UAF). Bounds the streamed working set
+// (~a couple of layers of experts); prior layers age out as prefill advances -> the 35B's ~30 GB int8-inflate
+// stays within ~`budget` resident instead of overflowing IOVA/RAM. (se/spool tier not evicted here; the
+// STREAM path imports fresh, no spool.)
+static void ork_wcache_evict_experts(ggml_backend_ork_context * ctx, size_t budget) {
+    size_t eb = 0; for (auto & kv : ctx->wcache) if (kv.second.is_expert) eb += kv.second.bytes;
+    while (eb > budget) {
+        auto lru = ctx->wcache.end();
+        for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
+            if (it->second.is_expert && !ctx->wcache_pin.count(it->first) &&
+                (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
+        if (lru == ctx->wcache.end()) break;   // remaining experts pinned by the active op
+        eb                -= lru->second.bytes;
+        ctx->wcache_bytes -= lru->second.bytes;
+        ork_slice_ws_drop(ctx, lru->second.w);
+        ork_mm_free(ctx->npu, lru->second.w);
         ctx->wcache.erase(lru);
     }
 }
@@ -1111,12 +1154,25 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
     if (pit == ctx->persist_idx.end() || pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N ||
         pit->second.dtype != ORKPACK_DT_I4_NATIVE) return false;
     const orkpack_entry & e = pit->second;
-    ow.w = ork_mm_load_i4(ctx->npu, K, N, (const char *) ctx->persist_map + e.blob_off, e.blob_size);
+    const char * blob = (const char *) ctx->persist_map + e.blob_off;
+    // Multi-domain residence: byte-balance this dense int4 weight across domains (same as the int8 resolve +
+    // expert paths) so domain_bytes stays accurate (else experts over-admit to domain 0 and overfill it) and
+    // retry the next domain on IOVA exhaustion. IMPORT first (bimport, multi-domain-safe); bcreate fallback.
+    int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(name));
+    ork_npu_set_pack_domain(ctx->npu, _dom);
+    ow.w = ork_mm_load_i4_import(ctx->npu, K, N, blob, e.blob_size);
+    if (!ow.w) ow.w = ork_mm_load_i4(ctx->npu, K, N, blob, e.blob_size);
+    while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) {
+        ow.w = ork_mm_load_i4_import(ctx->npu, K, N, blob, e.blob_size);
+        if (!ow.w) ow.w = ork_mm_load_i4(ctx->npu, K, N, blob, e.blob_size);
+    }
     if (!ow.w) return false;
     ow.gsize = 0; ow.bscale.resize(e.bscale_n);
     if (e.bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + e.bscale_off, (size_t) e.bscale_n * sizeof(float));
+    ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
     ctx->persist_hits++;
-    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native LOAD %s K=%d N=%d\n", name, K, N);
+    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native LOAD %s K=%d N=%d dom=%d\n", name, K, N, _dom);
     return true;
 }
 
@@ -1184,6 +1240,47 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     for (int e = 0; e < n_expert; e++)
         if (!ctx->persist_dumped.count(ork_expert_key(src0->name, e))) todo.push_back(e);
     if (todo.empty()) return;
+
+    // NATIVE W4A4 (ORK_QUANT=4 + ORK_HADAMARD): emit each expert as ORKPACK_DT_I4_NATIVE — FWHT-rotate the
+    // weight columns, per-channel int4-quant (mx/7), ork_mm_pack_i4 + ork_w_dump — the exact form the run
+    // path's native-W4A4 expert branch loads via ork_mm_load_i4 (twin of the dense ork_persist_write_i4native).
+    // SERIAL over experts because ork_mm_pack_i4 is a single-stream NPU op (inner column loop is OMP-parallel);
+    // NOT the parallel-CPU O4N1/int8 loop below. Deduped per synthetic key like the int8/O4N1 path.
+    if (ctx->qbits == 4 && ctx->hadamard) {
+        const int fb = K & (-K);
+        std::vector<float> f32((size_t) N * K); std::vector<int8_t> bi((size_t) K * N); std::vector<float> bs(N);
+        const size_t nb2 = src0->nb[2], nb01 = src0->nb[1];
+        for (int e : todo) {
+            const std::string key = ork_expert_key(src0->name, e);
+            if (ctx->persist_dumped.count(key)) continue;
+            const char * x = (const char *) src0->data + (size_t) e * nb2;
+            #pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; n++) {
+                float * col = f32.data() + (size_t) n * K;
+                if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
+                else                        to_float(x + (size_t) n*nb01, col, K);
+                for (int o = 0; o < K; o += fb) ork_fwht_norm(col + o, fb);
+                float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                float s = mx / 7.0f; bs[n] = s;
+                for (int k = 0; k < K; k++) { int q = (int) lrintf(col[k] / s);
+                    bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
+            }
+            ork_w * w = ork_mm_pack_i4(ctx->npu, K, N, bi.data());
+            if (!w) { fprintf(stderr, "[ORK PERSIST] expert %s#%d i4-native pack FAILED\n", src0->name, e); continue; }
+            size_t tb = ork_w_dump(w, nullptr, 0);
+            std::vector<char> blob(tb); ork_w_dump(w, blob.data(), tb);
+            ork_mm_free(ctx->npu, w);
+            orkpack_entry ent{}; ent.K = K; ent.N = N; ent.dtype = ORKPACK_DT_I4_NATIVE; ent.bscale_n = (uint32_t) N;
+            if (ctx->persist_dumped.insert(key).second) {
+                ent.blob_off = ctx->persist_off; ent.blob_size = tb;
+                fwrite(blob.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
+                ent.bscale_off = ctx->persist_off;
+                fwrite(bs.data(), sizeof(float), N, ctx->persist_out); ctx->persist_off += (size_t) N * sizeof(float);
+                ctx->persist_built.emplace_back(key, ent);
+            }
+        }
+        return;
+    }
 
     // COMPUTE→DMA PIPELINE. The per-expert work splits into a parallel CPU half (dequant+quant) and a
     // serial NPU/IO half (ork_mm_pack_i8's bcreate + IOMMU-map + bsync DMA, then dump). The serial half
@@ -1339,13 +1436,21 @@ static bool ork_spool_install(ggml_backend_ork_context * ctx,
 static std::unordered_map<const void *, ork_weight>::iterator
 ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
                       int K, int N, size_t nb01, enum ggml_type type, ggml_to_float_t to_float,
-                      bool allow_evict) {
+                      bool allow_evict, int expert = -1, int proc_prec = 0) {
+    // expert>=0 OVERLOAD (MoE prefill layer-streamer): resolve ONE expert slice of a 3D _exps tensor
+    // through the SAME streaming path as dense (zero-copy import + ork_weight_domain + evict), keyed by
+    // the per-expert pointer + orkpack entry. expert<0 = the original dense behavior, byte-for-byte.
+    // proc_prec PROCESSING PRECISION: 0 = int8-inflate (default; int4 nibbles -> int8 resident, amortized
+    // compute but ~2x resident bytes) — the dense/current path. 1 = int4-NATIVE-RESIDENT (W4A4): keep the
+    // weight DT_I4 in IOVA (no inflate -> ~half the bytes so a big MoE fits RESIDENT), run via ork_mm_run_i4.
+    // proc_prec=1 needs the orkpack to store the expert as a native DT_I4 dump (ork_mm_pack_i4) + the caller's
+    // run path to use the int4 doorbell — else the DT_I4 load returns NULL and the caller falls to CPU.
     // allow_evict: the non-chain path uses one weight at a time, so it may stream-evict the LRU to
     // free IOVA. The chain path needs ALL `count` weights co-resident at submit, so it passes false
     // (matching the original chain pack, which never evicted) — otherwise packing weight i frees the
     // already-packed weight i-1 that the chain still references → use-after-free at submit.
     const double _r0 = ctx->profile ? ork_now_us_e() : 0;
-    const char * x = (const char *) src0->data;
+    const char * x = (const char *) src0->data + (expert >= 0 ? (size_t) expert * src0->nb[2] : 0);   // MoE: per-expert slice key
     auto it = ctx->wcache.find(x);
     if (it != ctx->wcache.end()) {
         if (ctx->spool && it->second.se && !ork_stream_entry_mapped(it->second.se)) {
@@ -1367,7 +1472,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     if (ctx->persist_mode == 1) {
         // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
         // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
-        auto pit = ctx->persist_idx.find(src0->name);
+        auto pit = ctx->persist_idx.find(expert >= 0 ? ork_expert_key(src0->name, expert) : std::string(src0->name));   // MoE: per-expert orkpack entry
         if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N &&
             (pit->second.dtype == ORKPACK_DT_I8 || pit->second.dtype == ORKPACK_DT_I4)) {
             const orkpack_entry & e = pit->second;
@@ -1391,7 +1496,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 // bit-exact + llama.cpp perplexity 3.30 on the 7B across 5 domains. `ORK_NO_IMPORT` is the only
                 // opt-out (falls back to the bcreate COPY load — same pre-tiled bytes, a host memcpy per weight).
                 const bool no_import = env_enabled("ORK_NO_IMPORT");
-                if (e.dtype == ORKPACK_DT_I4) {
+                if (e.dtype == ORKPACK_DT_I4 && proc_prec == 1) {
+                    // int4-NATIVE-RESIDENT (W4A4): keep the weight DT_I4 in IOVA (no int8 inflate -> ~half the
+                    // resident bytes, so a big MoE fits RESIDENT and escapes the int8-inflate load wall), run
+                    // via ork_mm_run_i4 / the int4 doorbell. NOTE: ork_mm_load_i4 wants a NATIVE DT_I4 dump
+                    // (ork_mm_pack_i4 + ork_w_dump); on the current O4N1 compact blob it returns NULL -> caller
+                    // falls to CPU. Enable end-to-end once ork_persist_write_experts emits native DT_I4.
+                    ow.w = ork_mm_load_i4(ctx->npu, K, N, blob, e.blob_size);
+                    if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
+                } else if (e.dtype == ORKPACK_DT_I4) {
                     if (!no_import) ow.w = ork_mm_load_i4a8_import(ctx->npu, K, N, blob, e.blob_size);   // ZERO-COPY: map .orkpack page-cache pages into IOVA
                     if (!ow.w) ow.w = ork_mm_load_i4a8(ctx->npu, K, N, blob, e.blob_size);  // copy (import off / unavailable)
                     if (ow.w) { const float * bs = ork_w_bscale(ow.w); if (bs) ow.bscale.assign(bs, bs + N); }
@@ -1438,6 +1551,10 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         }
     }
 
+    // MoE experts are ORKPACK-ONLY on this path: a persist miss does NOT live-pack here (the code below
+    // assumes a dense 2D Q8_0 weight, not an expert slice) — return miss so the MoE handler falls the
+    // expert to the CPU NF4 path.
+    if (expert >= 0) { if (ctx->profile) ctx->s_resolve += ork_now_us_e() - _r0; return ctx->wcache.end(); }
     // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
     if (ctx->persist_mode) ctx->persist_misses++;
     if (ctx->persist_mode == 1) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
@@ -2418,6 +2535,10 @@ static void ork_profile_dump(ggml_backend_ork_context * ctx) {
     if (!ctx || g_ork_prof_dumped) return;
     if (ctx->profile) fprintf(stderr, "[ork DUMP] profile=%d n_mm=%ld t_quant=%.0fms t_run=%.0fms t_deq=%.0fms t_actq=%.0fms\n",
                               ctx->profile, ctx->n_mm, ctx->t_quant/1e3, ctx->t_run/1e3, ctx->t_deq/1e3, ctx->t_actq/1e3);
+    if (ctx->profile && ctx->bl_calls)   // BIG.LITTLE accumulated averages: per-MoE-op wall + big-cluster + little-cluster
+        fprintf(stderr, "[ork BL-AVG] calls=%ld | avg wall=%.0fus  avg big=%.0fus  avg little=%.0fus | tot wall=%.0fms big=%.0fms little=%.0fms\n",
+            ctx->bl_calls, ctx->bl_wall_t/ctx->bl_calls, ctx->bl_big_t/ctx->bl_calls, ctx->bl_little_t/ctx->bl_calls,
+            ctx->bl_wall_t/1e3, ctx->bl_big_t/1e3, ctx->bl_little_t/1e3);
     if (ctx->profile && ctx->n_mm) {
         g_ork_prof_dumped = 1;
         double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
@@ -2578,6 +2699,10 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     for (auto & p : ctx->moe_pools) for (auto & s : p.second) if (s.w) ork_w_free(s.w);   // MoE expert pool
     for (auto & tk : ctx->moe_hot) for (auto & es : tk.second) if (es.second.w) ork_w_free(es.second.w);   // hot-expert partition
     if (ctx->cpu_backend) ggml_backend_free(ctx->cpu_backend);   // PATH (b) cached CPU backend
+    if (ctx->bl_big)    ggml_backend_free(ctx->bl_big);          // BIG.LITTLE pinned CPU backends
+    if (ctx->bl_little) ggml_backend_free(ctx->bl_little);
+    if (ctx->bl_tp_big)    ggml_threadpool_free(ctx->bl_tp_big);
+    if (ctx->bl_tp_little) ggml_threadpool_free(ctx->bl_tp_little);
     for (auto & kv : ctx->pathb_repack) { if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf); if (kv.second.gctx) ggml_free(kv.second.gctx); }
     attn_pool_free(ctx);                                         // per-context fused-attention pool (needs ctx->npu)
     { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
@@ -3100,6 +3225,199 @@ static void ork_moe_deq_row(void * vctx, int n, float * dst, int K) {
 }
 
 static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need);   // defined below; used by the #14 multi-core NONBLOCK path
+
+// ===================== BIG.LITTLE proportional CPU MoE dispatcher (ORK_MOE_BIGLITTLE) =====================
+// Native CPU MoE is compute-bound on the 4 A76 cores (measured pp512 28.35 t/s, DRAM-BW only 8% -> huge
+// headroom) while the 4 A55 little cores sit idle; naive -t8 makes them DRAG the shared threadpool barrier
+// (28.35 -> 25.9). This dispatcher instead splits the TOKENS into a big share and a PROPORTIONALLY SMALLER
+// little share (ORK_BL_LITTLE_FRAC, default 0.15 ~ the measured A55/A76 cluster ratio), and runs the NATIVE
+// fused MUL_MAT_ID over each token slice on its own AFFINITY-PINNED CPU backend (big=cpu4-7, little=cpu0-3)
+// CONCURRENTLY on INDEPENDENT threadpools. No shared barrier -> a slow A55 slice never stalls the A76s; the
+// little cluster just carries fewer tokens so both finish together, adding A55 throughput below the DRAM
+// wall. Token is the OUTER dim so a slice is a contiguous sub-block: all operands are in-place VIEWS (no
+// gather, no scatter) and weights are ALIASED (src0->buffer carried) so ggml's repacked kernel fires with no
+// copy. Reachable via ORK_MOE_BIGLITTLE=1 (leave ORK_MOE_NPU UNSET so the experts stay in the repack buffer).
+// frac=0 => all tokens on the big backend (Stage-A validation that the delegated path == native).
+
+// Run the NATIVE fused MUL_MAT_ID over a contiguous TOKEN range [t0, t0+tn) on `backend`, writing IN PLACE
+// into dst. All operands are VIEWS (token is the outer dim, so a token sub-range is a contiguous sub-block):
+// as = src0 aliased (repacked weights -> the fast kernel fires), b/ids/out = src1/ids/dst offset by t0. No
+// gather, no scatter, no compaction — the exact native kernel on a token slice. This is the fix for Stage A:
+// the earlier expert-partition path gathered every routed row into a 33 MB/call buffer (18% slower than
+// native); token-split reads activations in place, so frac=0 == native and the little share is pure upside.
+static bool ork_bl_run_range(ggml_backend_t backend, const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1, const struct ggml_tensor * ids, struct ggml_tensor * dst, int t0, int tn) {
+    if (tn <= 0) return true;
+    { static int logged = 0; if (!logged && getenv("ORK_VERBOSE")) { logged = 1;
+        const int repacked = src0->buffer && src0->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+        fprintf(stderr, "[ORK BIG.LITTLE] src0 buffer=%s repacked=%d (repacked=1 -> fast kernel; 0 -> slow plain-Q4_K -> "
+            "claiming the op forfeits the repack buffer; the -17%% wall)\n",
+            src0->buffer ? ggml_backend_buft_name(src0->buffer->buft) : "(none)", repacked); } }
+    size_t mem = 8 * ggml_tensor_overhead() + 2 * ggml_graph_overhead() + 256;
+    struct ggml_init_params ip = { mem, nullptr, true };
+    struct ggml_context * gctx = ggml_init(ip);
+    struct ggml_tensor * as_t = ggml_new_tensor_3d(gctx, src0->type, src0->ne[0], src0->ne[1], src0->ne[2]);
+    as_t->data=src0->data; as_t->nb[0]=src0->nb[0]; as_t->nb[1]=src0->nb[1]; as_t->nb[2]=src0->nb[2]; as_t->nb[3]=src0->nb[3];
+    as_t->buffer=src0->buffer; as_t->extra=src0->extra;
+    struct ggml_tensor * b_t = ggml_new_tensor_3d(gctx, src1->type, src1->ne[0], src1->ne[1], tn);
+    b_t->data = (char *) src1->data + (size_t) t0 * src1->nb[2];
+    b_t->nb[0]=src1->nb[0]; b_t->nb[1]=src1->nb[1]; b_t->nb[2]=src1->nb[2]; b_t->nb[3]=src1->nb[3];
+    struct ggml_tensor * id_t = ggml_new_tensor_2d(gctx, ids->type, ids->ne[0], tn);
+    id_t->data = (char *) ids->data + (size_t) t0 * ids->nb[1];
+    id_t->nb[0]=ids->nb[0]; id_t->nb[1]=ids->nb[1];
+    struct ggml_tensor * out = ggml_mul_mat_id(gctx, as_t, b_t, id_t);
+    out->data = (char *) dst->data + (size_t) t0 * dst->nb[2];
+    out->nb[0]=dst->nb[0]; out->nb[1]=dst->nb[1]; out->nb[2]=dst->nb[2]; out->nb[3]=dst->nb[3];
+    struct ggml_cgraph * gf = ggml_new_graph(gctx); ggml_build_forward_expand(gf, out);
+    enum ggml_status st = ggml_backend_graph_compute(backend, gf);
+    ggml_free(gctx);
+    return st == GGML_STATUS_SUCCESS;
+}
+
+// EXPERT-split: gather THIS cluster's experts' routed rows into a compacted b'[K,1,P] + ids'[1,P] and run
+// ONE batched MUL_MAT_ID (repacked kernel via the src0 alias). Each cluster owns DISTINCT experts, so each
+// expert weight is read EXACTLY ONCE across the two clusters (no token-split double-read) and full M_e per
+// expert is preserved (amortization intact). Cost: a per-cluster ACTIVATION gather (weights are untouched).
+// Fills `pairs` (token,slot per output column) for the caller's scatter + `dstp` [N,P] f32. `buckets` read
+// const (safe under concurrent big/little).
+static bool ork_bl_compute_set(ggml_backend_t backend, const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1, int K, int N, bool bcast,
+        const std::unordered_map<int, std::vector<std::pair<int,int>>> & buckets,
+        const std::vector<int> & experts, std::vector<std::pair<int,int>> & pairs, std::vector<float> & dstp) {
+    pairs.clear();
+    for (int e : experts) { auto it = buckets.find(e); if (it == buckets.end()) continue;
+        for (auto & pr : it->second) pairs.push_back(pr); }
+    const int P = (int) pairs.size();
+    if (P == 0) { dstp.clear(); return true; }
+    size_t mem = 8 * ggml_tensor_overhead() + 2 * ggml_graph_overhead() + 256;
+    struct ggml_init_params ip = { mem, nullptr, true };
+    struct ggml_context * gctx = ggml_init(ip);
+    std::vector<float>   bP((size_t) K * P);   // gathered token columns for this cluster's experts
+    std::vector<int32_t> idP(P);               // expert id per column (same iteration order as pairs)
+    dstp.assign((size_t) N * P, 0.f);
+    for (int p = 0; p < P; p++) { const int t = pairs[p].first, j = pairs[p].second;
+        const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:j)*src1->nb[1] + (size_t) t*src1->nb[2]);
+        memcpy(bP.data() + (size_t) p * K, y, (size_t) K * sizeof(float)); }
+    { int p = 0; for (int e : experts) { auto it = buckets.find(e); if (it == buckets.end()) continue;
+        for (size_t i = 0; i < it->second.size(); i++) idP[p++] = e; } }
+    struct ggml_tensor * as_t = ggml_new_tensor_3d(gctx, src0->type, K, N, src0->ne[2]);   // alias src0 (repacked)
+    as_t->data=src0->data; as_t->nb[0]=src0->nb[0]; as_t->nb[1]=src0->nb[1]; as_t->nb[2]=src0->nb[2]; as_t->nb[3]=src0->nb[3];
+    as_t->buffer=src0->buffer; as_t->extra=src0->extra;
+    struct ggml_tensor * b_t  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, K, 1, P); b_t->data = bP.data();
+    struct ggml_tensor * id_t = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, 1, P);    id_t->data = idP.data();
+    struct ggml_tensor * out  = ggml_mul_mat_id(gctx, as_t, b_t, id_t);           out->data = dstp.data();
+    struct ggml_cgraph * gf = ggml_new_graph(gctx); ggml_build_forward_expand(gf, out);
+    enum ggml_status st = ggml_backend_graph_compute(backend, gf);
+    ggml_free(gctx);
+    return st == GGML_STATUS_SUCCESS;
+}
+
+// lazily create one cpumask-pinned CPU backend over cores [c0,c1) with nth threads.
+static void ork_bl_init_backend(ggml_backend_t * be, ggml_threadpool_t * tp, int c0, int c1, int nth) {
+    if (*be) return;
+    *be = ggml_backend_cpu_init();
+    struct ggml_threadpool_params pp = {};
+    ggml_threadpool_params_init(&pp, nth);
+    for (int i = 0; i < GGML_MAX_N_THREADS; i++) pp.cpumask[i] = false;
+    for (int i = c0; i < c1 && i < GGML_MAX_N_THREADS; i++) pp.cpumask[i] = true;
+    pp.strict_cpu = true;
+    pp.poll = getenv("ORK_BL_POLL") ? atoi(getenv("ORK_BL_POLL")) : 50;   // poll level; 0 blocks on idle (no
+        // spin between MoE calls) but adds a futex wake per op (the ~2 t/s delegation handoff); 50 (native's
+        // default) trims that at the cost of brief idle spin during attention. Sweepable via ORK_BL_POLL.
+    *tp = ggml_threadpool_new(&pp);
+    if (*tp) ggml_backend_cpu_set_threadpool(*be, *tp);
+    ggml_backend_cpu_set_n_threads(*be, nth);
+}
+
+static bool ggml_backend_ork_mul_mat_id_biglittle(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];   // experts [K, N, n_expert]
+    const struct ggml_tensor * src1 = dst->src[1];   // input   [K, n_b1, n_tokens]
+    const struct ggml_tensor * ids  = dst->src[2];   // ids     [n_used, n_tokens] (i32)
+    const int K = (int) src0->ne[0], N = (int) src0->ne[1];
+    const int n_used = (int) ids->ne[0], n_tokens = (int) src1->ne[2];
+    const bool bcast = ((int) src1->ne[1] == 1);
+    char * dbase = (char *) dst->data;
+    const double t0 = ork_now_us();
+    // little_frac = the A55 cluster's target share of the WORK (rows, or tokens for token-split). ~0.15 ~ the
+    // measured A55/A76 cluster ratio. ORK_BL_SPLIT=token forces the old token-split (fragments M_e, double-
+    // reads weights); default EXPERT-split partitions DISTINCT experts per cluster (weight read once, M_e kept).
+    static const double little_frac = getenv("ORK_BL_LITTLE_FRAC") ? atof(getenv("ORK_BL_LITTLE_FRAC")) : 0.15;
+    static const bool token_split = getenv("ORK_BL_SPLIT") && strcmp(getenv("ORK_BL_SPLIT"), "token") == 0;
+    const int lt = getenv("ORK_BL_LITTLE_THREADS") ? atoi(getenv("ORK_BL_LITTLE_THREADS")) : 4;
+    const int bt = getenv("ORK_BL_BIG_THREADS") ? atoi(getenv("ORK_BL_BIG_THREADS")) : 4;   // big-pool core count
+    ork_bl_init_backend(&ctx->bl_big, &ctx->bl_tp_big, 8 - bt, 8, bt);   // A76 cluster: top `bt` big cores (cpu 8-bt..7)
+
+    std::atomic<int> lrc(0); double lt_dt = 0, bt_dt = 0; bool bok = true;
+    int e_big = 0, e_little = 0;
+
+    if (token_split) {
+        // --- TOKEN-split (legacy): little takes the last little_frac of tokens; native kernel in place ---
+        int T_little = (int) (little_frac * (double) n_tokens + 0.5);
+        if (T_little < 0) T_little = 0; if (T_little > n_tokens) T_little = n_tokens;
+        const int T_big = n_tokens - T_little;
+        if (T_little > 0) ork_bl_init_backend(&ctx->bl_little, &ctx->bl_tp_little, 0, lt < 4 ? lt : 4, lt);
+        std::thread lth;
+        if (T_little > 0) lth = std::thread([&](){ const double s = ork_now_us();
+            lrc.store(ork_bl_run_range(ctx->bl_little, src0, src1, ids, dst, T_big, T_little) ? 0 : 1); lt_dt = ork_now_us() - s; });
+        const double bs = ork_now_us();
+        bok = ork_bl_run_range(ctx->bl_big, src0, src1, ids, dst, 0, T_big);
+        bt_dt = ork_now_us() - bs;
+        if (lth.joinable()) lth.join();
+        e_big = T_big; e_little = T_little;
+    } else {
+        // --- EXPERT-split (default): distinct experts per cluster (weight read ONCE, M_e preserved) ---
+        std::unordered_map<int, std::vector<std::pair<int,int>>> buckets;
+        for (int t = 0; t < n_tokens; t++) {
+            const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
+            for (int j = 0; j < n_used; j++) buckets[idp[j]].push_back(std::make_pair(t, j));
+        }
+        // balance by ROWS weighted by cluster rate: assign largest-row experts first to whichever cluster is
+        // furthest below its weighted target (little target = little_frac of total rows).
+        std::vector<std::pair<int,int>> act; long total_rows = 0;
+        for (auto & kv : buckets) { act.push_back({(int) kv.second.size(), kv.first}); total_rows += (long) kv.second.size(); }
+        std::sort(act.begin(), act.end(), [](const std::pair<int,int>&a, const std::pair<int,int>&b){ return a.first > b.first; });
+        std::vector<int> big_e, little_e; long lr = 0, br = 0; const double lf = little_frac;
+        for (auto & pr : act) {
+            if (lf > 0.0 && (double) lr * (1.0 - lf) <= (double) br * lf) { little_e.push_back(pr.second); lr += pr.first; }
+            else { big_e.push_back(pr.second); br += pr.first; }
+        }
+        e_big = (int) big_e.size(); e_little = (int) little_e.size();
+        if (little_e.empty()) {
+            // frac=0 (or all rows to big): just run the native full op in place — no gather.
+            const double bs = ork_now_us();
+            bok = ork_bl_run_range(ctx->bl_big, src0, src1, ids, dst, 0, n_tokens);
+            bt_dt = ork_now_us() - bs;
+        } else {
+            ork_bl_init_backend(&ctx->bl_little, &ctx->bl_tp_little, 0, lt < 4 ? lt : 4, lt);
+            std::vector<std::pair<int,int>> lp, bp; std::vector<float> ld, bd;
+            std::thread lth([&](){ const double s = ork_now_us();
+                lrc.store(ork_bl_compute_set(ctx->bl_little, src0, src1, K, N, bcast, buckets, little_e, lp, ld) ? 0 : 1);
+                lt_dt = ork_now_us() - s; });
+            const double bs = ork_now_us();
+            bok = ork_bl_compute_set(ctx->bl_big, src0, src1, K, N, bcast, buckets, big_e, bp, bd);
+            bt_dt = ork_now_us() - bs;
+            lth.join();
+            if (bok && !lrc.load()) {   // scatter both partials into dst[:, slot, token]
+                auto scatter = [&](const std::vector<std::pair<int,int>> & pr, const std::vector<float> & dv){
+                    for (size_t p = 0; p < pr.size(); p++) { const int t = pr[p].first, j = pr[p].second;
+                        memcpy(dbase + (size_t) j*dst->nb[1] + (size_t) t*dst->nb[2], dv.data() + (size_t) p*N, (size_t) N*sizeof(float)); } };
+                scatter(bp, bd); scatter(lp, ld);
+            }
+        }
+    }
+    if (!bok || lrc.load()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK BIG.LITTLE] compute failed\n"); return false; }
+
+    if (ctx->profile) {
+        ctx->bl_calls++; ctx->bl_big_t += bt_dt; ctx->bl_little_t += lt_dt; ctx->bl_wall_t += ork_now_us() - t0;
+        ctx->bl_big_e += e_big; ctx->bl_little_e += e_little;
+        if (ctx->bl_calls <= 4)
+            fprintf(stderr, "[ORK BIG.LITTLE %s] K=%d N=%d big=%d little=%d big_t=%.0fus little_t=%.0fus wall=%.0fus\n",
+                token_split ? "token" : "expert", K, N, e_big, e_little, bt_dt, lt_dt, ork_now_us() - t0);
+        ctx->t_run += ork_now_us() - t0; ctx->n_mm++;
+    }
+    return true;
+}
+
 // MoE expert matmul (GGML_OP_MUL_MAT_ID), int8 path. Handles any n_tokens.
 // dst[N, n_used, n_tokens] = for each (token t, slot j): W[ids[j,t]] (K x N) @ x_t (K).
 // We GROUP tokens by their selected expert and run ONE M=count matmul per active expert (M-padded to 32
@@ -3157,6 +3475,181 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     char * dbase = (char *) dst->data;
     const bool bcast = (n_b1 == 1);
+
+    // ===== NATIVE W4A4 EXPERT PATH (ORK_QUANT=4 + ORK_HADAMARD) =====
+    // The int4 twin of the int8 expert compute below. Shares this handler's routing (the src0/src1/ids parse
+    // + the persist_mode==2 convert branch above); only the inner per-expert kernel differs: FWHT-rotate +
+    // int4-quant the weight AND the activation (QuaRot — an orthonormal rotation preserves the dot product
+    // but makes both int4-friendly), ONE ork_mm_run_i4 per active expert, per-(row,channel) fp32 dequant.
+    // Each expert packs once, resident across IOVA domains (ork_weight_domain/domain_advance) keyed by its
+    // host-ptr with is_expert=1 (so ork_wcache_evict_experts can reclaim it, dense untouched). Returns before
+    // the int8 machinery, so that path stays byte-identical. Mirrors ggml_backend_ork_mul_mat_group_i4.
+    if (ctx->qbits == 4 && ctx->hadamard) {
+        const int fb = K & (-K);                                  // FWHT block = largest pow2 dividing K
+        std::unordered_map<int, std::vector<std::pair<int,int>>> buckets;
+        for (int t = 0; t < n_tokens; t++) {
+            const int32_t * idp = (const int32_t *)((const char *) ids->data + (size_t) t * ids->nb[1]);
+            for (int j = 0; j < n_used; j++) buckets[idp[j]].push_back(std::make_pair(t, j));
+        }
+        std::vector<int8_t> bi, ai; std::vector<int32_t> ci; std::vector<float> f32e, as;
+        // #54 RESIDENT MULTI-DOMAIN (NOT streaming): experts pack ONCE into their layer's IOMMU domain
+        // (ork_weight_domain byte-balances layers across the auto-sized n_domains) and stay resident zero-copy —
+        // NO per-layer evict/re-import. The auto-sizer sizes n_domains to the full ~15.6 GiB int4 footprint so
+        // the whole model lives across the domains at once. (Legacy ORK_MOE_STREAM_MB eviction removed — it forced
+        // 19 GiB through one domain, the wrong regime for this NPU.)
+        // #54 COALESCE: pass 1 builds each M>=2 expert's int4 activation into a PERSISTENT slot + gathers a task;
+        // one ork_mm_run_i4_experts chains them all through the doorbell; pass 2 dequants. reserve() so push_back
+        // never reallocs (task pointers stay valid). All same domain (ork_weight_domain is per-layer deterministic).
+        const int n_bkt = (int) buckets.size();
+        std::vector<std::vector<int8_t>>  co_ai;  co_ai.reserve(n_bkt);
+        std::vector<std::vector<int32_t>> co_ci;  co_ci.reserve(n_bkt);
+        std::vector<std::vector<float>>   co_as;  co_as.reserve(n_bkt);
+        std::vector<std::vector<std::pair<int,int>>> co_rows; co_rows.reserve(n_bkt);
+        std::vector<const float*> co_bs; co_bs.reserve(n_bkt);
+        std::vector<int> co_Mr; co_Mr.reserve(n_bkt);
+        std::vector<ork_mm_task_i4> co_tasks; co_tasks.reserve(n_bkt);
+        for (auto & kv : buckets) {
+            const int e = kv.first; auto & rows = kv.second;
+            // PREFILL-ONLY on the NPU: route M=1 expert buckets (decode, or a rarely-routed prefill expert) to
+            // the CPU. Matches the design (decode runs on CPU via the mmap'd weights) and keeps the int4 NPU
+            // path to the M>=2 BCHAIN case only — the M=1 per-row int4 path is not used. ORK_I4_M1_NPU forces old.
+            if ((int) rows.size() == 1 && !getenv("ORK_I4_M1_NPU")) {
+                const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
+                std::vector<float> wcol(K);
+                const int t = rows[0].first, jj = rows[0].second;
+                const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jj)*src1->nb[1] + (size_t) t*src1->nb[2]);
+                float * dr = (float *)(dbase + (size_t) jj * dst->nb[1] + (size_t) t * dst->nb[2]);
+                for (int n = 0; n < N; n++) {
+                    const char * wsrc = x + (size_t) n * src0->nb[1];
+                    if (type == GGML_TYPE_F32) memcpy(wcol.data(), wsrc, (size_t) K*sizeof(float));
+                    else                        to_float(wsrc, wcol.data(), K);
+                    float acc = 0.f; for (int k = 0; k < K; k++) acc += wcol[k] * y[k]; dr[n] = acc;
+                }
+                continue;
+            }
+            const void * key = (const char *) src0->data + (size_t) e * src0->nb[2];
+            auto it = ctx->wcache.find(key);
+            if (it == ctx->wcache.end()) {                        // load-from-orkpack or cold-pack, resident
+                ork_weight ow; ow.gsize = 0; ow.bscale.resize(N); ow.is_expert = true;
+                const char * x = (const char *) src0->data + (size_t) e * src0->nb[2];
+                // Prefer the orkpack's native-int4 expert bytes (these carry the GPTQ codes when the pack was
+                // GPTQ-built); on a miss (no orkpack / not-yet-dumped) cold-pack from src0 (FWHT + int4 RTN).
+                const orkpack_entry * pe = nullptr;
+                if (ctx->persist_mode == 1 && ctx->persist_map) {
+                    auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
+                    if (pit != ctx->persist_idx.end() && pit->second.dtype == ORKPACK_DT_I4_NATIVE &&
+                        pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N) pe = &pit->second;
+                }
+                if (!pe) {                                        // cold quantize the plane -> bi + ow.bscale
+                    bi.resize((size_t) K * N); f32e.resize((size_t) N * K);
+                    #pragma omp parallel for schedule(static)
+                    for (int n = 0; n < N; n++) {
+                        float * col = f32e.data() + (size_t) n * K;
+                        if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*src0->nb[1], (size_t) K*sizeof(float));
+                        else                        to_float(x + (size_t) n*src0->nb[1], col, K);
+                        for (int o = 0; o < K; o += fb) ork_fwht_norm(col + o, fb);
+                        float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                        float s = mx / 7.0f; ow.bscale[n] = s;
+                        for (int k = 0; k < K; k++) { int q = (int) lrintf(col[k] / s);
+                            bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
+                    }
+                }
+                // MULTI-DOMAIN resident via IMPORT (bcreate faults at scale on the big int4 set — the load must
+                // import). NOTE (#54, open): the int4 RUN reads imported weights in NON-0 domains wrong on the
+                // 2nd+ buffer (int8's run reads imported non-0 weights bit-exact — this is an int4-run-specific
+                // integration bug still to fix). Per-expert import also saturates IOMMU mappings (~2340/dom) at
+                // full scale. ORK_I4_ARENA consolidates to fewer chunks but hit a chunk-boundary read bug.
+                int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(src0->name));
+                ork_npu_set_pack_domain(ctx->npu, _dom);
+                auto mk = [&]() -> ork_w * {
+                    if (!pe) return ork_mm_pack_i4(ctx->npu, K, N, bi.data());
+                    // #54 RESIDENT MULTI-DOMAIN: zero-copy import (page-cache-mapped) across MANY light domains —
+                    // domains are cheap (mapped to the page cache, count limit >> 8), so keep weights zero-copy
+                    // (NOT bcreate/pinned-copy). The wall is the bcreate run-SCRATCH (pinned pool), fixed separately.
+                    return ork_mm_load_i4_import(ctx->npu, K, N, (const char *) ctx->persist_map + pe->blob_off, pe->blob_size);
+                };
+                ow.w = mk();
+                while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) ow.w = mk();
+                if (ow.w) {
+                    if (pe && pe->bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + pe->bscale_off, (size_t) pe->bscale_n * sizeof(float));
+                    ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+                    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
+                    it = ctx->wcache.emplace(key, std::move(ow)).first;
+                } else {                                          // load failed: CPU f32 GEMV fallback (dequant from src0)
+                    std::vector<float> wcol(K);
+                    for (auto & r : rows) {
+                        const int t = r.first, jj = r.second;
+                        const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jj)*src1->nb[1] + (size_t) t*src1->nb[2]);
+                        float * dr = (float *)(dbase + (size_t) jj * dst->nb[1] + (size_t) t * dst->nb[2]);
+                        for (int n = 0; n < N; n++) {
+                            const char * wsrc = x + (size_t) n * src0->nb[1];
+                            if (type == GGML_TYPE_F32) memcpy(wcol.data(), wsrc, (size_t) K*sizeof(float));
+                            else to_float(wsrc, wcol.data(), K);
+                            float acc = 0.f; for (int k = 0; k < K; k++) acc += wcol[k] * y[k]; dr[n] = acc;
+                        }
+                    }
+                    continue;
+                }
+            }
+            const ork_weight & ow = it->second;
+            const int Mr = (int) rows.size();                     // Mr>=2 here (Mr==1 went to CPU above)
+            // #54 M-pad granularity: was hard 32 ("like the dense path"), but MoE experts avg ~16 routed rows,
+            // so pad-to-32 DOUBLES the BCHAIN M-groups (NG=ceil(Mp/H), H=8 for gate/up K=2048) → ~1.6x wasted
+            // programs. BCHAIN handles any M (partial last group), so pad only to 16 (aligned to both H=8/H=16;
+            // halves NG for the common Mr~16). ORK_MOE_MPAD=32 restores baseline; =8 or =1 (exact Mr) sweep further.
+            // MEASURED (35B pp512, 2026-08-11): 32→5.57, 16→5.38, 8→4.03 t/s — reducing the pad does NOT help
+            // end-to-end (the isolated single-matmul 1.6× doesn't translate: routed Mr mostly rounds to 32 anyway,
+            // and the prefill wall isn't the expert-matmul NG count). Default stays 32; knob kept for experiments.
+            static const int mpad = getenv("ORK_MOE_MPAD") ? atoi(getenv("ORK_MOE_MPAD")) : 32;
+            const int Mp = (mpad <= 1) ? Mr : ((Mr + mpad - 1) / mpad) * mpad;
+            co_ai.emplace_back((size_t) Mp * K); co_ci.emplace_back((size_t) Mp * N); co_as.emplace_back(Mp);
+            std::vector<int8_t> & aiE = co_ai.back(); std::vector<float> & asE = co_as.back();
+            #pragma omp parallel for if (Mp >= 16)
+            for (int r = 0; r < Mp; r++) {                         // rotate + int4-quant each routed activation
+                if (r < Mr) {
+                    const int t = rows[r].first, jj = rows[r].second;
+                    const float * y = (const float *)((const char *) src1->data + (size_t)(bcast?0:jj)*src1->nb[1] + (size_t) t*src1->nb[2]);
+                    float arow[K]; memcpy(arow, y, (size_t) K*sizeof(float));
+                    for (int o = 0; o < K; o += fb) ork_fwht_norm(arow + o, fb);
+                    float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                    float s = mx / 7.0f; asE[r] = s;
+                    for (int k = 0; k < K; k++) { int q = (int) lrintf(arow[k] / s);
+                        aiE[(size_t) r*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q); }
+                } else { memset(aiE.data() + (size_t) r*K, 0, K); asE[r] = 0.0f; }
+            }
+            ork_mm_task_i4 tk4; tk4.w = ow.w; tk4.M = Mp; tk4.A = aiE.data(); tk4.C = co_ci.back().data();
+            co_tasks.push_back(tk4);                               // gather for the coalesced doorbell
+            co_rows.push_back(rows); co_bs.push_back(ow.bscale.data()); co_Mr.push_back(Mr);
+        }
+        // #54 pass 2: ONE coalesced doorbell for ALL this tensor's M>=2 experts (chained across cores), then
+        // per-expert fp32 dequant scatter. Replaces the per-expert submit storm (~1152/layer -> ~nc/layer).
+        if (!co_tasks.empty()) {
+            // #54 DEFAULT = per-expert via ork_mm_run_i4 -> run_i4_bchain_db, which rides the PROVEN doorbell
+            // recover (mc_recover_resubmit: RESET + re-seed + resubmit missed cores, domain-safe — the same path
+            // int8 colsplit uses across 8 domains). The COALESCED worker (ork_mm_run_i4_experts / bch_mw_worker)
+            // does NOT ride mc_recover_resubmit — its raw submit + inline drop corrupts the IOMMU domain-switch
+            // in multi-domain (soft reset -> "switch iommu domain time out"). Opt into coalescing (once ported
+            // onto mc_recover_resubmit) with ORK_I4_COALESCE=1. Both write co_ci[q] for the dequant below.
+            static const bool coalesce = getenv("ORK_I4_COALESCE") != nullptr;
+            if (coalesce && ork_mm_run_i4_experts(ctx->npu, co_tasks.data(), (int) co_tasks.size(), 3) == 0) {
+                /* coalesced landed */
+            } else {
+                for (size_t q = 0; q < co_tasks.size(); q++)
+                    if (ork_mm_run_i4(ctx->npu, co_tasks[q].w, co_tasks[q].M, co_ai[q].data(), co_ci[q].data())) return false;
+            }
+            for (size_t q = 0; q < co_tasks.size(); q++) {
+                const int32_t * ciq = co_ci[q].data(); const float * asq = co_as[q].data(); const float * bs = co_bs[q];
+                for (int r = 0; r < co_Mr[q]; r++) {
+                    const int t = co_rows[q][r].first, jj = co_rows[q][r].second;
+                    float * dr = (float *)(dbase + (size_t) jj * dst->nb[1] + (size_t) t * dst->nb[2]);
+                    const float rs = asq[r]; const int32_t * cr = ciq + (size_t) r * N;
+                    for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
+                }
+            }
+        }
+        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+        return true;
+    }
 
     // pre-quantize each token's input once (per-row int8); MoE broadcasts one input across a token's
     // experts (n_b1==1). Non-broadcast quantizes per (token,slot) in the gather below.
@@ -3670,34 +4163,53 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     }
     // ========================== END PATH (b) ==========================================
 
-    const size_t eff_cap = batched ? (size_t) -1 /*budget-limited only*/ : hot_K;
-    std::vector<int> hot_e; std::vector<ggml_backend_ork_context::ork_hot_slot *> hot_s;
+    // (get_hot's per-tensor eff_cap removed from this path — the footprint-derived residence mode governs
+    //  eviction now, not a per-tensor cap; RESIDENT resolves via ork_resolve_weight_i8, STREAM -> CPU.)
+    std::vector<int> hot_e; std::vector<ork_weight *> hot_s;   // ork_weight (wcache) — same .w/.bscale fields as the old hot_slot
     // STEP B — DECODE CPU/NPU SPLIT. At decode (max_Me < batch_minM) route a FRACTION of the active experts
     // to the NON-BLOCKING async doorbell (ork_submit_async, which overlaps run_cold) instead of all-CPU. The
     // blocking #14 rendezvous lost net (profiled); the thread-free doorbell should overlap for free. Knob:
     //   ORK_SPLIT_FRAC (default 0.0) = CPU-only baseline;  0.5 = half the experts to the NPU async share.
     // Prefill (max_Me >= batch_minM) admits all as before; ORK_M1_NPU forces all-decode-on-NPU (old A/B).
     static const bool  m1_npu     = env_enabled("ORK_M1_NPU");
+    // ORK_MOE_CPU (task #54, NF4 route): force ALL experts to the CPU cold path (the batched int4/NF4 NEON
+    // GEMM) instead of the NPU — the "prefill using only int4 from orkpack on CPU" A/B. The int4 weights stay
+    // resident once (the mmap'd orkpack blob the ork-native cold path reads); the NPU IOVA copy is unused.
+    static const bool  cpu_only   = env_enabled("ORK_MOE_CPU");
     static const float split_frac = getenv("ORK_SPLIT_FRAC") ? (float) atof(getenv("ORK_SPLIT_FRAC")) : 0.0f;
     const bool prefill_phase = ((int) max_Me >= batch_minM);
     const int  n_active_e    = (int) buckets.size();
     const int  npu_budget    = prefill_phase ? n_active_e
                              : (m1_npu ? n_active_e : (int) lrintf(split_frac * (float) n_active_e));
     int npu_admitted = 0;
+    // STREAM residence (task #54): before resolving THIS _exps tensor's experts, evict prior layers' experts
+    // (LRU, experts-only; dense stays resident) so the streamed working set stays bounded (~ORK_MOE_STREAM_MB,
+    // default 2 GiB ≈ a couple of layers). The 35B's ~30 GB int8-inflate can't fit resident -> it streams.
+    // RESIDENT mode skips this (the whole footprint fits; experts accumulate resident, zero churn).
+    if (ctx->residence_stream) {
+        static const size_t stream_bytes = (getenv("ORK_MOE_STREAM_MB") ? (size_t) atoll(getenv("ORK_MOE_STREAM_MB")) : 2048) * (size_t) 1024 * 1024;
+        ork_wcache_evict_experts(ctx, stream_bytes);
+    }
     for (auto & kv : buckets) {
         const int e = kv.first;
-        const void * x = (const char *) src0->data + (size_t) e * src0->nb[2];
-        bool resident = hotmap.count(x) && hotmap[x].w;
-        // PATH B: conforming K always NPU-eligible; non-conforming K only when this expert has enough
-        // routed rows (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
+        // conforming K always NPU-eligible; non-conforming K only when this expert has enough routed rows
+        // (M_e) to amortize the submit (the prefill / batched-verify regime). allk forces all.
         const int M_e = (int) kv.second.size();
         const bool npu_ok = conforming_k || allk || (M_e >= down_minM);
         const bool npu_phase_ok = (npu_admitted < npu_budget);   // split budget (decode: split_frac share; prefill: all)
-        // admit to NPU if the shape conforms, we're within the NPU budget, AND (resident, or headroom)
-        ggml_backend_ork_context::ork_hot_slot * s =
-            (npu_ok && npu_phase_ok && (resident || hotmap.size() < eff_cap)) ? get_hot(e, eff_cap) : nullptr;
+        // FOOTPRINT-DERIVED RESIDENCE (task #54). RESIDENT mode: resolve the expert through the SHARED
+        // streaming loader (ork_resolve_weight_i8 expert-overload -> zero-copy import + ork_weight_domain +
+        // multi-domain + shared wcache), CO-RESIDENT for the chain (allow_evict=false: a chained submit must
+        // not evict its own in-flight weights -> UAF; the residence mode, not this call, is the evict policy).
+        // STREAM mode (footprint > RAM budget) or a resolve-miss: expert falls to the CPU NF4 path below.
+        // get_hot (the old per-expert single-domain hot cache) is no longer on this path (it was the S0 churn).
+        ork_weight * s = nullptr;
+        if (npu_ok && npu_phase_ok && !cpu_only) {
+            auto rit = ork_resolve_weight_i8(ctx, src0, K, N, src0->nb[1], type, to_float, /*allow_evict*/false, /*expert*/e);
+            if (rit != ctx->wcache.end() && rit->second.w) { rit->second.is_expert = true; s = &rit->second; }
+        }
         if (s) { hot_e.push_back(e); hot_s.push_back(s); npu_admitted++; }
-        else   { cpu_expert(e, kv.second); }   // non-conforming or budget/cap-full -> CPU (deferred; run threaded below)
+        else   { cpu_expert(e, kv.second); }   // STREAM / non-conforming / resolve-miss -> CPU (NF4 decode kernel)
     }
 
     // Pre-quantize all needed token activations single-threaded (qact grows; not thread-safe), then build
@@ -3711,6 +4223,61 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         if (cold.empty()) return;
         const double cd0 = ctx->profile ? ork_now_us() : 0;
         const int n_cold = (int) cold.size();
+
+        // BATCHED int4 cold path (ORK_MOE_COLD_BATCH, default ON for the ork-native I4 orkpack): instead of a
+        // per-(token,slot) M=1 GEMV (which re-reads+re-unpacks each expert weight per routed row), gather each
+        // cold expert's M_e rows and run ONE ork_cpu_gemm_i4 (4x4-blocked, weight/unpack amortized across
+        // rows — the prefill lever; ~2.35x on the expert GEMM, bit-exact per test_i4_gemm). Threads over
+        // EXPERTS (one batched call each). Activations pre-quantized single-threaded (quant_tok_i8 resizes ai8,
+        // not thread-safe), then the workers only read the stable ai8. NF4/i8/non-native fall to the loop below.
+        static const bool cold_batch = !getenv("ORK_MOE_COLD_BATCH") || atoi(getenv("ORK_MOE_COLD_BATCH")) != 0;
+        const bool batch_fmt = (ofmt == ORK_CPU_I4 || ofmt == ORK_CPU_NF4);   // batched kernels cover I4 + NF4
+        if (getenv("ORK_VERBOSE")) { static int g=0; if(!g){ g=1;
+            fprintf(stderr, "[ork COLD-GATE] ork_native=%d ofmt=%d(0=I4,1=NF4) cold_experts=%d cold_batch=%d -> batched=%d\n",
+                (int)ork_native, (int)ofmt, (int)cold.size(), (int)cold_batch, (int)(ork_native && batch_fmt && cold_batch)); } }
+        if (ork_native && batch_fmt && cold_batch) {
+            // pre-quantize every cold (token,slot) activation single-threaded + record its ai8 row per expert.
+            std::vector<std::vector<int>> eidx(cold.size());   // eidx[ce] = i8 row index per pair of that expert
+            for (size_t ce = 0; ce < cold.size(); ce++) {
+                auto & ent = *cold[ce].second; eidx[ce].resize(ent.size());
+                for (size_t m = 0; m < ent.size(); m++) eidx[ce][m] = quant_tok_i8(ent[m].first, ent[m].second);
+            }
+            const int8_t * ai8base = ai8.data();   // stable now (no more resizes)
+            unsigned hw = std::thread::hardware_concurrency();
+            int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
+            if (nthr < 1) nthr = 1; if (nthr > (int) cold.size()) nthr = (int) cold.size();
+            static const bool cbpin = !env_enabled("ORK_NO_AFFINITY");
+            std::atomic<int> nexte(0);
+            auto bworker = [&]() {
+                if (cbpin) { cpu_set_t s; CPU_ZERO(&s); for (int c = 4; c < 8; c++) CPU_SET(c, &s); sched_setaffinity(0, sizeof s, &s); }
+                std::vector<int8_t> Ag; std::vector<float> ascg, outg;
+                int ce; while ((ce = nexte.fetch_add(1)) < (int) cold.size()) {
+                    const int e = cold[ce].first; auto & ent = *cold[ce].second; const int Me = (int) ent.size();
+                    if (Me == 0) continue;
+                    ork_cpu_w w; memset(&w, 0, sizeof w);
+                    w.fmt = ofmt; w.nibble = onib[e]; w.bscale = obsc[e]; w.nf4_lut = ork_lutv; w.K = K; w.N = N;
+                    Ag.resize((size_t) Me * K); ascg.resize(Me); outg.assign((size_t) Me * N, 0.f);
+                    for (int m = 0; m < Me; m++) { const int idx = eidx[ce][m];
+                        memcpy(Ag.data() + (size_t) m * K, ai8base + (size_t) idx * K, (size_t) K); ascg[m] = ai8sc[idx]; }
+                    if (ofmt == ORK_CPU_NF4) ork_cpu_gemm_nf4(&w, Ag.data(), K, ascg.data(), outg.data(), N, Me, 0, N);
+                    else                     ork_cpu_gemm_i4 (&w, Ag.data(), K, ascg.data(), outg.data(), N, Me, 0, N);
+                    for (int m = 0; m < Me; m++) { const int t = ent[m].first, j = ent[m].second;
+                        float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
+                        memcpy(dr, outg.data() + (size_t) m * N, (size_t) N * sizeof(float)); }
+                }
+            };
+            if (nthr <= 1) { bworker(); }
+            else { cpu_set_t saved; bool hs = cbpin && sched_getaffinity(0, sizeof saved, &saved) == 0;
+                std::vector<std::thread> th; th.reserve(nthr - 1);
+                for (int wi = 0; wi < nthr - 1; wi++) th.emplace_back(bworker);
+                bworker(); for (auto & t : th) t.join();
+                if (hs) sched_setaffinity(0, sizeof saved, &saved); }
+            ctx->moe_cold_cpu += n_cold;
+            if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold;
+                if (ctx->moe_calls < 4) fprintf(stderr, "[ork MoE COLD-BATCH i4] %d experts, gemm_i4 batched (weight amortized)\n", n_cold); }
+            return;
+        }
+
         std::vector<cold_item> items;
         const int ROW_BLK = 256;
         for (auto & ce : cold) {
@@ -6204,6 +6771,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 break;
             }
             case GGML_OP_MUL_MAT_ID: {
+                if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK MMID-COMPUTE] node src0=%s\n",   // DIAG: does ork ever run the MoE op?
+                    node->src[0] ? node->src[0]->name : "?");
+                if (env_enabled("ORK_MOE_BIGLITTLE")) {
+                    if (!ggml_backend_ork_mul_mat_id_biglittle(ctx, node)) return GGML_STATUS_FAILED;
+                    break;
+                }
                 if (!ggml_backend_ork_mul_mat_id_i8(ctx, node)) return GGML_STATUS_FAILED;
                 break;
             }
@@ -6465,34 +7038,65 @@ ggml_backend_t ggml_backend_ork_init(void) {
           const bool f16route = getenv("ORK_FFN_F16") != nullptr;
           const bool chain    = ork_ffn_chain_on() && ctx->qbits == 8;   // packs a coexisting per-tensor fc.wg per ffn_gate
           const bool no_bf = getenv("ORK_NO_BF") != nullptr;   // NO_BF sheds the full-K Bf rebuild -> don't size for it
-          size_t inflated = 0;
+          // RAM budget first — the adaptive Bf decision below is a footprint-vs-budget comparison.
+          long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
+          size_t phys = (pg > 0 && ps > 0) ? (size_t) pg * (size_t) ps : (size_t) 31 * 1024*1024*1024;
+          size_t budget = (size_t) (0.72 * (double) phys);   // ~72% for resident weights; rest = activations/KV/page-cache
+          if (const char * rb = getenv("ORK_RESIDENCE_RAM_MB")) budget = (size_t) atoll(rb) * 1024*1024;
+          // Split the footprint into base (Bb + fp16/chain extras, ALWAYS resident) and bf_extra (the decode-only
+          // full-K Bf companion, ~doubles int4 bytes). Bf is optional; base is not.
+          size_t base = 0, bf_extra = 0;
           for (const auto & kv : ctx->persist_idx) {
               const int K = (int) kv.second.K, N = (int) kv.second.N;
               size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
                                               : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
-              inflated += tile + ((K <= 4096 && !no_bf) ? tile : 0);   // + full-K Bf rebuild (unless NO_BF sheds it)
+              base += tile;
+              if (K <= 4096) bf_extra += tile;                         // full-K Bf rebuild (decode fast path only)
               if (f16route && (kv.first.find("ffn_gate") != std::string::npos ||
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
-                  inflated += (size_t) 2 * K * N;                      // fp16 tile headroom (no Bf)
+                  base += (size_t) 2 * K * N;                          // fp16 tile headroom (no Bf)
               // ORK_FFN_CHAIN: the fused per-tensor gate fc.wg (packed fresh at runtime, NOT in persist_idx)
-              // coexists with the per-channel gate — add its int8 tile + full-K Bf per ffn_gate so the domains
-              // are sized to hold it (else the runtime fc.wg pack overflows -> OOM/churn — the multi-domain
-              // 7B chain bug). Same tile shape as the gate itself (ork_pack_pt_f32 K*Nff, K<=4096 -> has Bf).
-              if (chain && kv.first.find("ffn_gate") != std::string::npos)
-                  inflated += tile + ((K <= 4096 && !no_bf) ? tile : 0);
+              // coexists with the per-channel gate — size for its tile (+Bf) per ffn_gate so a runtime pack
+              // never overflows the domains (the multi-domain 7B chain bug).
+              if (chain && kv.first.find("ffn_gate") != std::string::npos) {
+                  base += tile; if (K <= 4096) bf_extra += tile;
+              }
           }
-          // Per-domain TARGET 2.5 GiB (below the ~2.9 GiB hard IOVA limit): the read path IMPORTS
-          // (PRIME_FD_TO_HANDLE) rather than packs fresh, and import PRIME-fails with less headroom
-          // (~2.7 GiB observed) — keep each domain's byte-balanced fill well clear of that edge.
-          const size_t cap = (size_t) 2500 * 1024 * 1024;
+          // ADAPTIVE Bf (no env gate — behaviour follows the scenario): build Bf iff the WITH-Bf footprint fits
+          // the RAM budget; auto-shed it when it wouldn't (e.g. a ~15 GiB int4 MoE whose Bf would push it to
+          // ~30 GiB > budget) so the compact set stays RESIDENT instead of dropping to STREAM/CPU. The driver's
+          // pack/load honor ORK_NO_BF, so the decision is communicated by setting it INTERNALLY here — never a
+          // user gate. An EXPLICIT user ORK_NO_BF (already read into `no_bf`) still wins.
+          const bool want_bf = no_bf ? false : (base + bf_extra <= budget);
+          if (!want_bf && !no_bf) {
+              setenv("ORK_NO_BF", "1", 1);
+              fprintf(stderr, "[ORK] Bf auto-shed: with-Bf %.2f GiB > RAM budget %.2f GiB — keeping the compact "
+                              "%.2f GiB (Bb-only) set RESIDENT (decode full-K path off, prefill unaffected)\n",
+                      (base + bf_extra)/(1024.0*1024*1024), budget/(1024.0*1024*1024), base/(1024.0*1024*1024));
+          }
+          const size_t inflated = want_bf ? (base + bf_extra) : base;
+          // Per-domain fill TARGET 1.6 GiB (was 2.5): each domain must leave IOVA HEADROOM under the ~2.9 GiB
+          // hard limit for the RUN's own scratch (mtk_all multi-core task buffer, output C, activation tiles) —
+          // NOT just the weights. At 2.5 GiB the byte-balanced fill + a full-layer overshoot packed domain 0 to
+          // ~2.95 GiB (past the hard edge) so mc_ensure could not allocate the run scratch (IOMMU full -> decode
+          // -3). At 1.6 GiB the fill + overshoot stays ~2.3 GiB, leaving ~0.6 GiB per domain for run scratch.
+          /* Per-domain fill cap: domains are page-cache-mapped and plentiful (count limit >> 8), so MANY light
+           * domains is fine and keeps each domain's IOVA window mostly free for the run scratch. 1 GiB/domain. */
+          const size_t cap = (size_t) 1000 * 1024 * 1024;
           long nd = (long) ((inflated + cap - 1) / cap);
-          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // no small cap; 63 = the system's owned_dom bitmask ceiling (~155 GiB, beyond any RK3588)
+          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // 63 = owned_dom bitmask ceiling (~155 GiB)
           if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
+          // Hard headroom clamp: never target a fill so high that fill + a full-layer overshoot could approach the
+          // ~2.9 GiB hard IOVA edge and starve the run scratch (protects models the byte-balance leaves lumpy).
+          if (ctx->domain_fill_cap > (size_t) 1900 * 1024 * 1024) ctx->domain_fill_cap = (size_t) 1900 * 1024 * 1024;
+          ctx->residence_footprint = inflated;
+          ctx->residence_ram_budget = budget;
+          ctx->residence_stream = (inflated > budget) ? 1 : 0;       // even Bb-only overflows -> stream by layer
           if (getenv("ORK_VERBOSE"))
-              fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom, byte-balanced) from %.2f GiB resident footprint\n",
-                      ctx->n_domains, ctx->domain_fill_cap / (1024.0*1024.0*1024.0),
-                      inflated / (1024.0 * 1024.0 * 1024.0));
+              fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom) footprint %.2f GiB (Bf %s) vs RAM budget %.2f GiB -> %s\n",
+                      ctx->n_domains, ctx->domain_fill_cap/(1024.0*1024*1024), inflated/(1024.0*1024*1024),
+                      want_bf ? "on" : "auto-shed", budget/(1024.0*1024*1024), ctx->residence_stream ? "STREAM-by-layer" : "RESIDENT");
       } else {
           // No .orkpack index (live-pack / write mode): footprint unknown up front (weights arrive one matmul
           // at a time). Keep a domain ceiling; ork_weight_domain() fills only as many as the resident set needs.
@@ -6712,6 +7316,11 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
     }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    if (getenv("ORK_VERBOSE") && op->op == GGML_OP_MUL_MAT_ID)   // DIAG: is ork ever asked about the MoE op?
+        fprintf(stderr, "[ORK MMID-ENTRY] name=%s type=%s buft=%s via_orkd=%d\n",
+            src0 ? src0->name : "?", src0 ? ggml_type_name(src0->type) : "?",
+            (src0 && src0->buffer) ? ggml_backend_buft_name(src0->buffer->buft) : "(none)",
+            (g_ork_ctx && g_ork_ctx->via_orkd) ? 1 : 0);
     switch (op->op) {
         case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW:
         case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
@@ -6894,8 +7503,16 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // legacy alias: ORK_NO_EXPERT_REPACK). NOTE: the matching repack-buffer exclusion in
             // ggml-cpu/repack.cpp is gated on bare getenv presence, so to actually route experts to the
             // NPU set the var to a truthy value (don't disable here by setting 0 while leaving it present).
-            if (!env_enabled("ORK_MOE_NPU") && !env_enabled("ORK_NO_EXPERT_REPACK")) return false;
-            {   // one-time loud warning when the experimental MoE-on-NPU path is actually enabled
+            // ORK_MOE_BIGLITTLE: claim MUL_MAT_ID for the proportional big+little CPU dispatcher (NOT the
+            // NPU). Weights stay in the CPU repack buffer (repack.cpp still assigns it: gated on !ORK_MOE_NPU,
+            // independent of who claims the compute), so the delegated sub-graph gets the repacked fast kernel.
+            const bool biglittle = env_enabled("ORK_MOE_BIGLITTLE");
+            // ORK_MOE_CPU (task #54, NF4/int4 CPU route): claim MUL_MAT_ID so the handler runs and routes
+            // every expert to the batched CPU int4/NF4 NEON GEMM (the "prefill using only int4 from orkpack
+            // on CPU" A/B). Also required in WRITE mode so persist_write_experts emits the O4N1 experts.
+            const bool cpu_only_op = env_enabled("ORK_MOE_CPU");
+            if (!biglittle && !cpu_only_op && !env_enabled("ORK_MOE_NPU") && !env_enabled("ORK_NO_EXPERT_REPACK")) return false;
+            if (!biglittle && !cpu_only_op) {   // one-time loud warning when the experimental MoE-on-NPU path is actually enabled
                 static bool warned = false;
                 if (!warned) { warned = true;
                     fprintf(stderr, "[ork] WARNING: ORK_MOE_NPU MoE-on-NPU expert offload is EXPERIMENTAL "
@@ -6908,6 +7525,15 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const struct ggml_tensor * b = op->src[1];   // input
             const struct ggml_tensor * c = op->src[2];   // ids (i32)
             const int64_t K = a->ne[0], N = a->ne[1];
+            // REPACK-PRESERVING BIG.LITTLE: ork's ORK_Weights buft is FIRST in the load-time buft_list, so
+            // if we claim MUL_MAT_ID for ANY buffer, select_weight_buft parks the experts in ORK_Weights
+            // (plain, non-repacked) BEFORE reaching the CPU repack buffer -> the delegated CPU kernel runs
+            // slow plain-Q4_K (-17%). Fix: DECLINE when src0 is in ork's OWN buffer type, so at load
+            // select_weight_buft falls through to the repack buffer; ACCEPT when src0 is in a host CPU
+            // buffer, so at schedule time the offload_op override (ggml-backend.cpp) still routes the
+            // COMPUTE to ork (zero-copy, weight stays repacked). The big.little handler aliases src0->buffer
+            // so ggml's repacked fused kernel then fires. (BIGLITTLE only; the NPU path packs its own int4.)
+            if (biglittle && a->buffer && a->buffer->buft == ggml_backend_ork_buffer_type()) return false;
             // NOTE: must accept ALL n_tokens (not just decode) — the graph split is planned with a
             // worst-case multi-token batch, and gating on b->ne[2]==1 made the planner leave the
             // experts on CPU. The handler loops over tokens, so multi-token is handled (correctly,
@@ -7018,6 +7644,16 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_ork_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    // BIG.LITTLE unlock: also accept the CPU repack buffer. It is PHYSICALLY host memory (CPU RAM) in a
+    // tile-reordered layout; is_host() returns false only to stop other backends reading it raw. ork's MoE
+    // handler never reads it raw — it re-runs ggml_mul_mat_id on it, so ggml's own repack-aware kernel
+    // interprets the layout. Declaring support makes ggml_backend_sched_backend_from_buffer route the
+    // repack-resident routed experts to ork (highest-prio backend that supports_buft+supports_op), so the
+    // big+little dispatcher actually executes WITH the repacked kernel — resolving the host-vs-repack
+    // catch-22 (offload needs host; fast kernel needs the non-host repack buffer). No copy: ork reads the
+    // host bytes in place via delegation. Gated on ORK_MOE_BIGLITTLE so no other routing changes; dense
+    // Q4_K weights in the same buffer still stay on CPU (ork's supports_op declines them: sub-5-bit gate).
+    if (env_enabled("ORK_MOE_BIGLITTLE") && buft == ggml_backend_cpu_repack_buffer_type()) return true;
     return ggml_backend_buft_is_host(buft); GGML_UNUSED(dev);
 }
 
