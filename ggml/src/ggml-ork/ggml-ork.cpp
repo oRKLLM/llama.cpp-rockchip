@@ -299,7 +299,11 @@ struct ork_moe_slot {
 // backends can run real attention graphs concurrently without clobbering each other's QK^T/scores/softmax
 // buffers. Pool = NPU scratch weights (wqk/wav/wet) + host densify/score buffers, warm-reused across calls of
 // the same shape. attn_sm = the softmax scratch (int8 scores, per-row max, exp/reduce/normalize buffers).
-struct ork_attn_pool { int DK,DV,N,nkvp,H; ork_w **wqk, **wav, **wet;
+// `dom` = the IOMMU domain this pool's fp16 scratch weights live in. The pool is keyed by domain (one pool
+// per domain, see ctx->attnp) so the fused attention always runs in the domain that is ALREADY ACTIVE and
+// therefore adds NO `switch iommu domain` — the switch is what a stuck doorbell job turns into a 60 s stall
+// on the next submit. See attn_pool_ensure.
+struct ork_attn_pool { int DK,DV,N,nkvp,H,dom; ork_w **wqk, **wav, **wet;
     ork_f16 *Qf, *KT, *Vf, *Pf, *Oh16; float *scores, *outf, *invS; ork_mm_task_f16 *tk; };
 struct ork_attn_sm {
     int16_t *xi=nullptr,*ei=nullptr; float *mx=nullptr,*ss=nullptr; ork_f16 *e=nullptr; size_t cap=0;
@@ -494,7 +498,11 @@ struct ggml_backend_ork_context {
     enum ggml_status async_status = GGML_STATUS_SUCCESS;
     // Per-context fused-attention scratch (moved off the old process-global g_attnp / softmax statics) so
     // concurrent ork backends don't corrupt each other's attention buffers. Freed in ggml_backend_ork_free.
-    struct ork_attn_pool attnp = {};
+    // PER-IOMMU-DOMAIN fused-attention pools, keyed by domain id. One pool per domain that actually hosts
+    // attention layers (2 on the 35B: dom 0 + dom 1), so each layer's attention runs co-domain with its own
+    // resident int8 weights and the run never switches domains for attention. A pool is ~1-2 MB, so a
+    // handful of them is noise. See attn_pool_ensure for why co-domain matters.
+    std::unordered_map<int, struct ork_attn_pool> attnp = {};
     struct ork_attn_sm   attn_sm = {};
     // Resident-KV for the int8 DECODE attention path (ORK_ATTN_KV): pack K^T/V ONCE per (layer, kv-head)
     // then append one key/value per token (no per-call repack — the perf lever, vs the default repack path).
@@ -4605,15 +4613,40 @@ static void ork_quant_f16_i8_perchan(const ork_f16 * w, int K, int N,
 }
 // Fetch (allocate once, then reuse) a shared fp16 scratch weight of shape (K,N). Allocated in a weight
 // domain like the resident packs; cached on ctx keyed by (K<<32|N). Returns NULL if every domain is full.
+// CO-DOMAIN placement (the ORK_ATTN submit-timeout fix). A scratch is TRANSIENT: unlike a resident weight
+// it has no natural home domain, so it must be placed where it costs the LEAST — and the cost that matters
+// is not bytes, it is IOMMU DOMAIN SWITCHES. Placing it by byte-balancing (ork_weight_domain) puts it in a
+// domain OTHER than the layer's resident int8 weights, so every bmm forces two `switch iommu domain` events
+// (into the scratch's domain and back). A switch waits for the outgoing domain's job refcount to reach 0,
+// and a nonblock doorbell job whose completion IRQ never fired holds that refcount forever — so the switch
+// stalls the NEXT submit for the full 60 s submit timeout (kernel: "commit elapse time: 61.2s" then "job
+// timeout"), then ork self-heals with a reset. That is the whole ORK_ATTN collapse: 3 such events x 60 s
+// == the entire 186 s pp64 wall (measured). ork-driver already has the reap-at-boundary machinery for this
+// (dom_dirty / ork_dom_flush_if_dirty) but it is armed only for int4 doorbell drops.
+// So: allocate the scratch in the domain that is ALREADY ACTIVE, and key the cache by (dom,K,N). The bmm
+// sits between the same layer's int8 attn_q/k/v and attn_output, which are co-domain by the layer-aligned
+// residence rule, so the active domain IS that layer's domain -> the bmm adds ZERO switches and the run
+// switches exactly as often as the (0-failure) ORK_ATTN=0 baseline. Cost: one small scratch per (dom,K,N)
+// instead of per (K,N) — the attention/GDN shapes are tens of KB, so this is noise.
+// Falls back to the old byte-balanced placement + domain_advance only if the co-domain alloc fails.
 static ork_w * ork_get_f16_scratch(ggml_backend_ork_context * ctx, int K, int N) {
-    uint64_t key = ((uint64_t) (uint32_t) K << 32) | (uint32_t) N;
+    const int adom = ork_npu_active_domain(ctx->npu);
+    uint64_t key = ((uint64_t) (uint32_t) adom << 48) | ((uint64_t) (uint32_t) (K & 0xffffff) << 24) | (uint32_t) (N & 0xffffff);
     auto it = ctx->f16_scratch.find(key);
     if (it != ctx->f16_scratch.end()) return it->second;
-    int dom = ork_weight_domain(ctx, (size_t) K * N * 2, -1); ork_npu_set_pack_domain(ctx->npu, dom);
+    const int saved = ork_npu_pack_domain(ctx->npu);
+    ork_npu_set_pack_domain(ctx->npu, adom);
     ork_w * s = ork_mm_f16_scratch(ctx->npu, K, N);
-    while (!s && (dom = ork_domain_advance(ctx)) >= 0) s = ork_mm_f16_scratch(ctx->npu, K, N);
-    ctx->f16_scratch[key] = s;   // cache even NULL is fine? no — cache only success so a later domain-free retries
-    if (!s) ctx->f16_scratch.erase(key);
+    if (!s) {   // co-domain alloc failed (that domain's IOVA is full) — fall back to the byte-balanced cursor
+        int dom = ork_weight_domain(ctx, (size_t) K * N * 2, -1); ork_npu_set_pack_domain(ctx->npu, dom);
+        s = ork_mm_f16_scratch(ctx->npu, K, N);
+        while (!s && (dom = ork_domain_advance(ctx)) >= 0) s = ork_mm_f16_scratch(ctx->npu, K, N);
+    }
+    ork_npu_set_pack_domain(ctx->npu, saved);   // don't leave the pack cursor pointing at the scratch domain
+    if (s) ctx->f16_scratch[key] = s;   // cache only success, so a later domain-free retries
+    if (getenv("ORK_ATTN_TRACE"))
+        fprintf(stderr, "[f16scratch] K=%d N=%d active_dom=%d -> %s dom=%d (cache=%zu)\n", K, N, adom,
+                s ? "ok" : "FAIL", s ? ork_w_domain(s) : -1, ctx->f16_scratch.size());
     return s;
 }
 
@@ -5669,7 +5702,23 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
     // head) instead of ork_bmm_fp16's per-head ork_mm_pack (a fresh ~6MB dma-buf import + cache entry ×
     // heads×layers -> PRIME_FD / bcreate OOM). Footprint = one K×N weight + reused A/C, constant regardless
     // of head/layer count — same pool discipline as ork_ssm/gdn_scan. K%32/N%16 already gated by supports_op.
-    ork_w * w = ork_mm_f16_scratch(ctx->npu, K, N);
+    // PER-RUN (not per-node) LIFETIME, and CO-DOMAIN: the scratch comes from the shared (dom,K,N)-keyed cache
+    // and is NOT freed here. It used to be ork_mm_f16_scratch()+ork_mm_free() per handler call, i.e. per NODE
+    // (~100-200 alloc/free cycles per forward pass). Two separate problems, only the second was the killer:
+    //   (1) churn — a fresh bcreate GEM per node draws from the limited CONTIGUOUS/CMA pool that bscratch()
+    //       documents as fragmenting under the resident dma-heap weights + orkpack mmap pressure. The cache
+    //       fixes that, but on its own it did NOT change the failure count (measured 9 -> 9), so churn was
+    //       NOT the cause.
+    //   (2) DOMAIN PLACEMENT — the real cause. Byte-balanced placement put the scratch in a different IOMMU
+    //       domain than the layer's resident int8 weights, so each bmm forced a `switch iommu domain` there
+    //       and back; a nonblock doorbell job whose completion IRQ never fired pins the outgoing domain's
+    //       refcount, and the switch then stalls the NEXT submit for the whole 60 s timeout. That is why the
+    //       op that FAILS is never the fp16 bmm but the int8 matmul right AFTER it — measured, every time,
+    //       ork_dyn_colsplit_ks on attn_output (K=4096 N=2048 dom=1 imported=1), errno 110, 3 events x 60 s
+    //       == the entire 186 s pp64 wall. ork_get_f16_scratch now allocates in the ALREADY-ACTIVE domain, so
+    //       the bmm adds zero switches. See the comment there for the full mechanism.
+    // ggml_backend_ork_free releases all f16_scratch entries.
+    ork_w * w = ork_get_f16_scratch(ctx, K, N);
     if (!w) return false;
     bool ok = true;
     for (int64_t i3 = 0; ok && i3 < ne3; i3++)
@@ -5685,7 +5734,8 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
             ok = false; break; }
         for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
     }
-    ork_mm_free(ctx->npu, w);
+    // NO ork_mm_free(w) — the (K,N) cache owns it (freed in ggml_backend_ork_free). Freeing per node is what
+    // churned the contiguous/CMA pool and poisoned later int8 submits (see the comment above).
     return ok;
 }
 
@@ -5938,32 +5988,70 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
 // v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
 // the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
 // (ork_attn_pool / ork_attn_sm are defined above the context struct; the pool lives PER-CONTEXT in ctx->attnp.)
-static void attn_pool_free(ggml_backend_ork_context * ctx) {
+static void attn_pool_free_one(ggml_backend_ork_context * ctx, struct ork_attn_pool * P) {
     ork_npu * c = ctx->npu;
-    struct ork_attn_pool * P = &ctx->attnp;
     if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); if (P->wet && P->wet[h]) ork_mm_free(c, P->wet[h]); }
     free(P->wqk); free(P->wav); free(P->wet); free(P->Qf); free(P->KT); free(P->Vf); free(P->Pf); free(P->Oh16);
     free(P->scores); free(P->outf); free(P->invS); free(P->tk);
+    int dom = P->dom;
     *P = (struct ork_attn_pool){0};
+    P->dom = dom;   // keep the domain: a pool object stays bound to its map key even when empty
 }
-static int attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int N, int nkvp, int H) {
+static void attn_pool_free(ggml_backend_ork_context * ctx) {   // teardown: every domain's pool
+    for (auto & kv : ctx->attnp) attn_pool_free_one(ctx, &kv.second);
+    ctx->attnp.clear();
+}
+// CO-DOMAIN fused-attention pool (the ORK_ATTN submit-timeout fix). The pool's fp16 QK^T / A·V scratch
+// weights are TRANSIENT — unlike a resident weight they have no natural home domain, so they must be placed
+// where they cost the LEAST, and the cost that matters is not bytes, it is IOMMU DOMAIN SWITCHES.
+//
+// Previously this called ork_mm_f16_scratch() with no domain control at all, so the scratch landed in
+// ork_dom(c->pack_domain) = wherever the weight loader last left the pack cursor (the LAST domain it filled),
+// and there was ONE pool shared by every attention layer. Every attention layer whose int8 weights live in a
+// different domain therefore forced two `switch iommu domain` events (into the pool's domain and back).
+// A switch waits for the outgoing domain's job refcount to reach 0, and a nonblock doorbell job whose
+// completion IRQ never fired holds that refcount forever — so the switch stalls the NEXT submit for the full
+// 60 s submit timeout (kernel: "commit elapse time: 61.2s" then "job timeout"), after which ork self-heals
+// with a reset. That is the entire ORK_ATTN collapse: 2-3 such events x 60 s == the whole ~125-186 s pp64
+// wall (measured), which is why the op that FAILS is never the attention matmul but the int8 matmul right
+// AFTER it — every time ork_dyn_colsplit_ks on attn_output (K=4096 N=2048 dom=1 imported=1), errno 110.
+// ork-driver already has reap-at-boundary machinery for exactly this (dom_dirty / ork_dom_flush_if_dirty)
+// but it is armed only for int4 doorbell drops.
+//
+// Fix: one pool PER DOMAIN, allocated in the domain that is ALREADY ACTIVE when that layer's attention runs.
+// The FA node sits between the same layer's int8 attn_q/k/v and attn_output, which are co-domain by the
+// layer-aligned residence rule, so the active domain IS that layer's domain -> attention adds ZERO switches
+// and the run switches exactly as often as the (0-failure) ORK_ATTN=0 baseline.
+// Returns the pool for the active domain, or NULL on a shape/alloc failure (caller falls back to CPU).
+static struct ork_attn_pool * attn_pool_ensure(ggml_backend_ork_context * ctx, int DK, int DV, int N, int nkvp, int H) {
     ork_npu * c = ctx->npu;
-    struct ork_attn_pool * P = &ctx->attnp;
-    if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return 0;   // warm reuse
-    attn_pool_free(ctx);
+    const int adom = ork_npu_active_domain(c);
+    struct ork_attn_pool * P = &ctx->attnp[adom];   // creates a zeroed pool for this domain on first use
+    P->dom = adom;
+    if (P->wqk && P->DK==DK && P->DV==DV && P->N==N && P->nkvp==nkvp && P->H==H) return P;   // warm reuse
+    attn_pool_free_one(ctx, P);
+    // Pin the scratch allocation to THIS domain (ork_mm_f16_scratch stamps w->domain from pack_domain), then
+    // restore the loader's cursor so a later weight pack is unaffected.
+    const int saved = ork_npu_pack_domain(c);
+    ork_npu_set_pack_domain(c, adom);
     P->wqk = (ork_w**)calloc(H, sizeof(ork_w*)); P->wav = (ork_w**)calloc(H, sizeof(ork_w*)); P->wet = (ork_w**)calloc(H, sizeof(ork_w*));
-    if (!P->wqk || !P->wav || !P->wet) { attn_pool_free(ctx); return -1; }
+    if (!P->wqk || !P->wav || !P->wet) { ork_npu_set_pack_domain(c, saved); attn_pool_free_one(ctx, P); return nullptr; }
     for (int h=0; h<H; h++) { P->wqk[h] = ork_mm_f16_scratch(c, DK, nkvp); P->wav[h] = ork_mm_f16_scratch(c, nkvp, DV);
         P->wet[h] = ork_mm_f16_scratch(c, nkvp, N);   // transposed A·V weight = e^T[nkvp][N]
-        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; attn_pool_free(ctx); return -1; } }
+        if (!P->wqk[h] || !P->wav[h] || !P->wet[h]) { P->H=H; ork_npu_set_pack_domain(c, saved); attn_pool_free_one(ctx, P); return nullptr; } }
+    ork_npu_set_pack_domain(c, saved);
     P->Qf = (ork_f16*)malloc((size_t)H*N*DK*2); P->KT = (ork_f16*)malloc((size_t)H*DK*nkvp*2);
     P->Vf = (ork_f16*)malloc((size_t)H*nkvp*DV*2); P->Pf = (ork_f16*)malloc((size_t)H*N*nkvp*2);
     P->Oh16 = (ork_f16*)malloc((size_t)H*DV*N*2);
     P->scores = (float*)malloc((size_t)H*N*nkvp*4); P->outf = (float*)malloc((size_t)H*DV*N*4);
     P->invS = (float*)malloc((size_t)H*N*4);
     P->tk = (ork_mm_task_f16*)malloc((size_t)H*sizeof(ork_mm_task_f16));
-    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free(ctx); return -1; }
-    P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H; return 0;
+    if (!P->Qf||!P->KT||!P->Vf||!P->Pf||!P->Oh16||!P->scores||!P->outf||!P->invS||!P->tk) { P->H=H; attn_pool_free_one(ctx, P); return nullptr; }
+    P->DK=DK; P->DV=DV; P->N=N; P->nkvp=nkvp; P->H=H;
+    if (getenv("ORK_ATTN_TRACE"))
+        fprintf(stderr, "[attnpool] NEW pool dom=%d DK=%d DV=%d N=%d nkvp=%d H=%d (pools=%zu)\n",
+                adom, DK, DV, N, nkvp, H, ctx->attnp.size());
+    return P;
 }
 // Resident-KV variant of the int8 decode attention (ORK_ATTN_KV): instead of packing K^T/V every call
 // (the O(nkv)/token repack tax that makes the default path perf-negative), pack ONCE per (layer, kv-head)
@@ -6194,8 +6282,8 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     const int rk2 = H/Hkv;
     const int nkvp = (nkv+31)&~31;                                     // pad KV to %32 for the fp16 stream (K%32/N%16)
     if (DK%32 || DV%16) return false;
-    if (attn_pool_ensure(ctx, DK, DV, N, nkvp, H)) return false;
-    struct ork_attn_pool * P = &ctx->attnp;
+    struct ork_attn_pool * P = attn_pool_ensure(ctx, DK, DV, N, nkvp, H);   // co-domain with the active domain
+    if (!P) return false;
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
         const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
         return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
@@ -7387,8 +7475,20 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // (max_bias==0 — op_params[1]). Everything else stays on the CPU backend. Part of the
             // attention block, gated with ORK_ATTN.
             static const int ork_attn = getenv("ORK_ATTN") != nullptr;
+            // ORK_ATTN_SM_CPU=1 must ALSO un-claim the standalone SOFT_MAX, not just the FA-internal softmax.
+            // It previously only switched ggml_backend_ork_flash_attn_ext's inner softmax (the `sm_npu` flag),
+            // so with ORK_ATTN=1 this claim stayed live and swallowed EVERY qualifying softmax in the graph —
+            // including, on a routed-MoE model, the **expert-router softmax** (ne[0]=n_expert, %32==0;
+            // ne[1]=n_tokens>1 in prefill). Routing weights then came back through the coarse int16 exp LUT
+            // (in_scale = -lo/32000) instead of fp32 expf, which perturbs top-k expert selection and their
+            // mixing weights. Measured on qwen3.6-35B-A3B: PPL 10.83 -> 67.86, and it is invisible to
+            // ORK_ATTN_CPU (which only moves the attention MATMULS) — that is what made it look like an
+            // attention-math bug. The exp LUT is fine for attention scores (renormalized per row, differences
+            // only) but not for a 128-way router distribution. Keep this claim tied to the same flag that
+            // disables the NPU softmax everywhere else.
+            static const int sm_cpu = getenv("ORK_ATTN_SM_CPU") != nullptr;
             float mb = 0.0f; memcpy(&mb, (const char *) op->op_params + sizeof(float), sizeof(float));
-            return ork_attn && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
+            return ork_attn && !sm_cpu && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
                 && op->ne[1] > 1 && op->ne[0] % 32 == 0 && mb == 0.0f;
         }
         case GGML_OP_RMS_NORM:
