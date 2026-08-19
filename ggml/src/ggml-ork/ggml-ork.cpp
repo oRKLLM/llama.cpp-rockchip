@@ -7,6 +7,28 @@
 // which is dequantized (aScale[m]*bScale[n]) into the fp32 dst. ~1% vs fp32 on real weights, half
 // the weight bytes of fp16. (int4/W4A4 + per-group scales is the next step down.)
 //
+// =================== MoE AUTO-PROFILE (no env knobs — the MODEL TYPE decides) ===================
+// A routed-MoE model (any GGML_OP_MUL_MAT_ID op, detected at load-time graph planning) automatically
+// selects the MEASURED-OPTIMAL scheme for this hardware. NOTHING needs to be set:
+//   * orkpack tier   : expert/ffn tensors -> int4 (NF4 codebook when the source is f16+), attn/dense int8
+//   * prefill (M>1)  : experts on CPU via the batched 4x4 NF4/int4 NEON GEMM (ork claims MUL_MAT_ID);
+//                      attn/dense int8 on the NPU
+//   * decode  (M==1) : ALL-CPU — the dense/attn backbone is declined (the NPU per-submit floor loses at
+//                      M=1), experts use the fused M=1 gemv fast-path (one quant/token, direct-to-dst,
+//                      persistent OpenMP pool) with one-cache-line PRFM prefetch
+// Measured, qwen3.6-35B-A3B, RK3588 -t4, governors=performance, q8_0-attn base (see MODEL RECIPE below):
+//   prefill 36.9 t/s (1.59x native ggml 23.3) | decode 6.59 t/s | coherent | no thermal throttle.
+// MODEL RECIPE (a FILE property, not a runtime knob — the single biggest decode lever measured):
+//   llama-quantize --tensor-type attn=q8_0 --tensor-type shexp=q8_0 <f16.gguf> <out.gguf> Q4_K_M
+//   Attention precision trades prefill for decode: f16 38.4/5.26, q8_0 36.9/6.59, Q4_K 26.8/7.42 — and
+//   BELOW 5 bits the NPU declines the source entirely (sbits<5.0 gate), losing the prefill path. q8_0 is
+//   the balanced optimum. Expert precision in the GGUF is irrelevant (NF4 comes from the .orkpack).
+// The .orkpack path is DERIVED from the loaded model (<model-dir>/<model-basename>.orkpack) — no env var
+// needed; an absent pack is built once, and a MoE model always gets the SAME scheme (NF4 experts) whatever
+// the GGUF's own precision, so one model = one pack. ORK_ORKPACK_PATH is a DEVELOPMENT override only.
+// ORK_PERSIST is REMOVED and now aborts with guidance.
+// Research escape hatches: ORK_MOE_AUTO=0 disables the profile; ORK_MOE_NPU forces experts to the NPU.
+//
 // ============================ ENVIRONMENT FEATURE FLAGS ============================
 // All experimental paths are OFF by default; the default build is the validated stable baseline
 // (dense MUL_MAT offload to NPU; everything else on CPU). Set a flag on the runtime command line.
@@ -150,7 +172,7 @@ static bool env_enabled(const char * name) {
 
 // ---- .orkpack persist format: a self-populating on-disk cache of pre-tiled (mixed int8 / int4) weights ----
 // File: [ blobs: per weight, packed bytes then (int8 only) N bscale floats ][ index ][ footer@EOF ].
-// First run with ORK_PERSIST=<path> writes it (one slow pass); later runs mmap it and load the bytes
+// First run writes it (one slow pass) to the DERIVED <model>.orkpack; later runs mmap it and load the bytes
 // straight into DMA — no dequant/quant/tile. Each weight's (K,N,dtype) is re-checked on load AND the
 // footer carries ork_pack_format_version() (ork-driver's MAJOR ver): a tile-layout / quant change bumps
 // that major, so an incompatible file is rejected wholesale at startup and regenerated (the read path
@@ -406,7 +428,7 @@ struct ggml_backend_ork_context {
     ork_stream_pool * spool = nullptr;     // created at init when enabled (NULL => fall back to plain wcache)
     size_t   spool_ram_bytes = 0;          // RAM bytes held across all stream entries (RAM-LRU budget)
     long     spool_remaps = 0, spool_ram_evicts = 0, spool_iova_unmaps = 0;  // diagnostics
-    // .orkpack persist (ORK_PERSIST=<path>): 0 off, 1 read (mmap'd), 2 write (building a .tmp)
+    // .orkpack persist (path derived from the model; ORK_ORKPACK_PATH overrides): 0 off, 1 read (mmap'd), 2 write
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
     std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
@@ -548,6 +570,20 @@ struct ggml_backend_ork_context {
 };
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
+// ---- MoE AUTO-PROFILE (no env knobs: the MODEL TYPE selects the quantization/placement scheme) ----
+// Set the first time ork is asked about a GGML_OP_MUL_MAT_ID op (i.e. the model is a routed MoE); llama.cpp
+// plans the graph at load, so this is known before any weight is packed or any op computed. It turns on the
+// MEASURED-OPTIMAL MoE profile for this hardware (RK3588), which used to require three env vars:
+//   * orkpack tier: expert/ffn tensors -> int4 (NF4 when the source is f16+), attn/dense stay int8
+//   * experts computed on the CPU via the batched NF4/int4 NEON kernel (ork claims MUL_MAT_ID to do it)
+//   * at DECODE (M==1) the dense/attn backbone is declined to the CPU (the NPU submit floor loses at M=1)
+// Measured on qwen3.6-35B-A3B (q8_0-attn base): prefill 36.9 (1.59x native) / decode 6.59 t/s.
+// Escape hatches (research only): ORK_MOE_AUTO=0 disables the profile; ORK_MOE_NPU forces experts to the NPU.
+static bool g_ork_is_moe = false;
+static inline bool ork_moe_auto() {
+    static const bool off = (getenv("ORK_MOE_AUTO") && atoi(getenv("ORK_MOE_AUTO")) == 0);
+    return !off && g_ork_is_moe;
+}
 // ---- Load-time product config (the two user-facing options; see ggml-ork.h) ----
 static bool g_ork_cfg_set          = false;   // has ggml_backend_ork_set_load_config been called this process?
 static bool g_ork_cfg_dflash       = false;   // enable the speculative block-diffusion drafter
@@ -726,8 +762,38 @@ static void ork_spool_ram_evict(ggml_backend_ork_context * ctx, size_t need) {
     }
 }
 
-// Open ORK_PERSIST: if the file exists and validates, mmap it for READ (load weights by name); otherwise
+// Open the resolved .orkpack: if the file exists and validates, mmap it for READ (load weights by name); else
 // open a <path>.tmp for WRITE (this run packs the model and dumps it, then finalize renames it in).
+// Find the GGUF this process is serving, from /proc/self/cmdline: prefer the argument after -m/--model
+// (or --model=<p>), else the first argument ending in .gguf (covers ork_bench's positional model arg).
+// cmdline is populated before main, so this works at backend-init time (the model is not mmap'd yet).
+static std::string ork_find_model_path() {
+    FILE * f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return std::string();
+    std::vector<char> buf; char c; while (fread(&c, 1, 1, f) == 1) buf.push_back(c);
+    fclose(f);
+    std::vector<std::string> av; std::string cur;
+    for (char ch : buf) { if (ch == '\0') { if (!cur.empty()) av.push_back(cur); cur.clear(); } else cur += ch; }
+    if (!cur.empty()) av.push_back(cur);
+    auto is_gguf = [](const std::string & s) {
+        return s.size() > 5 && s.compare(s.size()-5, 5, ".gguf") == 0; };
+    for (size_t i = 0; i < av.size(); i++) {                      // explicit -m / --model wins
+        if ((av[i] == "-m" || av[i] == "--model") && i+1 < av.size() && is_gguf(av[i+1])) return av[i+1];
+        if (av[i].rfind("--model=", 0) == 0 && is_gguf(av[i].substr(8)))                  return av[i].substr(8);
+    }
+    for (const auto & a : av) if (is_gguf(a)) return a;            // positional (ork_bench)
+    return std::string();
+}
+// DEFAULT orkpack path: <model-dir>/<model-basename>.orkpack, derived from the loaded GGUF. No env needed.
+// ORK_ORKPACK_PATH overrides it (e.g. to share ONE pack built from the f16 source across several GGUFs —
+// sharing one pack across GGUFs during development). DEVELOPMENT OVERRIDE ONLY — the derived path is the
+// supported path; a MoE model's pack scheme is fixed by the model type (NF4 experts + int8 attn/dense).
+static std::string ork_default_orkpack_path() {
+    std::string m = ork_find_model_path();
+    if (m.empty()) return std::string();
+    const size_t dot = m.rfind(".gguf");
+    return m.substr(0, dot) + ".orkpack";
+}
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_mm_import_i8),
@@ -735,8 +801,31 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // or owns weights. WRITE mode (packing a fresh .orkpack) still needs a resident NPU tile to dump, which is
     // fd-local, so under orkd we only support READ; if the file is absent, fall back to the live-pack path
     // (write mode is a one-time offline step — generate the .orkpack in a direct-NPU run, then run under orkd).
-    const char * p = getenv("ORK_PERSIST");
+    // ORK_PERSIST is REMOVED — it made the pack path a required runtime knob. The pack path is now DERIVED
+    // from the loaded model. Fail loudly so stale scripts get fixed rather than silently losing the pack.
+    if (getenv("ORK_PERSIST")) {
+        GGML_ABORT("ork: ORK_PERSIST is no longer supported. The .orkpack path is DERIVED from the loaded "
+                   "model (<model-dir>/<model-basename>.orkpack) and needs no configuration — just run with "
+                   "-m <model.gguf>. ORK_ORKPACK_PATH=<file.orkpack> exists ONLY as a development override "
+                   "(e.g. to point several GGUFs at one pack built from an f16 source). Unset ORK_PERSIST.\n");
+    }
+    // Path resolution (no env required): ORK_ORKPACK_PATH (development override only) >
+    // <model>.orkpack derived from the loaded GGUF. An absent derived pack is BUILT this run (one-time).
+    const char * env_p = getenv("ORK_ORKPACK_PATH");
+    std::string derived;
+    if (!env_p || !*env_p) {
+        derived = ork_default_orkpack_path();
+        if (derived.empty()) {
+            fprintf(stderr, "[ork] no .gguf found on the command line — cannot derive the orkpack path; "
+                            "set ORK_ORKPACK_PATH=<file.orkpack> to enable the packed-weight path.\n");
+            return;
+        }
+        fprintf(stderr, "[ork] orkpack (derived from model): %s%s\n", derived.c_str(),
+                access(derived.c_str(), R_OK) == 0 ? "" : " (absent -> building this run)");
+    }
+    const char * p = (env_p && *env_p) ? env_p : derived.c_str();
     if (!p || !*p) return;
+    ctx->persist_final = p;    // resolved pack path, valid in BOTH read and write mode (sidecars key off it)
     bool stale = false;   // present-but-incompatible pack seen -> regenerate + delete the old sidecar
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
@@ -1007,7 +1096,7 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
     }
     // (B) explicit env overrides (force int4)
     if (i4_above_bytes >= 0 && (long) K * N >= i4_above_bytes) want_i4 = true;
-    if (i4_ffn && name && (strstr(name, "ffn_") || strstr(name, "exps") ||
+    if ((i4_ffn || ork_moe_auto()) && name && (strstr(name, "ffn_") || strstr(name, "exps") ||
                            strstr(name, "expert") || strstr(name, "shexp"))) want_i4 = true;
     return want_i4 ? 4 : 8;
 }
@@ -1071,7 +1160,11 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
         // Codebook routed by SOURCE (not an env flag): full-precision weights (F16/F32/BF16, >=16 bit) → NF4
         // non-uniform codebook (fits the original distribution); an already-quantized source → uniform (NF4 can't
         // recover compounded quant error — the warning above tells the user to rebuild from unquantized weights).
-        int nf4 = ork_src_type_bits(src_type) >= 16.0 ? 1 : 0;
+        // MoE AUTO-PROFILE: a routed-MoE model gets ONE pack scheme decided by the MODEL TYPE — always the
+        // NF4 codebook for its int4 tier, regardless of the GGUF's own precision. (Otherwise a pack built from
+        // an already-quantized GGUF would fall back to uniform int4, which measures 1.4x SLOWER in the M=1
+        // kernel, 90 vs 65 us/expert, and is no more accurate.) Non-MoE keeps the source-routed choice.
+        int nf4 = (ork_src_type_bits(src_type) >= 16.0 || ork_moe_auto()) ? 1 : 0;
         size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, nullptr, 0);
         if (tb) {
             std::vector<char> tmp(tb);
@@ -1308,7 +1401,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
             orkpack_entry ent{}; ent.K = K; ent.N = N;
             if (tier == 4) {
                 const float * im = ork_imatrix_lookup(src0->name, K);
-                int nf4 = ork_src_type_bits(type) >= 16.0 ? 1 : 0;   // codebook routed by source (full-precision → NF4)
+                int nf4 = (ork_src_type_bits(type) >= 16.0 || ork_moe_auto()) ? 1 : 0;   // MoE auto: ALWAYS NF4 (one scheme per model type); else source-routed
                 size_t tb = ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nf4, nullptr, 0);
                 blob.resize(tb); ork_pack_i4a8_cpu_blob(ctx->npu, K, N, f32.data(), im, nf4, blob.data(), tb);
                 ent.dtype = ORKPACK_DT_I4; ent.bscale_n = 0; ent.blob_size = tb; ent.bscale_off = 0;
@@ -2626,10 +2719,11 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         for (auto & p : g)
             fprintf(stderr, "[ORK FFN-GMAX]   %-28s gmax=%8.2f%s\n", p.first.c_str(), p.second, p.second > cut ? "  <-- outlier" : "");
     }
-    // (b) persist the gmax profile to the <ORK_PERSIST>.gmax sidecar (name<TAB>gmax/line) so a later run
+    // (b) persist the gmax profile to the <orkpack>.gmax sidecar (name<TAB>gmax/line) so a later run
     // loads it. Written whenever we captured a profile and have a persist path — independent of ORK_VERBOSE.
     if (!ctx->gmax_profile.empty()) {
-        const char * pp = getenv("ORK_PERSIST");
+        const char * pp = getenv("ORK_ORKPACK_PATH");   // development override; else derive from the model
+        std::string pp_d; if ((!pp || !*pp)) { pp_d = ork_default_orkpack_path(); if (!pp_d.empty()) pp = pp_d.c_str(); }
         if (pp && pp[0]) {
             std::string sp = std::string(pp) + ".gmax";
             FILE * gf = fopen(sp.c_str(), "w");
@@ -3955,7 +4049,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // ORK_MOE_CPU (task #54, NF4 route): force ALL experts to the CPU cold path (the batched int4/NF4 NEON
     // GEMM) instead of the NPU — the "prefill using only int4 from orkpack on CPU" A/B. The int4 weights stay
     // resident once (the mmap'd orkpack blob the ork-native cold path reads); the NPU IOVA copy is unused.
-    static const bool  cpu_only   = env_enabled("ORK_MOE_CPU");
+    const bool         cpu_only   = env_enabled("ORK_MOE_CPU") || (ork_moe_auto() && !env_enabled("ORK_MOE_NPU"));
     static const float split_frac = getenv("ORK_SPLIT_FRAC") ? (float) atof(getenv("ORK_SPLIT_FRAC")) : 0.0f;
     const bool prefill_phase = ((int) max_Me >= batch_minM);
     const int  n_active_e    = (int) buckets.size();
@@ -4015,6 +4109,38 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         if (getenv("ORK_VERBOSE")) { static int g=0; if(!g){ g=1;
             fprintf(stderr, "[ork COLD-GATE] ork_native=%d ofmt=%d(0=I4,1=NF4) cold_experts=%d cold_batch=%d -> batched=%d\n",
                 (int)ork_native, (int)ofmt, (int)cold.size(), (int)cold_batch, (int)(ork_native && batch_fmt && cold_batch)); } }
+        // PURPOSE-BUILT DECODE KERNEL (ORK_MOE_DECODE_FAST, default on): at M=1 decode the batched path's
+        // per-expert gather (Ag memcpy) + outg alloc/zero + gemm-setup + scatter memcpy is pure overhead with
+        // no rows to amortize. Instead: quantize each token's activation ONCE (bcast-cached in quant_tok_i8)
+        // and GEMV each expert's NF4/int4 weight DIRECTLY into dst (ork_cpu_gemv_m1, full N). Threads over
+        // experts on the A76 cluster. Removes the wrapper; keeps NF4's cheap vqtbl unpack.
+        static const bool decode_fast = !getenv("ORK_MOE_DECODE_FAST") || atoi(getenv("ORK_MOE_DECODE_FAST")) != 0;
+        if (ork_native && batch_fmt && decode_fast && max_Me == 1) {
+            std::vector<int> ci8(cold.size(), 0);                 // one int8-quant per token (bcast-cached)
+            for (size_t ce = 0; ce < cold.size(); ce++) { auto & ent = *cold[ce].second;
+                if (!ent.empty()) ci8[ce] = quant_tok_i8(ent[0].first, ent[0].second); }
+            const int8_t * ai8base = ai8.data();                 // stable now (no more resizes)
+            unsigned hw = std::thread::hardware_concurrency();
+            int nthr = (int) (getenv("ORK_MOE_COLD_THREADS") ? atoi(getenv("ORK_MOE_COLD_THREADS")) : (hw ? hw/2 : 4));
+            if (nthr < 1) nthr = 1; if (nthr > (int) cold.size()) nthr = (int) cold.size();
+            const int ncold_i = (int) cold.size();
+            // PERSISTENT POOL: OpenMP reuses its thread pool across ops (no per-op std::thread create/join —
+            // the overhead that made the earlier std::thread fast-path == the batched path). Process affinity
+            // (taskset -c 4-7) already pins these to the A76 cluster. Each iter: direct NF4/int4 GEMV -> dst.
+            #pragma omp parallel for schedule(dynamic,1) num_threads(nthr)
+            for (int ce = 0; ce < ncold_i; ce++) {
+                auto & ent = *cold[ce].second; if (ent.empty()) continue;
+                const int e = cold[ce].first; const int t = ent[0].first, j = ent[0].second; const int idx = ci8[ce];
+                ork_cpu_w w; memset(&w, 0, sizeof w); w.fmt = ofmt; w.nf4_lut = ork_lutv; w.K = K; w.N = N;
+                w.nibble = onib[e]; w.bscale = obsc[e];
+                float * dr = (float *)(dbase + (size_t) j * dst->nb[1] + (size_t) t * dst->nb[2]);
+                ork_cpu_gemv_m1(&w, ai8base + (size_t) idx * K, ai8sc[idx], dr, 0, N);   // NF4/int4 GEMV -> dst, no gather/scatter
+            }
+            ctx->moe_cold_cpu += n_cold;
+            { static bool df1=false; if(!df1 && getenv("ORK_VERBOSE")){ df1=true; fprintf(stderr, "[ork MoE DECODE-FAST] FIRED (omp pool): %d experts, direct gemv->dst (M=1, one quant/token)\n", n_cold); } }
+            if (ctx->profile) { ctx->moe_cold += ork_now_us() - cd0; ctx->moe_cold_calls += n_cold; }
+            return;
+        }
         if (ork_native && batch_fmt && cold_batch) {
             // pre-quantize every cold (token,slot) activation single-threaded + record its ai8 row per expert.
             std::vector<std::vector<int>> eidx(cold.size());   // eidx[ce] = i8 row index per pair of that expert
@@ -6735,9 +6861,10 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->via_orkd = ork_npu_uses_orkd(npu) != 0;   // true iff ORK_USE_ORKD opted in and the daemon connected; false in the default direct path — gates the orkd-routed weight/matmul path
     g_ork_ctx = ctx;
     ork_persist_init(ctx);   // .orkpack: read (fast load) if present, else build it this run
-    // (b) load the persisted gmax sidecar (<ORK_PERSIST>.gmax) if present: a known model's per-layer gate
+    // (b) load the persisted gmax sidecar (<orkpack>.gmax) if present: a known model's per-layer gate
     // ranges available at LOAD (before prep recomputes them) — foundation for a load-time selective policy.
-    { const char * pp = getenv("ORK_PERSIST");
+    // Uses the RESOLVED pack path (ctx->persist_final, set by ork_persist_init: override > legacy > derived).
+    { const char * pp = ctx->persist_final.empty() ? nullptr : ctx->persist_final.c_str();
       if (pp && pp[0]) { std::string sp = std::string(pp) + ".gmax"; FILE * gf = fopen(sp.c_str(), "r");
           if (gf) { char nm[256]; float gv;
               while (fscanf(gf, "%255s %f", nm, &gv) == 2) ctx->gmax_loaded[nm] = gv;
@@ -7090,6 +7217,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
     }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    // MoE AUTO-PROFILE detection: a MUL_MAT_ID op means this model is a routed MoE -> enable the measured
+    // MoE profile (expert-int4 tier + experts-on-CPU + decode-on-CPU) with NO env knobs. Latches once.
+    if (op->op == GGML_OP_MUL_MAT_ID && !g_ork_is_moe) {
+        g_ork_is_moe = true;
+        if (!(getenv("ORK_MOE_AUTO") && atoi(getenv("ORK_MOE_AUTO")) == 0))
+            fprintf(stderr, "[ork] MoE model detected -> auto profile: experts int4/NF4 on CPU (batched NEON), "
+                            "attn/dense int8 on NPU at prefill, all-CPU at decode. (ORK_MOE_AUTO=0 to disable.)\n");
+    }
     if (getenv("ORK_VERBOSE") && op->op == GGML_OP_MUL_MAT_ID)   // DIAG: is ork ever asked about the MoE op?
         fprintf(stderr, "[ORK MMID-ENTRY] name=%s type=%s buft=%s via_orkd=%d\n",
             src0 ? src0->name : "?", src0 ? ggml_type_name(src0->type) : "?",
@@ -7209,7 +7344,10 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // _exps tensors never reach this case), so declining at M==1 is exactly the backbone-at-decode.
             {
                 static const int pe = env_enabled("ORK_MOE_PHASE_EVICT");
-                if (pe && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
+                // NEVER decline M==1 in WRITE/convert mode: the .orkpack is built by a single 1-token forward,
+                // so declining M==1 there would pack ZERO dense weights (and leave a useless pack behind).
+                const bool writing = g_ork_ctx && g_ork_ctx->persist_mode == 2;
+                if ((pe || ork_moe_auto()) && !writing && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
             }
             // ORK_FFN_DEC: admit the DECODE (M==1) FFN gate/up/down to the NPU so the whole gate/up/GLU/down
             // subgraph is ONE contiguous ORK split (a CPU-side up would fragment it and the matcher couldn't
@@ -7280,7 +7418,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // ORK_MOE_CPU (task #54, NF4/int4 CPU route): claim MUL_MAT_ID so the handler runs and routes
             // every expert to the batched CPU int4/NF4 NEON GEMM (the "prefill using only int4 from orkpack
             // on CPU" A/B). Also required in WRITE mode so persist_write_experts emits the O4N1 experts.
-            const bool cpu_only_op = env_enabled("ORK_MOE_CPU");
+            const bool cpu_only_op = env_enabled("ORK_MOE_CPU") || (ork_moe_auto() && !env_enabled("ORK_MOE_NPU"));
             if (!cpu_only_op && !env_enabled("ORK_MOE_NPU") && !env_enabled("ORK_NO_EXPERT_REPACK")) return false;
             if (!cpu_only_op) {   // one-time loud warning when the experimental MoE-on-NPU path is actually enabled
                 static bool warned = false;
