@@ -5726,7 +5726,18 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
         const char * s0 = (const char *) src0->data + (i2 / r2_0) * src0->nb[2] + (i3 / r3_0) * src0->nb[3];
         const char * s1 = (const char *) src1->data + (i2 / r2_1) * src1->nb[2] + (i3 / r3_1) * src1->nb[3];
         float      * d  = (float *)((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3]);
-        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j % K, j / K);   // src0 [K,N]
+        // DEFECT FIX (was: `rds(src0, s0, j % K, j / K)`): ork_mm_repack_f16/ork_mm_pack take B as
+        // **[K,N] ROW-MAJOR**, i.e. B[k*N + n] = weight(k, n). ggml stores element (k,n) of a [K,N]
+        // tensor at offset n*nb[1] + k*nb[0] — ne[0]-contiguous — so src0's raw buffer is [N][K],
+        // i.e. Bᵀ. The old index `(j%K, j/K)` reproduced exactly that raw order, so every batched
+        // matmul ran against a TRANSPOSED weight. Proven by emulation: feeding the driver Bᵀ
+        // reproduces the NPU output to NRMSE 1.9e-4 (fp16 noise) at K=N=256, K≠N, and every M
+        // (scratchpad bmm_probe). This is what took ork_ppl PPL 10.83 -> 67.86 with ORK_ATTN=1:
+        // ork_ppl sets flash_attn_type = DISABLED, so attention arrives as batched MUL_MAT here
+        // (QKᵀ and A·V), NOT as FLASH_ATTN_EXT — and ORK_ATTN_CPU only moves the FA handler's
+        // matmuls, which is why forcing "both FA matmuls to CPU" left the PPL byte-identical.
+        // Correct order: B[j] = src0(j / N, j % N)  =>  B[k*N + n] = src0(k, n).
+        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j / N, j % N);   // B[k*N+n] = src0(k,n)
         for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
         if (ork_mm_repack_f16(ctx->npu, w, K, N, B.data()) || ork_mm_run(ctx->npu, w, M, A.data(), C.data())) {
             if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ FAILED M=%d K=%d N=%d head(%lld,%lld)\n",
@@ -5988,6 +5999,48 @@ static bool ggml_backend_ork_ssm_scan(ggml_backend_ork_context * ctx, struct ggm
 // v1: no alibi (max_bias) / no softcap — supports_op gates those to CPU. Gated ORK_ATTN. Keep-warm carries
 // the matmul<->matmul (and future SDP) transitions. Falls back to CPU (ret false) on any shape/alloc issue.
 // (ork_attn_pool / ork_attn_sm are defined above the context struct; the pool lives PER-CONTEXT in ctx->attnp.)
+// LEGAL fp16 M-TILE for the stream/chain primitives, and the M-tiling wrapper the FA handler needs.
+//
+// DEFECT (fixed here): ork_mm_run_stream_f16 / _chain synth ONE regcmd program per task — they are
+// documented "Single M-tile (the SSD scan is M<=64 <= one tile)" and do NOT M-schedule. The rows of a
+// program are only computed against the right K-partition while M stays inside the 0x1040 K-reduction
+// schedule's validated tile: CBUF_CON0 = base - slope*(mg-1) must stay >= 0x1b, with mg = ceil(M/64),
+// base/slope derived from K (npu.c synth(), and npu.c run() which does tile to exactly mg_max*64).
+// Past that ceiling the excess rows are SILENTLY WRONG — no error, no submit failure.
+//   K=DK=256   -> mg_max=11 -> 704 rows      (QKᵀ: fine at ubatch 512)
+//   K=nkvp=512 -> mg_max=5  -> 320 rows      (A·V at n_kv 512: WRONG for M>~320)
+//   K=nkvp=1024-> mg_max=2  -> 128 rows      (A·V at n_kv 1024: WRONG for M>128)
+// The handler passed M = n_tokens straight through, so at ubatch 512 the A·V output was garbage from
+// row ~352 on. Measured with scratchpad fa_probe (CPU-backend oracle, DK=DV=256 H=16 Hkv=2):
+//   n_kv 512, nb 64/128/256 PASS (NRMSE 2e-4); nb 384/512 FAIL from query 352 (NRMSE 30-69)
+//   n_kv 1024, nb 512 FAIL from query 0 (NRMSE 153); ORK_ATTN_CPU=2 (A·V on CPU) PASS => A·V only.
+// Fix: chunk M to ork_f16_mtile(K) and issue one chain submit per chunk (A/C advance by their row
+// strides). Mirrors npu.c run()'s own M-scheduler. Cost: 2 submits instead of 1 at ubatch 512.
+static int ork_f16_mtile(int K) {
+    const int sched = (K & (K - 1)) == 0 && K >= 128 && K < 2048;   // same gate as synth()/run()
+    if (!sched) { int t = (32768 / 2) / (K > 0 ? K : 1); return t < 1 ? 1 : t; }
+    const double scale = (double) K / 256.0;                        // fp16 reference K (int8 uses 512)
+    const int base = (int) (177.0 - 15.0 * (scale - 1.0)), slope = (int) (15.0 * scale);
+    const int mg_max = (slope > 0 && base >= 0x1b) ? (base - 0x1b) / slope + 1 : 1;
+    const int t = mg_max * 64;
+    return t < 1 ? 1 : t;
+}
+// M-tile-safe ork_mm_run_stream_f16_chain. All tasks must share the same M (they do here: one task per
+// head). K = the weight's contraction dim (A row stride), Nout = the weight's N (C row stride).
+static int ork_attn_chain_mtiled(ork_npu * npu, int S, const ork_mm_task_f16 * tk, int K, int Nout) {
+    const int M = tk[0].M, cap = ork_f16_mtile(K);
+    if (M <= cap) return ork_mm_run_stream_f16_chain(npu, S, tk);
+    std::vector<ork_mm_task_f16> sub((size_t) S);
+    for (int m0 = 0; m0 < M; m0 += cap) {
+        const int mm = (M - m0 < cap) ? (M - m0) : cap;
+        for (int i = 0; i < S; i++)
+            sub[i] = (ork_mm_task_f16){ tk[i].w, mm,
+                                        tk[i].A + (size_t) m0 * K,
+                                        tk[i].C + (size_t) m0 * Nout };
+        if (ork_mm_run_stream_f16_chain(npu, S, sub.data())) return -1;
+    }
+    return 0;
+}
 static void attn_pool_free_one(ggml_backend_ork_context * ctx, struct ork_attn_pool * P) {
     ork_npu * c = ctx->npu;
     if (P->wqk) for (int h=0; h<P->H; h++) { if (P->wqk[h]) ork_mm_free(c, P->wqk[h]); if (P->wav && P->wav[h]) ork_mm_free(c, P->wav[h]); if (P->wet && P->wet[h]) ork_mm_free(c, P->wet[h]); }
@@ -6310,13 +6363,18 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
         _t=ork_now_us();
         if (dbg_cpu & 1) { for (int h=0;h<H;h++){ ork_f16 *Qh=P->Qf+(size_t)h*N*DK, *KTh=P->KT+(size_t)h*DK*nkvp; float *sc=P->scores+(size_t)h*N*nkvp;
             for (int m=0;m<N;m++) for (int j=0;j<nkvp;j++){ float a=0; for (int e=0;e<DK;e++) a+=(float)Qh[(size_t)m*DK+e]*(float)KTh[(size_t)e*nkvp+j]; sc[(size_t)m*nkvp+j]=a; } } }
-        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        else if (ork_attn_chain_mtiled(ctx->npu,H,P->tk,DK,nkvp)) return false;   // M-tiled: see ork_f16_mtile
         if(prof) a_qk+=ork_now_us()-_t;
-        // (2) softmax. Default = FUSED softmax-on-NPU chain: scale+mask+max (CPU prep) -> quantize (CPU)
-        // -> exp on the NPU (ork_npu_exp_i16, ONE batched SDP submit over all H*N rows, in-line between
-        // the QK^T and A·V fp16 matmuls = in-chain precision swap) -> sum+normalize (CPU). ORK_ATTN_SM_CPU=1
-        // forces the CPU-softmax path instead. Sub-step timers exposed under ORK_ATTN_PROF.
-        static int sm_npu=-1; if(sm_npu<0) sm_npu = getenv("ORK_ATTN_SM_CPU")?0:1;
+        // (2) softmax. DEFAULT IS NOW THE CPU SOFTMAX (scale+mask+max+exp+normalize, fp32) — it is the only
+        // one that is correct. The FUSED softmax-on-NPU chain (scale+mask+max CPU prep -> quantize -> exp on
+        // the NPU via ork_npu_exp_i16, ONE batched SDP submit over all H*N rows, in-chain between the two
+        // fp16 matmuls -> sum via reduce-matmul -> normalize) is OPT-IN under ORK_ATTN_SM_NPU because it is
+        // QUALITY-BROKEN at some row counts: fa_probe (CPU-backend oracle) gives NRMSE 2e-4 at MR=H*N=8192
+        // but 0.55-0.69 at MR=6144 and MR=4096 — a factor-1000 blowup, wrong from row 0, and IDENTICAL with
+        // ORK_ATTN_TNORM_OFF / ORK_ATTN_MAX_CPU / ORK_ATTN_SM_SUMCPU all set, which pins it on
+        // ork_npu_exp_i16 itself (an int16 SDP act-LUT shape/row-count envelope issue, not this handler).
+        // ORK_ATTN_SM_CPU is kept as an accepted no-op alias so existing invocations still mean "CPU softmax".
+        static int sm_npu=-1; if(sm_npu<0) sm_npu = (getenv("ORK_ATTN_SM_NPU") && !getenv("ORK_ATTN_SM_CPU")) ? 1 : 0;
         static int tnorm=-1; if(tnorm<0) tnorm = getenv("ORK_ATTN_TNORM_OFF")?0:1;  // transposed on-NPU normalize (A·V transposed + per-channel 1/Σ)
         int tnorm_ok=0;
         _t=ork_now_us();
@@ -6430,7 +6488,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             P->tk[h]=(ork_mm_task_f16){P->wet[h],DV,VT,P->outf+(size_t)h*DV*N}; } // C[DV][N] = Ô
           if(prof) a_dv+=ork_now_us()-_t;
           _t=ork_now_us();
-          if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+          if (ork_attn_chain_mtiled(ctx->npu,H,P->tk,nkvp,N)) return false;       // M-tiled (M=DV here)
           if(prof) a_av+=ork_now_us()-_t;
           // (3.5) on-NPU per-channel normalize Ô[d][m]*=(1/Σ)[m]. BATCHED across heads into ONE submit:
           // lay Ô as [DV][H*N] (channel = head*N+query) so a single per-channel scale by invS[H*N] does all
@@ -6474,7 +6532,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
         _t=ork_now_us();
         if (dbg_cpu & 2) { for (int h=0;h<H;h++){ ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp, *Vh=P->Vf+(size_t)h*nkvp*DV; float *o=P->outf+(size_t)h*N*DV;
             for (int m=0;m<N;m++) for (int e=0;e<DV;e++){ float a=0; for (int j=0;j<nkvp;j++) a+=(float)Ph[(size_t)m*nkvp+j]*(float)Vh[(size_t)j*DV+e]; o[(size_t)m*DV+e]=a; } } }
-        else if (ork_mm_run_stream_f16_chain(ctx->npu,H,P->tk)) return false;
+        else if (ork_attn_chain_mtiled(ctx->npu,H,P->tk,nkvp,DV)) return false;   // M-tiled: A·V K=nkvp caps M
         if(prof) a_av+=ork_now_us()-_t;
         // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
         _t=ork_now_us();
@@ -7481,14 +7539,18 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // including, on a routed-MoE model, the **expert-router softmax** (ne[0]=n_expert, %32==0;
             // ne[1]=n_tokens>1 in prefill). Routing weights then came back through the coarse int16 exp LUT
             // (in_scale = -lo/32000) instead of fp32 expf, which perturbs top-k expert selection and their
-            // mixing weights. Measured on qwen3.6-35B-A3B: PPL 10.83 -> 67.86, and it is invisible to
-            // ORK_ATTN_CPU (which only moves the attention MATMULS) — that is what made it look like an
-            // attention-math bug. The exp LUT is fine for attention scores (renormalized per row, differences
+            // mixing weights. Measured on qwen3.6-35B-A3B: PPL 70.06 -> 67.86, i.e. real but only ~3%.
+            // (The 10.83 -> 67.86 blowup was NOT this: it was ggml_backend_ork_bmm_fp16 feeding the driver
+            // a TRANSPOSED B — see the DEFECT FIX comment there. Both are invisible to ORK_ATTN_CPU, which
+            // only moves the FLASH_ATTN_EXT handler's matmuls.) The exp LUT is fine for attention scores (renormalized per row, differences
             // only) but not for a 128-way router distribution. Keep this claim tied to the same flag that
-            // disables the NPU softmax everywhere else.
-            static const int sm_cpu = getenv("ORK_ATTN_SM_CPU") != nullptr;
+            // gates the NPU softmax everywhere else — which is now OPT-IN (ORK_ATTN_SM_NPU), because
+            // ork_npu_exp_i16 is also quality-broken at some row counts (see the FA handler's step (2)).
+            // So plain ORK_ATTN=1 no longer claims SOFT_MAX at all; ORK_ATTN_SM_CPU stays accepted as the
+            // explicit "keep softmax on the CPU" alias (it now only has to override an explicit SM_NPU).
+            static const int sm_npu = getenv("ORK_ATTN_SM_NPU") != nullptr && getenv("ORK_ATTN_SM_CPU") == nullptr;
             float mb = 0.0f; memcpy(&mb, (const char *) op->op_params + sizeof(float), sizeof(float));
-            return ork_attn && !sm_cpu && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
+            return ork_attn && sm_npu && op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32
                 && op->ne[1] > 1 && op->ne[0] % 32 == 0 && mb == 0.0f;
         }
         case GGML_OP_RMS_NORM:
