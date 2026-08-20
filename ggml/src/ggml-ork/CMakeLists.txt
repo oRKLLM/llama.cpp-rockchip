@@ -3,12 +3,32 @@
 # to the in-tree rknpu DRM driver via ioctls). ARM64 Linux only.
 
 set(ORK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ork-driver)
-# ork-driver's npu.c is being split into src/npu/*.c by precision (see its MODULARIZE_PLAN.md). Glob the
-# modules so each new one does not need a CMake edit in lockstep; CONFIGURE_DEPENDS re-globs every build.
+# ork-driver's npu.c was split by precision into src/npu/ (its MODULARIZE_PLAN.md): a thin scaffold plus
+# src/npu/{core,i8,f16,i4,i16}/ and src/npu/{sdp,ssm,norm}.c. Glob the modules so a new one does not need a
+# CMake edit in lockstep; CONFIGURE_DEPENDS re-globs every build rather than only at configure time.
 file(GLOB ORK_NPU_MODULES CONFIGURE_DEPENDS ${ORK_DIR}/src/npu/*.c ${ORK_DIR}/src/npu/*/*.c)
+# The daemon and its client shim were split the same way, so glob both — a further split needs no edit here.
+#   ORK_ORKD_CLIENT  the CLIENT-side RPC shim (round 9: orkd_client.c -> + orkd_client_ops.c behind
+#                    orkd_client_internal.h). Linked into BOTH the backend library and the daemon.
+#                    Missing a TU here does NOT fail the build — a shared library happily keeps undefined
+#                    symbols and defers them to load time — it strands them (31 undefined orkd_* in
+#                    libggml-ork.so when orkd_client_ops.c was left out) and breaks ORK_USE_ORKD at RUNTIME.
+#   ORK_ORKD_MODULES the daemon proper (round 8: orkd.c -> + orkd_handlers.c behind orkd_internal.h),
+#                    i.e. src/orkd*.c minus the client shim.
+file(GLOB ORK_ORKD_CLIENT  CONFIGURE_DEPENDS ${ORK_DIR}/src/orkd_client*.c)
+file(GLOB ORK_ORKD_MODULES CONFIGURE_DEPENDS ${ORK_DIR}/src/orkd*.c)
+list(REMOVE_ITEM ORK_ORKD_MODULES ${ORK_ORKD_CLIENT})
 
 if (NOT EXISTS ${ORK_DIR}/src/npu.c)
     message(FATAL_ERROR "ork-driver submodule missing — run: git submodule update --init --recursive")
+endif()
+# A submodule checkout from before the split (or a partially-synced one) still has src/npu.c, so the check
+# above passes while the glob comes back short — which links a scaffold with ~93 undefined references. Fail
+# at configure time instead, where the message can say what is actually wrong.
+if (NOT EXISTS ${ORK_DIR}/src/npu/internal.h OR NOT ORK_NPU_MODULES)
+    message(FATAL_ERROR "ork-driver submodule is stale or partially synced: src/npu/ split modules missing "
+                        "(found ${ORK_DIR}/src/npu.c but no src/npu/internal.h + modules). "
+                        "Run: git submodule update --init --recursive")
 endif()
 
 find_package(Threads REQUIRED)
@@ -18,7 +38,7 @@ ggml_add_backend_library(ggml-ork
                          ${ORK_DIR}/src/npu.c
                          ${ORK_NPU_MODULES}
                          ${ORK_DIR}/src/ork_ops.c
-                         ${ORK_DIR}/src/orkd_client.c
+                         ${ORK_ORKD_CLIENT}
                          ${ORK_DIR}/src/soc.c
                          ${ORK_DIR}/src/soc/rk3588.c
                          ${ORK_DIR}/src/soc/rk3576.c
@@ -30,7 +50,7 @@ target_link_libraries     (ggml-ork PRIVATE Threads::Threads)
 # ork-driver's npu.c is C and needs _GNU_SOURCE (set in the file); keep its C sources as C.
 # orkd_client.c (v1.0.0) is the transparent orkd-daemon routing shim npu.c calls into under ORK_USE_ORKD.
 set_source_files_properties(
-    ${ORK_DIR}/src/npu.c ${ORK_DIR}/src/ork_ops.c ${ORK_DIR}/src/orkd_client.c ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
+    ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_DIR}/src/ork_ops.c ${ORK_ORKD_CLIENT} ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
     PROPERTIES LANGUAGE C)
 
 # Activation int8-quant in ggml-ork.cpp is parallelized with #pragma omp parallel for (per-row,
@@ -63,17 +83,25 @@ endforeach()
 # nothing to connect to. It links the same core NPU C sources as the backend (own binary, its own ork_npu ctx).
 # Board-only; guarded on the source (absent in <1.0.0 submodule checkouts). ORKD_BIN should point at bin/orkd.
 if (EXISTS ${ORK_DIR}/src/orkd.c)
+    # TWO globs are load-bearing here, for the same reason: orkd is a separate binary with its own ork_npu
+    # ctx, not a consumer of ggml-ork, so it cannot inherit anything from that target.
+    #   ${ORK_NPU_MODULES} — it links the same NPU core, and after the precision split src/npu.c alone left
+    #                        it with 93 undefined references (ork_mm_run_i8, ork_npu_enter, ork_dyn_*, ...).
+    #   ${ORK_ORKD_MODULES} — round 8 split the daemon itself; src/orkd.c alone left it with 19 (the
+    #                        orkd_handle_* dispatch table, now in orkd_handlers.c).
+    # Both were by-name lists that broke silently one refactor round apart. Globs, not names.
     add_executable(orkd
-                   ${ORK_DIR}/src/orkd.c
+                   ${ORK_ORKD_MODULES}
                    ${ORK_DIR}/src/npu.c
+                   ${ORK_NPU_MODULES}
                    ${ORK_DIR}/src/ork_ops.c
-                   ${ORK_DIR}/src/orkd_client.c
+                   ${ORK_ORKD_CLIENT}
                    ${ORK_DIR}/src/neon_activations.c
                    ${ORK_DIR}/src/soc.c
                    ${ORK_DIR}/src/soc/rk3588.c
                    ${ORK_DIR}/src/soc/rk3576.c)
     set_source_files_properties(
-        ${ORK_DIR}/src/orkd.c ${ORK_DIR}/src/npu.c ${ORK_DIR}/src/orkd_client.c
+        ${ORK_ORKD_MODULES} ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_ORKD_CLIENT}
         ${ORK_DIR}/src/neon_activations.c ${ORK_DIR}/src/soc.c
         ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
         PROPERTIES LANGUAGE C)
