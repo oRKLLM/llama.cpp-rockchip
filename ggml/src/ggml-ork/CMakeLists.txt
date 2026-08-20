@@ -3,6 +3,9 @@
 # to the in-tree rknpu DRM driver via ioctls). ARM64 Linux only.
 
 set(ORK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ork-driver)
+# ork-driver's npu.c is being split into src/npu/*.c by precision (see its MODULARIZE_PLAN.md). Glob the
+# modules so each new one does not need a CMake edit in lockstep; CONFIGURE_DEPENDS re-globs every build.
+file(GLOB ORK_NPU_MODULES CONFIGURE_DEPENDS ${ORK_DIR}/src/npu/*.c ${ORK_DIR}/src/npu/*/*.c)
 
 if (NOT EXISTS ${ORK_DIR}/src/npu.c)
     message(FATAL_ERROR "ork-driver submodule missing — run: git submodule update --init --recursive")
@@ -13,6 +16,7 @@ find_package(Threads REQUIRED)
 ggml_add_backend_library(ggml-ork
                          ggml-ork.cpp
                          ${ORK_DIR}/src/npu.c
+                         ${ORK_NPU_MODULES}
                          ${ORK_DIR}/src/ork_ops.c
                          ${ORK_DIR}/src/orkd_client.c
                          ${ORK_DIR}/src/soc.c
