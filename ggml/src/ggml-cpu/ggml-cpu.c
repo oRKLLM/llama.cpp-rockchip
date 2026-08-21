@@ -1747,6 +1747,43 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+
+// ---- ORK_OPPROF=1: per-op CPU-side wall attribution (diagnostic; zero cost when unset) ----
+// Answers "what fraction of the wall is op X on the CPU backend". MUL_MAT is split into two buckets:
+//   MUL_MAT(dyn)  = src0 is a COMPUTED tensor (src0->op != GGML_OP_NONE) -> attention / GDN chunk GEMMs
+//   MUL_MAT(wgt)  = src0 is a static weight -> lm_head and anything the NPU backend declined
+// Timed on thread ith==0 only (the other threads run the same node in parallel behind a barrier), so the
+// accumulated value approximates per-node WALL, not summed CPU-thread time.
+static int          ork_opprof_on = -1;
+static double       ork_opprof_us[GGML_OP_COUNT + 2];
+static long         ork_opprof_n [GGML_OP_COUNT + 2];
+#define ORK_OPPROF_MMDYN (GGML_OP_COUNT + 0)
+#define ORK_OPPROF_MMWGT (GGML_OP_COUNT + 1)
+static double ork_opprof_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec * 1e6 + (double) ts.tv_nsec / 1e3;
+}
+static void ork_opprof_dump(void) {
+    double tot = 0;
+    for (int i = 0; i < GGML_OP_COUNT + 2; i++) tot += ork_opprof_us[i];
+    if (tot <= 0) return;
+    fprintf(stderr, "\n[OPPROF] CPU-backend per-op wall (ith==0), total %.1f ms\n", tot / 1e3);
+    for (int pass = 0; pass < 1; pass++) {
+        for (int k = 0; k < 12; k++) {           // print the top 12 by time
+            int best = -1; double bv = 0;
+            for (int i = 0; i < GGML_OP_COUNT + 2; i++)
+                if (ork_opprof_us[i] > bv) { bv = ork_opprof_us[i]; best = i; }
+            if (best < 0) break;
+            const char * nm = best == ORK_OPPROF_MMDYN ? "MUL_MAT(dyn: attn/GDN chunk)"
+                            : best == ORK_OPPROF_MMWGT ? "MUL_MAT(wgt: lm_head/declined)"
+                            : ggml_op_name((enum ggml_op) best);
+            fprintf(stderr, "[OPPROF]   %-32s %9.1f ms  %6.2f%%  n=%ld\n",
+                    nm, bv / 1e3, 100.0 * bv / tot, ork_opprof_n[best]);
+            ork_opprof_us[best] = 0;             // consume so the next pass picks the following entry
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -3118,7 +3155,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
-            ggml_compute_forward(&params, node);
+            if (ork_opprof_on < 0) {
+                ork_opprof_on = getenv("ORK_OPPROF") ? 1 : 0;
+                if (ork_opprof_on) atexit(ork_opprof_dump);
+            }
+            if (ork_opprof_on && state->ith == 0) {
+                const double _t0 = ork_opprof_now();
+                ggml_compute_forward(&params, node);
+                const double _d = ork_opprof_now() - _t0;
+                int _b = (int) node->op;
+                if (node->op == GGML_OP_MUL_MAT && node->src[0])
+                    _b = (node->src[0]->op != GGML_OP_NONE) ? ORK_OPPROF_MMDYN : ORK_OPPROF_MMWGT;
+                ork_opprof_us[_b] += _d; ork_opprof_n[_b]++;
+            } else {
+                ggml_compute_forward(&params, node);
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
