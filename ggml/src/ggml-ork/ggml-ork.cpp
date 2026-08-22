@@ -75,16 +75,25 @@
 //                        CPU baseline for A/B benchmarks.
 //   (QKV/gate-up group fusion is DEFAULT-ON for M>=2 (ORK_FUSE_MINM): +11% @M2 .. +17% @M64, bit-exact,
 //    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
-//   ORK_QUANT=4          int4: compact int4 STORAGE + W8A8-inflate compute on the NPU (route B — int4 weights
-//                        inflate int4->int8 and run on the robust int8 kernel; coherent, no wedge). The win is the
-//                        .orkpack STORAGE (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4
-//                        (single-row, wedge-prone at prefill) is OPT-IN via ORK_MIXED_W4A4 / ORK_HADAMARD.
+//   ORK_QUANT=4          int4 tier — a BUILD-TIME override, not a run-time mode. Set it for the run that CREATES
+//                        the .orkpack; afterwards the pack is self-describing (its footer records the tier) and
+//                        loading it selects int4 on its own, so steady-state runs need nothing set. Also use it
+//                        to deliberately rebuild an existing pack at a different tier. int4 = compact int4
+//                        STORAGE + W8A8-inflate compute on the NPU (route B — int4 weights inflate int4->int8 and
+//                        run on the robust int8 kernel; coherent, no wedge). The win is the .orkpack STORAGE
+//                        (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4 (single-row,
+//                        wedge-prone at prefill) is OPT-IN via ORK_MIXED_W4A4.
 //                        *** RECOMMENDED int4 setup: build the orkpack from the model's UNQUANTIZED (F16/F32/BF16)
 //                        GGUF — the NF4 codebook is then auto-selected (best fidelity; building from an already-
 //                        quantized source is warned and falls back to the lossier uniform int4). Measured Qwen3-1.7B
 //                        @ P=128 (RK3588): NF4-from-F16 = 215 tok/s prefill / 6.77 decode (edges the int8 ref ~178)
 //                        vs uniform-from-Q8 = 172 / 2.96. So: F16 source -> ORK_QUANT=4 -> compact NF4 .orkpack. ***
-//   ORK_HADAMARD=1       EXPERIMENTAL. Hadamard-rotated NATIVE W4A4 path (opt-in; prefill wedge-prone).
+//   (no ORK_HADAMARD)    The block-Hadamard rotation is IMPLIED by NATIVE W4A4 and cannot be turned off:
+//                        RK3588's W4A4 MAC is symmetric per-channel and incoherent unrotated (PPL ~104 vs ~24),
+//                        so un-rotated 4-bit compute was never a usable configuration — only a way to get a
+//                        silently garbage run. Note this is about the 4-bit COMPUTE path (ORK_MIXED_W4A4), not
+//                        the int4 STORAGE tier (ORK_QUANT=4), which computes W8A8 and rotates nothing. See
+//                        ork_w4a4_native_on for why ggml-ork owns this rule and ork-driver cannot.
 //   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
 //                        (q4) sources onto the NPU (instead of CPU) and pick the compute path per tensor by
 //                        source precision. Default: 4-bit tier computes W8A8 (dequant q4->int8, fast +
@@ -212,13 +221,59 @@ struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version
 
 // Build-config precision signature stored in the footer (see above). Env-derived so the standalone validity check
 // (pre-init, no ctx) and the write path compute it identically. Encodes the knobs that change PACKED CONTENT:
-// forced quant precision (ORK_QUANT), hybrid split (ORK_HYBRID), hadamard rotation (ORK_HADAMARD).
+// forced quant precision (ORK_QUANT) and hybrid split (ORK_HYBRID).
+//
+// The precision field is DESCRIPTIVE, not prescriptive. It records the tier a pack was BUILT at so that loading
+// the pack SELECTS that tier (ork_sig_qbits -> ctx->persist_qbits) — an int4 .orkpack drives the int4 path with
+// no env set. It used to be a pure equality gate, which meant an int4 pack was REJECTED and rebuilt as int8
+// unless the run happened to re-supply the same knobs. Only ORK_SIG_HY_BIT stays prescriptive: hybrid changes
+// WHICH tensors are packed at all, so a mismatch there is a genuinely unusable file.
+#define ORK_SIG_QB_MASK 0x0ffu   // forced-precision char: '4', '8', or 0 = source-driven default
+#define ORK_SIG_HY_BIT  0x100u   // ORK_HYBRID split
+#define ORK_SIG_HD_BIT  0x200u   // hadamard — now IMPLIED by native W4A4 (see ork_w4a4_native_on); vestigial in the sig
 static uint32_t ork_build_sig(void) {
     const char * q = getenv("ORK_QUANT");
     uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
-    uint32_t hy = (getenv("ORK_HYBRID")   != nullptr) ? 1u : 0u;
-    uint32_t hd = (getenv("ORK_HADAMARD") != nullptr) ? 1u : 0u;
-    return (qb & 0xffu) | (hy << 8) | (hd << 9);
+    uint32_t hy = (getenv("ORK_HYBRID") != nullptr) ? 1u : 0u;
+    // hd is DERIVED, not read: native W4A4 is always rotated (see ork_w4a4_native_on), so it carries no independent
+    // information. Deriving it keeps the emitted value bit-identical to what the old ORK_QUANT=4 +
+    // ORK_HADAMARD=1 build wrote (0x234) and what a plain int8 build wrote (0x0) — no existing pack is
+    // invalidated by removing the knob.
+    uint32_t hd = (qb == (uint32_t) '4') ? 1u : 0u;
+    return (qb & ORK_SIG_QB_MASK) | (hy << 8) | (hd << 9);
+}
+
+// The weight tier a pack was BUILT at, decoded from its stored signature. This is what makes an .orkpack
+// self-describing: load an int4 pack and you get the int4 path.
+static int ork_sig_qbits(uint32_t sig) {
+    return ((sig & ORK_SIG_QB_MASK) == (uint32_t) '4') ? 4 : 8;
+}
+
+// NATIVE W4A4 — the only path that actually issues 4-bit MACs (ork_i4_mm_*). Opt-in via ORK_MIXED_W4A4,
+// because it is fragile at prefill (single-row, no M-amortization).
+//
+// ORK_QUANT=4 does NOT select it. That is the int4 STORAGE tier: weights are stored 4-bit, then inflated
+// int4->int8 on the NPU and computed by the robust W8A8 kernel. No 4-bit MAC ever runs, so there is nothing
+// to rotate — which is exactly why the storage tier is the coherent, recommended int4 default.
+//
+// Where a 4-bit MAC DOES run, the block-Hadamard rotation is UNCONDITIONAL. RK3588's W4A4 is symmetric
+// per-channel and incoherent unrotated (PPL ~104 vs ~24), so un-rotated W4A4 was never a configuration worth
+// selecting — only a way to get a silently garbage run. Hence the old ORK_HADAMARD opt-in is gone, and the
+// un-rotated grouped route (mul_mat_i4) with it: selecting native W4A4 now means rotated, always.
+//
+// ork-driver cannot own this rule. A block-Hadamard is orthogonal, so (R*A)·(R*B) == A*B and the driver's
+// matmul is rotation-invariant by construction — it never observes whether the caller rotated, so it can
+// neither enforce nor check. ggml-ork applies R to the weight column at pack AND to the activation row at
+// run (both at the same block size), so ggml-ork is the only layer that can hold the invariant.
+static bool ork_w4a4_native_on(void) { return env_enabled("ORK_MIXED_W4A4"); }
+
+// Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —
+// unless ORK_QUANT explicitly forces a tier, in which case a conflicting pack is stale and gets rebuilt.
+static bool ork_sig_compatible(uint32_t sig) {
+    if ((sig & ORK_SIG_HY_BIT) != (ork_build_sig() & ORK_SIG_HY_BIT)) return false;
+    const char * q = getenv("ORK_QUANT");
+    if (q && *q) return ork_sig_qbits(sig) == ((q[0] == '4') ? 4 : 8);
+    return true;
 }
 
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
@@ -319,8 +374,9 @@ struct ggml_backend_ork_context {
                                // ORKD-ROUTED driver APIs only (ork_i8_mm_pack / ork_i8_mm_run — the daemon owns
                                // the buffers). The zero-copy .orkpack import, DMA activation buffers, and the
                                // fused/stream/chain/MoE runners are fd-local (not routed) and are gated OFF here.
-    int qbits = 8;              // 8 = W8A8 (default), 4 = W4A4 (ORK_QUANT=4)
-    int hadamard = 0;          // ORK_HADAMARD=1 (with ORK_QUANT=4): per-channel int4 + block-Hadamard rotation
+    int qbits = 8;              // 8 = W8A8, 4 = W4A4. Adopted from the loaded .orkpack (persist_qbits); ORK_QUANT overrides.
+    int persist_qbits = 0;     // tier the loaded .orkpack was BUILT at (4/8), 0 = no pack read. Set by ork_persist_init.
+    int hadamard = 0;          // 1 iff NATIVE W4A4 is selected; rotation is inseparable from it (see ork_w4a4_native_on)
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
     bool slice_route = false;  // ORK_SLICE_ROUTE=1: route wide int8 matmuls (K>4096 / N>8192) through the
@@ -866,13 +922,13 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                     fprintf(stderr, "[ORK PERSIST] %s is stale (pack-compat token %u != this build's %u) — regenerating\n",
                             p, f.ork_fmt, ork_pack_format_version());
                     stale = true;
-                } else if (magic_ok && f.quant_sig != ork_build_sig()) {          // right format, but a DIFFERENT precision/config
-                    fprintf(stderr, "[ORK PERSIST] %s was built for a different precision/config (quant_sig %u != this run's %u) — regenerating\n",
+                } else if (magic_ok && !ork_sig_compatible(f.quant_sig)) {        // right format, genuinely unusable config
+                    fprintf(stderr, "[ORK PERSIST] %s was built for an incompatible config (quant_sig %u vs this run's %u) — regenerating\n",
                             p, f.quant_sig, ork_build_sig());
                     stale = true;
                 }
                 if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
-                    f.ork_fmt == ork_pack_format_version() && f.quant_sig == ork_build_sig() && f.index_off < (uint64_t) sz) {
+                    f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
@@ -880,8 +936,15 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                         orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
                         ctx->persist_idx.emplace(std::move(name), e);
                     }
+                    // ADOPT the pack's tier. ork_persist_init runs BEFORE ctx->qbits is set, so this is the
+                    // value the ctx init picks up when ORK_QUANT is unset: loading an int4 pack selects int4.
+                    ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
+                    // Not VERBOSE-gated: a pack silently switching the run's weight tier is the one adoption
+                    // a reader must not have to guess at. (Tier only — the 4-bit COMPUTE path stays opt-in.)
+                    if (ctx->persist_qbits == 4)
+                        fprintf(stderr, "[ORK PERSIST] %s is an int4 pack — selecting the int4 tier (no ORK_QUANT needed)\n", p);
                     return;
                 }
                 munmap(m, sz);
@@ -922,7 +985,7 @@ extern "C" bool ggml_backend_ork_orkpack_valid(const char * path) {
         orkpack_footer f;
         if (read(fd, &f, sizeof f) == (ssize_t) sizeof f)
             ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
-                 f.ork_fmt == ork_pack_format_version() && f.quant_sig == ork_build_sig() && f.index_off < (uint64_t) sz;
+                 f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz;
     }
     close(fd);
     return ok;
@@ -1332,7 +1395,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
         if (!ctx->persist_dumped.count(ork_expert_key(src0->name, e))) todo.push_back(e);
     if (todo.empty()) return;
 
-    // NATIVE W4A4 (ORK_QUANT=4 + ORK_HADAMARD): emit each expert as ORKPACK_DT_I4_NATIVE — FWHT-rotate the
+    // NATIVE W4A4 (int4 tier; hadamard implied): emit each expert as ORKPACK_DT_I4_NATIVE — FWHT-rotate the
     // weight columns, per-channel int4-quant (mx/7), ork_i4_mm_pack + ork_w_dump — the exact form the run
     // path's native-W4A4 expert branch loads via ork_i4_mm_load (twin of the dense ork_persist_write_i4native).
     // SERIAL over experts because ork_i4_mm_pack is a single-stream NPU op (inner column loop is OMP-parallel);
@@ -2140,6 +2203,13 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
 // activations too — weights AND activations are per-group int4-quantized (group_size G along K),
 // the NPU dequantizes each group's int partial in fp32. ~9.5% matmul error (W4A4 floor; weights at
 // 0.5 B/elem). Submit-heavy (K/G submits/core), so coarser/larger G is cheaper but less accurate.
+//
+// NO LONGER REACHABLE FROM DISPATCH. This is the UN-ROTATED 4-bit route: per-group scales stand in for
+// the block-Hadamard, and they do not stand in well enough (grouped is coherent but costs 16x the
+// submits; per-channel-without-R is PPL ~104). Selecting native W4A4 now always takes the rotated
+// mul_mat_i4_hadamard — see ork_w4a4_native_on. Kept, not deleted: it is the grouped-vs-rotated A/B
+// baseline the int4 RE depends on, and re-deriving it costs far more than the dead code does.
+__attribute__((unused))
 static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i4\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -2259,7 +2329,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 }
 
 
-// int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (ORK_HADAMARD=1). Weights are
+// int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (implied by the int4 tier). Weights are
 // rotated (R·B) and per-channel int4-quantized once at load (cached); activations are rotated (A·R)
 // and per-row int4-quantized each matmul; the rotation cancels in fp32 (A·B = (A·R)·(R·B)) but lets
 // the coarse per-channel int4 quant stay accurate. Per-channel = full-K SINGLE submit (ork_i4_mm_run),
@@ -3367,7 +3437,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     char * dbase = (char *) dst->data;
     const bool bcast = (n_b1 == 1);
 
-    // ===== NATIVE W4A4 EXPERT PATH (ORK_QUANT=4 + ORK_HADAMARD) =====
+    // ===== NATIVE W4A4 EXPERT PATH (int4 tier; hadamard implied) =====
     // The int4 twin of the int8 expert compute below. Shares this handler's routing (the src0/src1/ids parse
     // + the persist_mode==2 convert branch above); only the inner per-expert kernel differs: FWHT-rotate +
     // int4-quant the weight AND the activation (QuaRot — an orthonormal rotation preserves the dot product
@@ -6802,16 +6872,15 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             else if (is_attn) target_qbits = 8;
                         }
 
-                        // int4 COMPUTE routing: native W4A4 (mul_mat_i4 grouped / hadamard) is fragile at prefill
-                        // (grouped M_padded wedges) and only opt-in now — ORK_HADAMARD or ORK_MIXED_W4A4. The DEFAULT
-                        // int4 (incl. ORK_QUANT=4) computes W8A8 via mul_mat_i8 (int4 weights inflated int4->int8 on the
-                        // NPU — robust, no wedge); compact i4a8 STORAGE is chosen separately at persist (ork_orkpack_tier).
-                        static const int w4a4_opt = env_enabled("ORK_MIXED_W4A4");
-                        bool native_w4a4 = (target_qbits == 4) && (ctx->hadamard || w4a4_opt);
-                        bool mm_ok = native_w4a4
-                            ? (ctx->hadamard ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
-                                             : ggml_backend_ork_mul_mat_i4(ctx, node))
-                            : ggml_backend_ork_mul_mat_i8(ctx, node);
+                        // int4 COMPUTE routing: native W4A4 is fragile at prefill (grouped M_padded wedges) and stays
+                        // opt-in via ORK_MIXED_W4A4 (ctx->hadamard). When selected it is ALWAYS the rotated variant —
+                        // the un-rotated grouped route is gone, because a symmetric 4-bit MAC without R is incoherent
+                        // (see ork_w4a4_native_on). The DEFAULT int4 (incl. ORK_QUANT=4) computes W8A8 via mul_mat_i8
+                        // (int4 weights inflated int4->int8 on the NPU — robust, no wedge); compact i4a8 STORAGE is
+                        // chosen separately at persist (ork_orkpack_tier).
+                        bool native_w4a4 = (target_qbits == 4) && ctx->hadamard;
+                        bool mm_ok = native_w4a4 ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
+                                                 : ggml_backend_ork_mul_mat_i8(ctx, node);
                         if (!mm_ok) return GGML_STATUS_FAILED;
                     }
                 }
@@ -7016,19 +7085,26 @@ ggml_backend_t ggml_backend_ork_init(void) {
               while (fscanf(gf, "%255s %f", nm, &gv) == 2) ctx->gmax_loaded[nm] = gv;
               fclose(gf);
               if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-GMAX] loaded %zu-layer gmax profile from %s\n", ctx->gmax_loaded.size(), sp.c_str()); } } }
+    // Weight tier. The .orkpack is the normal source of truth: ork_persist_init (above) decoded the tier the
+    // pack was BUILT at into persist_qbits, so loading an int4 pack selects the int4 path with nothing set.
+    // ORK_QUANT stays as a DEVELOPMENT OVERRIDE — it forces the tier for a run with no pack yet (the build
+    // pass that CREATES an int4 pack) or to deliberately rebuild at a different tier. With no pack and no
+    // override the default is W8A8.
     const char * q = getenv("ORK_QUANT");
-    ctx->qbits = (q && q[0] == '4') ? 4 : 8;   // ORK_QUANT=4 -> W4A4; default (unset/8) -> W8A8
+    ctx->qbits = (q && *q)         ? ((q[0] == '4') ? 4 : 8)
+               : ctx->persist_qbits ? ctx->persist_qbits
+                                    : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->slice_route = getenv("ORK_SLICE_ROUTE") != nullptr && !ctx->via_orkd;   // wide int8 via sliced doorbell (fd-local only)
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
-    // Hadamard engages under global int4 (ORK_QUANT=4) OR per-tensor mixed W4A4 (ORK_MIXED_DISPATCH +
-    // ORK_MIXED_W4A4): both route the 4-bit tier to mul_mat_i4_hadamard (per-channel, single submit, the
-    // persist-able native-W4A4 path) instead of mul_mat_i4 (grouped, no persist).
-    ctx->hadamard = getenv("ORK_HADAMARD") != nullptr &&
-                    (ctx->qbits == 4 || (ork_mixed_dispatch_on() && env_enabled("ORK_MIXED_W4A4")));
+    // Rotation is now exactly "native W4A4 is selected" — one flag, no separate opt-in. Selecting the 4-bit
+    // datapath routes to mul_mat_i4_hadamard (per-channel, single submit, persist-able); the un-rotated
+    // grouped route is no longer reachable. ORK_QUANT=4 alone does NOT land here — that is the int4 STORAGE
+    // tier computing W8A8. See ork_w4a4_native_on for the full rule and why ork-driver cannot own it.
+    ctx->hadamard = ork_w4a4_native_on();
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     // SHIP HARDENING (2026-07-11): the FFN chain ships with a COMPACT resident footprint — default ORK_NO_BF
     // when ORK_FFN_CHAIN is on. The full-K Bf decode-copies ~double the footprint (~1.9->3.6 GiB on 1.7B),
@@ -7413,13 +7489,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // symmetric W4A4 — no coherent int4-resident mode — and re-quantizing q4->int8 is lossy
             // double-quant). Route any sub-5-bit source (Q4_*/Q3_K/Q2_K/IQ*) to CPU, and — since supports_op
             // also gates the convert-time forward — this stops the .orkpack from ever packing a q4 model.
-            // Escape hatch: an explicit int4 RESEARCH mode (ORK_QUANT=4 / ORK_HADAMARD / ORK_HYBRID /
-            // ORK_ORKPACK_TIERMAP) still opts into the experimental int4 path. ORK_MIXED_DISPATCH also
-            // opts in: it ACCEPTS the sub-5-bit tensors and runs them native-W4A4 (per-tensor dispatch in
-            // graph_compute), keeping the >4-bit tensors on W8A8 — the mixed-precision q4 NPU path.
+            // Escape hatch: an explicit int4 RESEARCH mode (ORK_QUANT=4 / ORK_HYBRID / ORK_ORKPACK_TIERMAP)
+            // still opts into the experimental int4 path — as does simply having LOADED an int4 .orkpack,
+            // which is a deliberate enough act to count as opting in. ORK_MIXED_DISPATCH also opts in: it
+            // ACCEPTS the sub-5-bit tensors and runs them native-W4A4 (per-tensor dispatch in graph_compute),
+            // keeping the >4-bit tensors on W8A8 — the mixed-precision q4 NPU path.
             {
-                static const int i4_research = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
-                    || getenv("ORK_HADAMARD") || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
+                static const int i4_env = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
+                    || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
+                // Read the ctx live rather than folding it into the static: supports_op can be reached
+                // before backend init has published g_ork_ctx, and a cached 0 would stick for the run.
+                const int i4_research = i4_env || (g_ork_ctx && g_ork_ctx->qbits == 4);
                 if (!i4_research && !ork_mixed_dispatch_on()) {
                     double sbits = ork_src_type_bits(src0->type);
                     if (sbits >= 0.0 && sbits < 5.0) return false;   // q4/low-bit source -> CPU-only
@@ -7462,7 +7542,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // Residency does NOT make single-token (M=1) decode worth it for dense layers — the per-submit
             // floor dominates regardless. Keep the M threshold so dense decode stays on CPU.
             // Bypassed for expert layers (MoE) where CPU weight streaming is a catastrophic ~32ms bottleneck.
-            bool hadamard = g_ork_ctx ? g_ork_ctx->hadamard : (getenv("ORK_HADAMARD") != nullptr);
+            // Native W4A4 is env-selected, so this reads the same before and after the ctx exists.
+            bool hadamard = g_ork_ctx ? (bool) g_ork_ctx->hadamard : ork_w4a4_native_on();
             bool is_grouped = (src0->type == GGML_TYPE_Q4_0  ||
                                src0->type == GGML_TYPE_Q4_1  ||
                                src0->type == GGML_TYPE_Q4_K  ||
