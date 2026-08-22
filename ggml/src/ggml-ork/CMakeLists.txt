@@ -38,6 +38,7 @@ ggml_add_backend_library(ggml-ork
                          ${ORK_DIR}/src/npu.c
                          ${ORK_NPU_MODULES}
                          ${ORK_DIR}/src/ork_ops.c
+                         ${ORK_DIR}/src/ork_gptq.c
                          ${ORK_ORKD_CLIENT}
                          ${ORK_DIR}/src/soc.c
                          ${ORK_DIR}/src/soc/rk3588.c
@@ -50,7 +51,7 @@ target_link_libraries     (ggml-ork PRIVATE Threads::Threads)
 # ork-driver's npu.c is C and needs _GNU_SOURCE (set in the file); keep its C sources as C.
 # orkd_client.c (v1.0.0) is the transparent orkd-daemon routing shim npu.c calls into under ORK_USE_ORKD.
 set_source_files_properties(
-    ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_DIR}/src/ork_ops.c ${ORK_ORKD_CLIENT} ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
+    ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_DIR}/src/ork_ops.c ${ORK_DIR}/src/ork_gptq.c ${ORK_ORKD_CLIENT} ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
     PROPERTIES LANGUAGE C)
 
 # Activation int8-quant in ggml-ork.cpp is parallelized with #pragma omp parallel for (per-row,

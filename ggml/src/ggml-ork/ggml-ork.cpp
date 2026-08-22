@@ -2329,6 +2329,31 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 }
 
 
+/* ORK_GPTQ (pack-time, native-W4A4 only). GPTQ needs a calibration Hessian H = A^T A over the SAME input
+ * space the weights live in — under QuaRot that is the ROTATED space, so A here is the rotated activation
+ * batch (A*R), matching the rotated weight columns. The weight is quantized on FIRST USE inside the forward
+ * pass, so the calibration batch is simply whatever prompt the pack pass runs.
+ *
+ * RANK: H is K*K but a batch contributes only M samples, so rank(H) <= M. With M < K the Hessian is
+ * rank-deficient, damping dominates the null space and GPTQ degenerates toward RTN there — not wrong, just
+ * weak. Use a calibration prompt with M >= K for the full benefit; we warn when it is not.
+ * Cost: O(M*K^2) here plus ork_i4_gptq's three O(K^3) factorisations — a heavy ONE-TIME pack step. */
+static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
+    memset(H, 0, (size_t)K*K*sizeof(float));
+    std::vector<float> a((size_t)K);
+    for (int m = 0; m < M; m++) {
+        memcpy(a.data(), y + (size_t)m*K, (size_t)K*sizeof(float));
+        for (int off = 0; off < K; off += b) ork_fwht_norm(a.data() + off, b);   // same rotation as the weights
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < K; i++) {
+            const float ai = a[i];
+            if (ai == 0.0f) continue;
+            float * hr = H + (size_t)i*K;
+            for (int j = 0; j < K; j++) hr[j] += ai * a[j];
+        }
+    }
+}
+
 // int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (implied by the int4 tier). Weights are
 // rotated (R·B) and per-channel int4-quantized once at load (cached); activations are rotated (A·R)
 // and per-row int4-quantized each matmul; the rotation cancels in fp32 (A·B = (A·R)·(R·B)) but lets
@@ -2393,6 +2418,34 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         for (int k = 0; k < K; k++) {
                             int q = (int) lrintf(col[k] / s);
                             bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
+                    }
+                    /* ORK_GPTQ: swap the round-to-nearest codes just computed for error-compensated GPTQ
+                     * ones. The loop above already left f32 as the rotated weight in [N x K] — exactly what
+                     * ork_i4_gptq wants — and group=-1 yields per-row scales, i.e. the SAME per-channel layout
+                     * this pack format already uses. So it is a drop-in code/scale swap, not a format change,
+                     * and a failure falls back to the RTN codes already in bi. Off by default: three O(K^3)
+                     * factorisations per weight. */
+                    if (getenv("ORK_GPTQ")) {
+                        const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
+                        std::vector<float>  Hc((size_t)K*K);
+                        std::vector<int8_t> codes((size_t)N*K);
+                        std::vector<float>  sc((size_t)N);
+                        if (M < K) fprintf(stderr,
+                            "[ORK GPTQ] %s: calibration batch M=%d < K=%d — H is rank-deficient; GPTQ tends to "
+                            "RTN in the null space. Use a longer calibration prompt.\n", src0->name, M, K);
+                        double g0 = ork_now_us();
+                        ork_gptq_hessian(M, K, b, y, Hc.data());
+                        int grc = ork_i4_gptq(K, N, f32, Hc.data(), -1, codes.data(), sc.data(), damp);
+                        if (grc) {
+                            fprintf(stderr, "[ORK GPTQ] %s: ork_i4_gptq rc=%d — keeping RTN codes\n", src0->name, grc);
+                        } else {
+                            for (int n = 0; n < N; n++) {
+                                ow.bscale[n] = sc[n];
+                                for (int k = 0; k < K; k++) bi[(size_t)k*N + n] = codes[(size_t)n*K + k];
+                            }
+                            fprintf(stderr, "[ORK GPTQ] %s K=%d N=%d M=%d damp=%.3g -> GPTQ codes (%.1f s)\n",
+                                    src0->name, K, N, M, damp, (ork_now_us()-g0)/1e6);
                         }
                     }
                     ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi);
