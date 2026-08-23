@@ -1555,6 +1555,61 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
 // Read a native-W4A4 weight by name (read mode): fills `ow` and returns true on a matching hit (skip the
 // cold rotate+pack), false to pack normally. Per-(K,N,dtype) re-checked so a stale .orkpack can't feed
 // wrong weights. Single/current pack-domain (native W4A4 is the <4GB compute path; multi-domain is later).
+/* A read-mode pack MISS on a weight the index demonstrably contains is a BUG, not a rebuild condition.
+ *
+ * The fallback to inline packing is correct and necessary for a genuinely cold weight, which is exactly why
+ * it is so dangerous here: the run continues, produces a weight of the wrong TIER, and reports a plausible
+ * number. DT_I4_ROT_A8 sat in that state indefinitely -- its blob was written tiled while its loader
+ * demanded the compact container, so it never loaded once, at any size, and the only symptom was a
+ * perplexity that looked believable enough to publish.
+ *
+ * This is the fourth mechanism in one session to manufacture a confident wrong answer (the others: rsync -a
+ * preserving mtimes so cmake skipped rebuilds; an offline path with no implementation; a pack silently
+ * overwritten by its own reader). The other three are now loud. This one closes the set.
+ *
+ * Three outcomes, deliberately different:
+ *   - no index entry            -> silent. A cold weight SHOULD be packed inline; that is the design.
+ *   - entry with an unknown dtype -> warn once, continue. Forward compat is intentional: a newer pack read
+ *                                   by an older build refuses that entry per-weight rather than failing.
+ *   - entry this build can serve -> ABORT. The pack has it, the shapes agree, the dtype is supported, and
+ *                                   the load still failed. Nothing downstream of that is trustworthy.
+ * ORK_ALLOW_PACK_MISS=1 downgrades the abort to a warning for deliberate experiments. */
+static void ork_pack_miss_check(ggml_backend_ork_context * ctx, const char * name, int K, int N,
+                                const uint32_t * serves, int n_serves) {
+    if (!ctx || ctx->persist_mode != 1) return;
+    auto pit = ctx->persist_idx.find(name);
+    if (pit == ctx->persist_idx.end()) return;                  /* genuine cold weight -- pack it inline */
+    const orkpack_entry & e = pit->second;
+    /* CROSS-LOADER misses are legitimate and must stay silent. Each loader serves a subset of the dtypes:
+     * the i4-native loader takes the rotated/native int4 family, the int8 loader takes DT_I8 / DT_I4. A
+     * DT_I4 entry declining to load through the i4-native path is routing doing its job, not a fault --
+     * and a guard that cannot tell those apart aborts a healthy run, which the negative control caught it
+     * doing on a perfectly good i4a8 pack. So the caller states what IT can serve. */
+    bool mine = false;
+    for (int i = 0; i < n_serves; i++) if (e.dtype == serves[i]) { mine = true; break; }
+    if (!mine) return;
+    const bool known = (e.dtype == ORKPACK_DT_I8 || e.dtype == ORKPACK_DT_I4 ||
+                        e.dtype == ORKPACK_DT_I4_NATIVE || e.dtype == ORKPACK_DT_I8_ROT ||
+                        e.dtype == ORKPACK_DT_I4_ROT_A8);
+    if (!known) {
+        static std::unordered_set<uint32_t> said;
+        if (said.insert(e.dtype).second)
+            fprintf(stderr, "[ORK PERSIST] note: pack entry dtype %u is newer than this build "
+                            "(first: %s) — those weights are packed inline\n", e.dtype, name);
+        return;
+    }
+    const bool allow = env_enabled("ORK_ALLOW_PACK_MISS");
+    fprintf(stderr,
+        "[ORK PERSIST] %s: %s is IN the pack (K=%u N=%u dtype=%u) but failed to load; the run wants "
+        "K=%d N=%d.\n"
+        "              A miss here silently packs the weight inline at a DIFFERENT tier than the pack "
+        "specifies, so the\n"
+        "              model still runs and still reports a plausible number. %s\n",
+        allow ? "WARNING" : "FATAL", name, e.K, e.N, e.dtype, K, N,
+        allow ? "Continuing (ORK_ALLOW_PACK_MISS)." : "Set ORK_ALLOW_PACK_MISS=1 to continue anyway.");
+    if (!allow) abort();
+}
+
 static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, ork_weight & ow) {
     if (ctx->persist_mode != 1 || !ctx->persist_map) return false;
     auto pit = ctx->persist_idx.find(name);
@@ -2111,6 +2166,12 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     if (expert >= 0) { if (ctx->profile) ctx->s_resolve += ork_now_us_e() - _r0; return ctx->wcache.end(); }
     // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
     if (ctx->persist_mode) ctx->persist_misses++;
+    /* Fatal FIRST when the pack actually has this weight: the warning below is for a weight that is
+     * genuinely absent (slow, but correct), whereas an unloadable-but-present entry silently swaps the
+     * tier and is not correct at all. Expert keys are looked up under ork_expert_key, so a dense-name
+     * lookup finds nothing for them and this stays silent -- deliberately conservative. */
+    { static const uint32_t serves[] = { ORKPACK_DT_I8, ORKPACK_DT_I4 };
+      ork_pack_miss_check(ctx, src0->name, K, N, serves, 2); }
     if (ctx->persist_mode == 1) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
         // weight (name/shape/dtype mismatch or incomplete pack) so we fall back to live Q8_0->int8-tile
         // conversion (~25x the orkpack load — measured 16.7s vs 0.66s resolve on the 1.7B). Make it LOUD
@@ -3156,6 +3217,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if (it == ctx->wcache.end()) {
                 ork_weight ow;
                 if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
+                    { static const uint32_t serves[] = { ORKPACK_DT_I4_NATIVE, ORKPACK_DT_I8_ROT, ORKPACK_DT_I4_ROT_A8 };
+                      ork_pack_miss_check(ctx, src0->name, K, N, serves, 3); }   /* in the pack but unloadable = bug */
                     const int GRP = ork_i4_group_for(src0->name);
                     const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
                     /* ROTATED tier WIDTH. Promotion keeps the rotation and widens the quantiser instead of
@@ -4642,6 +4705,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                         pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N) pe = &pit->second;
                 }
                 if (!pe) {                                        // cold quantize the plane -> bi + ow.bscale
+                    { static const uint32_t serves[] = { ORKPACK_DT_I4_NATIVE };
+                      ork_pack_miss_check(ctx, ork_expert_key(src0->name, e).c_str(), K, N, serves, 1); }
                     bi.resize((size_t) K * N); f32e.resize((size_t) N * K);
                     #pragma omp parallel for schedule(static)
                     for (int n = 0; n < N; n++) {
@@ -4940,6 +5005,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             if (pit != ctx->persist_idx.end() && pit->second.K==(uint32_t)K && pit->second.N==(uint32_t)N &&
                 (pit->second.dtype==ORKPACK_DT_I8 || pit->second.dtype==ORKPACK_DT_I4)) pe = &pit->second;
         }
+        if (!pe) { static const uint32_t serves[] = { ORKPACK_DT_I8, ORKPACK_DT_I4 };
+                   ork_pack_miss_check(ctx, ork_expert_key(src0->name, e).c_str(), K, N, serves, 2); }
         std::vector<float> bsc(N);
         const double pk0 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] time first-touch pack/load
         if (pe) {
