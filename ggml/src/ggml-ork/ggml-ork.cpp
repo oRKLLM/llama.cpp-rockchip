@@ -2354,6 +2354,59 @@ static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
     }
 }
 
+/* ORK_W4A4_DIAG — split the W4A4 error into its WEIGHT and ACTIVATION halves.
+ *
+ * Everything invested in W4A4 quality so far (Hadamard, GPTQ) touches only W. A is still plain per-row
+ * absmax/7, and in W4A4 the activation term is usually the DOMINANT one — so before paying for a
+ * pack-format change to get per-group weight scales, measure which half actually owns the error.
+ *
+ * On a subsample (rows x channels, so it is cheap enough to run inline) computes the exact rotated
+ * product and three perturbations of it, and reports relative Frobenius error:
+ *     W-only : quantized W, exact A     — what GPTQ/grouping can improve
+ *     A-only : exact W, quantized A     — what NOTHING currently improves
+ *     both   : the real W4A4 product
+ * Uses the SAME rules the runtime uses (rotate, absmax/7, clamp [-8,7]) so the numbers are the real
+ * ones, not a model of them. Measured against RTN weights, which makes it a CONSERVATIVE read on A's
+ * share: GPTQ shrinks the W term, so A's dominance can only grow from here. */
+static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
+                          const float * y, const float * Wrot, const std::vector<float> & ws) {
+    const int MS = M < 32 ? M : 32;                       /* subsample: rows */
+    const int NS = N < 128 ? N : 128;                     /*            output channels */
+    if (MS < 1 || NS < 1) return;
+
+    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K);
+    for (int m = 0; m < MS; m++) {                        /* rotate + quantize A exactly as the runtime does */
+        float * a = A.data() + (size_t)m*K;
+        memcpy(a, y + (size_t)m*K, (size_t)K*sizeof(float));
+        for (int off = 0; off < K; off += b) ork_fwht_norm(a + off, b);
+        float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(a[k]); if (v > mx) mx = v; }
+        const float s = mx / 7.0f;
+        float * aq = Aq.data() + (size_t)m*K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s); q = q>7?7:(q<-8?-8:q); aq[k] = q*s; }
+    }
+    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0;
+    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b)
+    for (int n = 0; n < NS; n++) {
+        const float * w  = Wrot + (size_t)n*K;
+        const float sw = ws[n];
+        std::vector<float> wq((size_t)K);
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(w[k]/sw); q = q>7?7:(q<-8?-8:q); wq[k] = q*sw; }
+        for (int m = 0; m < MS; m++) {
+            const float * a  = A.data()  + (size_t)m*K;
+            const float * aq = Aq.data() + (size_t)m*K;
+            double r = 0, dw = 0, da = 0, db = 0;
+            for (int k = 0; k < K; k++) { r += (double)a[k]*w[k]; dw += (double)a[k]*wq[k];
+                                          da += (double)aq[k]*w[k]; db += (double)aq[k]*wq[k]; }
+            e_ref += r*r; e_w += (dw-r)*(dw-r); e_a += (da-r)*(da-r); e_b += (db-r)*(db-r);
+        }
+    }
+    if (e_ref <= 0) return;
+    const double nrm = sqrt(e_ref);
+    fprintf(stderr, "[W4A4-DIAG] %-28s K=%-5d N=%-6d | rel err  W-only %.4f  A-only %.4f  both %.4f  "
+                    "| A/W = %.2fx\n", name, K, N,
+            sqrt(e_w)/nrm, sqrt(e_a)/nrm, sqrt(e_b)/nrm, sqrt(e_w) > 0 ? sqrt(e_a)/sqrt(e_w) : 0.0);
+}
+
 /* ---- TWO-PHASE GPTQ CALIBRATION ----------------------------------------------------------------
  * GPTQ wants H accumulated over MANY calibration batches; ork-driver quantizes a weight on FIRST USE,
  * when exactly one batch has been seen. rank(H) <= samples, so single-shot calibration leaves H rank-4
@@ -2484,6 +2537,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                      * ggml_backend_ork_gptq_finalize() re-quantizes with the accumulated H and persists that. */
                     ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi);
                     if (!ow.w) return false;
+                    if (getenv("ORK_W4A4_DIAG")) ork_w4a4_diag(src0->name, M, K, N, b, y, f32, ow.bscale);
                     if (ork_gptq_on()) {
                         ork_gptq_cal & c = g_gptq_cal[x];
                         if (c.H.empty()) {
