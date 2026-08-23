@@ -82,6 +82,20 @@ GGML_BACKEND_API void                ggml_backend_ork_gptq_finalize(void);
 GGML_BACKEND_API int                 ggml_backend_ork_gptq_min_rows(void);
 GGML_BACKEND_API long                ggml_backend_ork_gptq_rows(void);
 
+/* WINDOWED CALIBRATION. The Hessian (K*K doubles per weight) is not disk-backed, so it cannot be paged --
+ * only rebuilt by replaying the corpus. Calibrating every weight at once costs sum(K^2*8) resident, which
+ * is ~236 GiB for a 64-layer 27B (the 64 ffn_down at K=17408 are 2.42 GiB each). Instead, calibrate a
+ * layer range per pass: set_window(lo,hi) -> run the corpus -> finalize() -> repeat. Because finalize
+ * writes the quantised weight back into the weight cache and windowed runs keep it pinned, later windows
+ * calibrate against already-quantised upstream layers, i.e. SEQUENTIAL GPTQ rather than one-shot.
+ * lo < 0 restores unwindowed behaviour. hessian_bytes(K) sizes the window against a RAM budget. */
+GGML_BACKEND_API void                ggml_backend_ork_gptq_set_window(int lo, int hi);
+GGML_BACKEND_API double              ggml_backend_ork_gptq_hessian_bytes(int K);
+/* Largest K over every REGISTERED weight (claimed or not) -- available after the discovery pass, which
+ * costs no Hessian memory, and used to size the window against a RAM budget. min_rows() by contrast
+ * reports the largest K the CURRENT window claimed, which is what sets its calibration row count. */
+GGML_BACKEND_API int                 ggml_backend_ork_gptq_max_k(void);
+
 // ---- Async cross-stream submit path ----
 // Run this backend's NPU graph on a worker thread: the launch returns immediately so the caller can do CPU
 // work (e.g. a speculative draft's routing/sampling) while the NPU crunches; synchronize joins and returns the

@@ -141,6 +141,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <sys/stat.h>
 #include <deque>
 #include <thread>
 #include <atomic>
@@ -1025,6 +1026,8 @@ static std::string ork_default_orkpack_path() {
     const size_t dot = m.rfind(".gguf");
     return m.substr(0, dot) + ".orkpack";
 }
+static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed);
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_i8_mm_import),
@@ -1122,6 +1125,19 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
+                    /* ORK_MAKE_STUB=1: emit the companion stub for a pack that already exists. The stub needs
+                     * only the source model and the set of names the pack owns, both of which are in hand
+                     * here -- rebuilding a 12 GiB pack merely to get its ~2 GiB sidecar would be absurd.
+                     * Explicit rather than automatic: writing gigabytes as a side effect of a read would be
+                     * a nasty surprise in the middle of a timed run. */
+                    if (getenv("ORK_MAKE_STUB")) {
+                        std::vector<std::pair<std::string, orkpack_entry>> owned;
+                        owned.reserve(ctx->persist_idx.size());
+                        for (const auto & kv : ctx->persist_idx) owned.emplace_back(kv.first, kv.second);
+                        const std::string src = ork_find_model_path();
+                        if (!src.empty()) ork_write_stub_gguf(src.c_str(), (std::string(p) + ".gguf").c_str(), owned);
+                        else fprintf(stderr, "[ORK STUB] source model path unknown — no stub written\n");
+                    }
                     /* ORK_PACK_RANK: print the pack's own quality evidence, worst first, with the bytes a
                      * promotion to int8 would cost (int8 = 2x int4, so +K*N/2). This is the input a
                      * re-tiering policy needs, and it comes from the FILE — no model run, no diagnostic
@@ -1789,6 +1805,97 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     }
 }
 
+/* ---- STUB GGUF -------------------------------------------------------------------------------------
+ * Emitted next to the .orkpack at build time, so a run needs (stub GGUF + orkpack) instead of (FULL GGUF
+ * + orkpack). Without it the matmul weights are carried TWICE -- once as source GGUF bytes and again as
+ * packed int4 in IOVA. At 27B that is a 40.8 GiB working set on a 31 GiB board, and it does not surface
+ * as an OOM: the GGUF is mmap'd, so pages churn, submits time out, and the NPU self-heals in a loop that
+ * reads like a driver fault. The stub removes the duplicate instead of tuning around it.
+ *
+ * HOW: the stub is byte-identical to the source in layout. Header + KV + tensor-info are copied verbatim,
+ * so every tensor keeps its exact data offset and llama.cpp loads it with no loader change at all; then
+ * only the tensors the pack does NOT own are copied into the data section, and the rest are left as file
+ * HOLES. Same apparent size, a fraction of the blocks. Copying the info section wholesale is also what
+ * makes this safe -- no re-serialisation, so no chance of writing subtly different metadata.
+ *
+ * The holes read as zeros, which is fine ONLY because ork substitutes those tensors from the pack before
+ * anything looks at them -- and dangerous if that ever stops being true, which is why the loader-side
+ * guard (ork_stub_verify) refuses to run a stub whose packed tensors the pack cannot serve. Never ship a
+ * stub without its pack; it is not a model on its own. */
+static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed) {
+    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+    if (!gg) { fprintf(stderr, "[ORK STUB] cannot read %s — no stub written\n", src_path); return false; }
+
+    std::unordered_set<std::string> own;
+    for (const auto & kv : packed) own.insert(kv.first);
+
+    int sfd = open(src_path, O_RDONLY);
+    int dfd = open(stub_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (sfd < 0 || dfd < 0) { if (sfd>=0) close(sfd); if (dfd>=0) close(dfd); gguf_free(gg);
+        fprintf(stderr, "[ORK STUB] open failed for %s\n", stub_path); return false; }
+
+    const size_t data_off = gguf_get_data_offset(gg);
+    std::vector<char> buf(1u << 20);
+    bool ok = true;
+
+    /* 1. header + KV + tensor-info, verbatim */
+    for (size_t got = 0; got < data_off && ok; ) {
+        const size_t want = (data_off - got < buf.size()) ? (data_off - got) : buf.size();
+        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
+        if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, (off_t) got) != r) ok = false; else got += (size_t) r;
+    }
+
+    /* 2. full length up front, so the untouched ranges become holes rather than a short file */
+    const off_t total = lseek(sfd, 0, SEEK_END);
+    if (ok && ftruncate(dfd, total) != 0) ok = false;
+
+    /* 3. copy only what the pack does not own */
+    size_t kept = 0, dropped = 0; uint64_t kept_b = 0, dropped_b = 0;
+    const int64_t nt = gguf_get_n_tensors(gg);
+    for (int64_t i = 0; i < nt && ok; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        const size_t sz = gguf_get_tensor_size(gg, i);
+        const off_t  at = (off_t) (data_off + gguf_get_tensor_offset(gg, i));
+        if (own.count(nm)) { dropped++; dropped_b += sz; continue; }        /* served from the pack -> hole */
+        kept++; kept_b += sz;
+        for (size_t got = 0; got < sz && ok; ) {
+            const size_t want = (sz - got < buf.size()) ? (sz - got) : buf.size();
+            ssize_t r = pread(sfd, buf.data(), want, at + (off_t) got);
+            if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, at + (off_t) got) != r) ok = false; else got += (size_t) r;
+        }
+    }
+    close(sfd); close(dfd); gguf_free(gg);
+    if (!ok) { unlink(stub_path); fprintf(stderr, "[ORK STUB] write failed — stub removed\n"); return false; }
+
+    struct stat st; long long blocks_b = (stat(stub_path, &st) == 0) ? (long long) st.st_blocks * 512 : -1;
+    fprintf(stderr, "[ORK STUB] %s: kept %zu tensors (%.2f GiB), left %zu to the pack (%.2f GiB of holes)\n"
+                    "[ORK STUB]   apparent %.2f GiB, on disk %.2f GiB — run with THIS gguf + the .orkpack\n",
+            stub_path, kept, kept_b/1073741824.0, dropped, dropped_b/1073741824.0,
+            total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
+    return true;
+}
+
+/* A stub's holes read as ZEROS. That is correct only while every hole is covered by the pack, so check it
+ * once at load instead of discovering it as a mysteriously bad perplexity -- the exact failure this session
+ * produced four separate ways. A tensor whose data is entirely zero AND which the pack cannot serve is the
+ * signature of a stub run without (or with the wrong) pack; refuse rather than emit confident garbage.
+ * Only tensors ork would claim are checked: a genuinely zero norm/bias in a real model is not our business. */
+static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, const void * data, size_t nbytes) {
+    if (ctx->persist_mode != 1) return;                 /* only meaningful when a pack is being read */
+    if (ctx->persist_idx.count(name)) return;           /* the pack serves it -- hole is fine */
+    if (!data || nbytes < 4096) return;
+    const unsigned char * p = (const unsigned char *) data;   /* sample, don't scan gigabytes */
+    for (size_t i = 0; i < nbytes; i += 4096) if (p[i]) return;
+    fprintf(stderr,
+        "[ORK STUB] FATAL: %s reads as all zeros and the .orkpack does not contain it.\n"
+        "           This looks like a STUB gguf run without its pack (or with a pack built from a\n"
+        "           different model). A stub is not a model on its own -- its packed tensors are file\n"
+        "           holes. Point ORK_ORKPACK_PATH at the matching pack, or use the full gguf.\n", name);
+    abort();
+}
+
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
 static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
@@ -1810,6 +1917,13 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     fwrite(&f, sizeof f, 1, ctx->persist_out);
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
     rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
+    /* Companion stub GGUF, so the next run does not have to carry the source model as well as the pack.
+     * Written AFTER the rename so a stub never exists without the pack it depends on. ORK_NO_STUB=1 skips. */
+    if (!getenv("ORK_NO_STUB")) {
+        const std::string src = ork_find_model_path();
+        if (!src.empty()) ork_write_stub_gguf(src.c_str(), (ctx->persist_final + ".gguf").c_str(), ctx->persist_built);
+        else fprintf(stderr, "[ORK STUB] source model path unknown — no stub written\n");
+    }
     // Unconditional success line: report the full path (directory + filename) and weight count so the user sees
     // exactly where the pack landed. Split dir/file for clarity when the path is absolute.
     {
@@ -2898,6 +3012,53 @@ struct ork_gptq_cal {
 static std::unordered_map<const void *, ork_gptq_cal> g_gptq_cal;
 static bool ork_gptq_on(void)  { static const int e = getenv("ORK_GPTQ") != nullptr; return e; }
 
+/* ---- WINDOWED GPTQ CALIBRATION -------------------------------------------------------------------
+ * The Hessian is K*K doubles and it is NOT disk-backed: unlike a weight, an evicted H cannot be paged
+ * back, only rebuilt by replaying the whole calibration corpus. So it is a bounded REDUCTION, not a
+ * cache, and the window is sized to minimise the number of corpus passes rather than to maximise a hit
+ * rate. Registering every weight in one pass costs sum(K^2*8) resident, which at 27B (64 layers, 64
+ * ffn_down at K=17408 = 2.42 GiB each) is ~236 GiB — it simply does not fit.
+ *
+ * So calibrate a LAYER RANGE per pass: the caller sets a window, runs the corpus, finalizes, repeats.
+ * Peak residency becomes the window's Hessians instead of the model's.
+ *
+ * This also upgrades the ALGORITHM, which is the part worth keeping. Finalize writes the quantised
+ * weight back into the wcache, so once a window is finalized its weights STAY quantised for the
+ * remaining passes (they are pinned below). Window W+1's Hessian is therefore accumulated from
+ * activations that already passed through window W's quantised weights — i.e. sequential GPTQ, where
+ * each layer compensates for the upstream error, rather than the one-shot variant where every H comes
+ * from the unquantised model. Sequential is the original formulation and is strictly better.
+ *
+ * Layer index comes from the "blk.<i>." name prefix. A weight with no layer index (embeddings, output)
+ * is calibrated in the FIRST window so it is never silently skipped. */
+static int  g_gptq_win_lo = -1, g_gptq_win_hi = -1;    /* [lo,hi); -1/-1 = unwindowed (all layers) */
+static std::unordered_set<const void *> g_gptq_done;   /* finalized in an earlier window — do not redo */
+
+static int ork_blk_index(const char * name) {
+    const char * p = name ? strstr(name, "blk.") : nullptr;
+    return p ? atoi(p + 4) : -1;
+}
+/* THREE states, and conflating the first two is what made the first two attempts silently do one-shot work:
+ *   UNSET (lo < 0)  -- the DISCOVERY pass. Registers metadata and packs RTN, claims NOTHING. This is what
+ *                      keeps discovery free; claiming here allocated all 102 Hessians before window 1 ran,
+ *                      so window 1 swept the whole model and windows 2-3 found nothing left to do.
+ *   RANGE [lo,hi)   -- a real window. Only these layers allocate a Hessian this pass.
+ *   ALL             -- the single-pass case, expressed as the range [0, n_layer). No special case needed.
+ * The caller must therefore ALWAYS set a window before calibrating, even when there is only one. */
+static bool ork_gptq_in_window(const char * name) {
+    if (g_gptq_win_lo < 0) return false;                      /* discovery: claim nothing */
+    const int b = ork_blk_index(name);
+    if (b < 0) return g_gptq_win_lo == 0;                     /* non-layer weights ride the first window */
+    return b >= g_gptq_win_lo && b < g_gptq_win_hi;
+}
+/* Set the layer range calibrated by the NEXT pass. lo<0 restores unwindowed behaviour. */
+extern "C" void ggml_backend_ork_gptq_set_window(int lo, int hi) {
+    g_gptq_win_lo = lo; g_gptq_win_hi = hi;
+    fprintf(stderr, "[ORK GPTQ] calibration window = layers [%d,%d)\n", lo, hi);
+}
+/* Bytes of Hessian one weight of this K needs (K*K doubles). The caller uses it to size the window. */
+extern "C" double ggml_backend_ork_gptq_hessian_bytes(int K) { return (double) K * (double) K * 8.0; }
+
 /* accumulate H += (A*R)^T (A*R) for one batch of rotated activations.
  *
  * BLOCKED over rows, and that is the whole point. The obvious form — one rank-1 update per row — streams
@@ -3045,10 +3206,15 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         ork_persist_write_i4native(ctx, src0->name, K, N, ow);   /* writes DT_I8_ROT */
                         if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] %s -> DT_I8_ROT (rotated int8, GPTQ skipped)\n", src0->name);
                     } else if (ork_gptq_on()) {
+                        /* REGISTER METADATA ONLY -- no Hessian here. This branch runs once per weight (the
+                         * forward that first packs it), so it cannot be where a window claims its weights:
+                         * by window 2 every weight is already cached and never comes back through here.
+                         * Keeping it free also makes the DISCOVERY pass cheap, which matters -- allocating
+                         * every H up front is exactly the ~236 GiB that windowing exists to avoid at 27B.
+                         * The claim + H allocation live on the every-forward path below. */
                         ork_gptq_cal & c = g_gptq_cal[x];
-                        if (c.H.empty()) {
+                        if (!c.src) {
                             c.src = src0; c.K = K; c.N = N; c.b = b;
-                            c.H.assign((size_t)K*K, 0.0);
                             /* PIN until finalize. In CONVERT mode ork_wcache_evict's budget is deliberately
                              * ZERO (pack -> dump -> free each weight, so conversion fits any model size), so
                              * ANY call to it evicts every unpinned entry. A pure-int4 build never calls it and
@@ -3057,9 +3223,6 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                              * entries GPTQ still needs, and finalize reports "wcache entry vanished" for most
                              * of the model (measured: 78 of 96). GPTQ holds a reference across the whole
                              * calibration, so it must say so rather than rely on nobody triggering eviction. */
-                            ctx->wcache_pin.insert(x);
-                            fprintf(stderr, "[ORK GPTQ] calibrating %s K=%d N=%d (H = %.0f MiB)\n",
-                                    src0->name, K, N, (double)K*K*8/1048576.0);
                         }
                     } else {
                         ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
@@ -3070,7 +3233,23 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             const ork_weight & ow = it->second;
             if (ork_gptq_on()) {                                   /* PHASE 1: keep accumulating H every forward */
                 auto ci = g_gptq_cal.find(x);
-                if (ci != g_gptq_cal.end()) ork_gptq_accum(ci->second, M, y);
+                /* CLAIM for this window HERE, not in the wcache-miss branch above. Registration happens once
+                 * (the first forward, which packs the weight); every later window finds the weight already
+                 * cached and never re-enters that branch. Allocating H there meant only the FIRST window
+                 * ever got Hessians -- measured: window 1 finalized all 102 weights and windows 2-3 found
+                 * nothing, so the "windowed" pack was a one-shot pack with extra passes (16.9724 vs the
+                 * 15.9011 single-pass baseline). The window claim must live on the path every forward takes. */
+                if (ci != g_gptq_cal.end()) {
+                    ork_gptq_cal & c = ci->second;
+                    if (c.H.empty() && ork_gptq_in_window(src0->name) && !g_gptq_done.count(x)) {
+                        c.H.assign((size_t) c.K * c.K, 0.0);       /* the window's cost, paid only in its window */
+                        c.samples = 0;                             /* rows count for THIS window, not cumulative */
+                        ctx->wcache_pin.insert(x);
+                        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GPTQ] claim %s K=%d (H = %.0f MiB)\n",
+                                                          src0->name, c.K, (double) c.K*c.K*8/1048576.0);
+                    }
+                    if (!c.H.empty()) ork_gptq_accum(c, M, y);     /* out-of-window weights cost nothing */
+                }
             }
             double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
@@ -3203,14 +3382,28 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
  * preference, so the caller derives the batch count from this instead of being told a number. Returns 0
  * when nothing is registered (not a GPTQ run). */
 extern "C" int ggml_backend_ork_gptq_min_rows(void) {
+    int mx = 0;   /* largest K among the weights THIS window claimed -- feeding more rows than the window
+                   * needs just burns passes, and feeding fewer leaves H rank-deficient. */
+    for (const auto & kv : g_gptq_cal) if (!kv.second.H.empty() && kv.second.K > mx) mx = kv.second.K;
+    return mx;
+}
+/* Largest K over EVERY registered weight, claimed or not. Available after the discovery pass (which costs
+ * no Hessian memory) and used to size the window against a RAM budget. */
+extern "C" int ggml_backend_ork_gptq_max_k(void) {
     int mx = 0;
     for (const auto & kv : g_gptq_cal) if (kv.second.K > mx) mx = kv.second.K;
     return mx;
 }
 
-/* Rows accumulated so far (they are identical across weights — every weight sees every batch). */
+/* Rows accumulated so far BY THIS WINDOW's claimed weights. Reading an arbitrary map entry was safe when
+ * every entry was claimed and saw every batch; with windowing the map also holds unclaimed weights (samples
+ * 0, so the row loop would run the corpus dry every pass) and retired ones (samples from THEIR window, so
+ * the loop would exit immediately and later windows would calibrate on the claim decode alone). Both are
+ * silent -- the pack still builds. Report the max over currently-claimed weights only. */
 extern "C" long ggml_backend_ork_gptq_rows(void) {
-    return g_gptq_cal.empty() ? 0 : g_gptq_cal.begin()->second.samples;
+    long mx = 0;
+    for (const auto & kv : g_gptq_cal) if (!kv.second.H.empty() && kv.second.samples > mx) mx = kv.second.samples;
+    return mx;
 }
 
 extern "C" void ggml_backend_ork_gptq_finalize(void) {
@@ -3219,13 +3412,24 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
     if (!ctx) { fprintf(stderr, "[ORK GPTQ] finalize: no backend context\n"); return; }
     /* Release the calibration pins on the way out (see the insert in phase 1): finalize is the last reader,
      * and leaving them pinned would defeat convert mode's zero-residency policy for the rest of the run. */
-    struct GptqPinRelease { ggml_backend_ork_context * c; ~GptqPinRelease() {
-        for (const auto & kv : g_gptq_cal) c->wcache_pin.erase(kv.first); } } _gptq_pins{ ctx };
+    /* WINDOWED: keep the pin. Finalize replaces ow.w in the wcache with the GPTQ weight, so holding the
+     * entry is what makes the NEXT window calibrate against already-quantised upstream layers (sequential
+     * GPTQ). Dropping it would let convert-mode eviction reclaim the entry, the next pass would re-pack it
+     * RTN, and every window would calibrate against the unquantised model — the one-shot variant, silently.
+     * Cost is the finalized weights staying resident (11.6 GiB for 27B); ORK_GPTQ_SEQ=0 opts out.
+     * UNWINDOWED: release, as before — finalize is the last reader and convert mode wants zero residency. */
+    const bool gptq_seq = !(getenv("ORK_GPTQ_SEQ") && atoi(getenv("ORK_GPTQ_SEQ")) == 0);
+    struct GptqPinRelease { ggml_backend_ork_context * c; bool keep; ~GptqPinRelease() {
+        if (keep) return;             /* windowed: pins stay, and only the CLAIMED weights are marked done
+                                       * (below) -- marking everything here would retire weights that have
+                                       * not had their window yet, and they would never be calibrated. */
+        for (const auto & kv : g_gptq_cal) c->wcache_pin.erase(kv.first); } }
+        _gptq_pins{ ctx, gptq_seq };
 
     const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
     std::vector<const void *> keys;
     keys.reserve(g_gptq_cal.size());
-    for (auto & kv : g_gptq_cal) keys.push_back(kv.first);
+    for (auto & kv : g_gptq_cal) if (!kv.second.H.empty()) keys.push_back(kv.first);   /* this window's claims only */
     std::sort(keys.begin(), keys.end(), [](const void * a, const void * b){
         return g_gptq_cal[a].K > g_gptq_cal[b].K; });          // biggest H freed first
 
@@ -3363,7 +3567,9 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
                     src->name, K, N, c.samples, secs[u], done, keys.size(), (ork_now_us()-all0)/6e7);
         }
     }
-    g_gptq_cal.clear();
+    /* WINDOWED: keep the metadata (later windows need K/N/src to claim their own weights) and free only
+     * this window's Hessians -- that release is the entire point of windowing. UNWINDOWED: clear, as before. */
+    for (const void * k : keys) { g_gptq_done.insert(k); std::vector<double>().swap(g_gptq_cal[k].H); }
     fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min\n",
             done, failed, (ork_now_us()-all0)/6e7);
 }
@@ -8327,6 +8533,7 @@ static ggml_backend_t ggml_backend_ork_device_init_backend(ggml_backend_dev_t de
 static void * ggml_backend_ork_buffer_get_base(ggml_backend_buffer_t buffer) { return buffer->context; }
 static void   ggml_backend_ork_buffer_free_buffer(ggml_backend_buffer_t buffer) { free(buffer->context); }
 static void   ggml_backend_ork_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (g_ork_ctx && offset == 0) ork_stub_verify(g_ork_ctx, tensor->name, data, size);   /* stub without its pack? */
     memcpy((char *) tensor->data + offset, data, size); GGML_UNUSED(buffer);
 }
 static void   ggml_backend_ork_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
