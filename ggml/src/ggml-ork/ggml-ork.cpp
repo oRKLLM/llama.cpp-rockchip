@@ -688,6 +688,12 @@ struct ggml_backend_ork_context {
     // (Q/K/V off the normed hidden state; FFN gate/up off the same x) — skips redundant per-matmul
     // activation int8-quant. Holds for the data in ctx->ai/as while last_* matches.
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
+    /* ACTIVATION WIDTH is part of the reuse key. The hadamard path quantises activations to the tier's
+     * width (4 for W4A4, 8 for the rotated int8 / rotated-i4a8 tiers), and a MIXED pack has both sharing
+     * one activation row at the same (y, M, K). Without this, whichever weight ran first won: int4
+     * activations (+/-7) handed to an int8 weight lose precision, and int8 activations (+/-127) handed to
+     * the int4 MAC are flatly out of range. Measured: +33% PPL on a k=28 rotated-int8 pack. */
+    int last_abits = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
@@ -1573,9 +1579,15 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
     int _dom = ork_weight_domain(ctx, wbytes, ork_layer_of(name));
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (rot_a8) {                                   /* int4 bytes -> int8 containers */
-        ow.w = ork_i4a8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+        /* _tiled, not ork_i4a8_mm_load. The blob here was written by ork_w_dump in the i4-NATIVE TILED
+         * layout (page-padded Kp*Nc/2 tiles, no header, no scales); ork_i4a8_mm_load wants the COMPACT
+         * container (hdr + bscale[N] + Bi4[K*N/2]) and gates on an exact size match, so it returned NULL
+         * for EVERY DT_I4_ROT_A8 weight ever written. The miss then fell back to inline packing, which is
+         * a legitimate event for a cold weight and therefore silent -- at 0.8B that produced a plausible
+         * wrong number, at 27B it inline-packed 80 weights at ~27-89 MB each and exhausted IOVA. */
+        ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size);
         while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
-            ow.w = ork_i4a8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+            ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size);
     } else if (ow.wbits == 8) {
         ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
         while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
@@ -3253,7 +3265,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             }
             double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
-            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 &&
+                          ctx->last_abits == ow.abits && !ctx->no_reuse);
             if (!reuse) {
                 // activations: rotate each row (A·R), per-row int4 quant with shape padding
                 #pragma omp parallel for if (M_padded >= 16)
@@ -3294,6 +3307,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->last_M = M;
                 ctx->last_K = K;
                 ctx->last_type = 3;
+                ctx->last_abits = ow.abits;
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
@@ -8046,7 +8060,18 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             }
                             if (pit != ctx->persist_idx.end()) {
                                 const uint32_t dt = pit->second.dtype;
-                                const bool want_i4n = (dt == ORKPACK_DT_I4_NATIVE);
+                                /* ROTATED tiers belong on the hadamard path, not mul_mat_i8. DT_I8_ROT and
+                                 * DT_I4_ROT_A8 store a Hadamard-ROTATED weight, and a rotated weight is only
+                                 * correct against rotated ACTIVATIONS -- which only mul_mat_i4_hadamard
+                                 * applies. mul_mat_i8 re-quantises from the SOURCE tensor instead, so it
+                                 * silently ignored the pack's rotated bytes entirely; with a stub gguf that
+                                 * source is a file hole, which is how the 27B rot-i4a8 arm scored 136986.
+                                 * The hadamard path already handles the widened tiers (it dispatches
+                                 * ork_i8_mm_run when ow.wbits == 8), so this is the routing it always
+                                 * needed. */
+                                const bool want_i4n = (dt == ORKPACK_DT_I4_NATIVE ||
+                                                       dt == ORKPACK_DT_I8_ROT   ||
+                                                       dt == ORKPACK_DT_I4_ROT_A8);
                                 static int n_route[3] = {0,0,0}, n_override = 0;
                                 n_route[dt == ORKPACK_DT_I4_NATIVE ? 0 : dt == ORKPACK_DT_I4 ? 1 : 2]++;
                                 if (want_i4n != native_w4a4) n_override++;
