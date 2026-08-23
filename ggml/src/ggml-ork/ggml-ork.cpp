@@ -2354,6 +2354,65 @@ static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
     }
 }
 
+/* ---- TWO-PHASE GPTQ CALIBRATION ----------------------------------------------------------------
+ * GPTQ wants H accumulated over MANY calibration batches; ork-driver quantizes a weight on FIRST USE,
+ * when exactly one batch has been seen. rank(H) <= samples, so single-shot calibration leaves H rank-4
+ * (the convert pass's M) against a K of 1024..3584 and GPTQ collapses to round-to-nearest. Hence two
+ * phases:
+ *   PHASE 1 (calibrate) — every native-W4A4 weight-miss registers here and keeps accumulating
+ *     H += (A*R)^T (A*R) on EVERY subsequent forward. The forward still needs a weight, so it uses the
+ *     RTN codes as usual, and persist is SKIPPED so no RTN codes reach the .orkpack.
+ *   PHASE 2 (finalize) — ggml_backend_ork_gptq_finalize() re-reads each source tensor, re-rotates it,
+ *     runs ork_i4_gptq against the accumulated H, re-packs, and persists THAT.
+ * The rotated weight is re-derived at finalize rather than stored: it is O(N*K) to recompute and
+ * O(N*K) floats to keep, and the recompute is noise next to GPTQ's three O(K^3) factorisations.
+ * H is the memory driver: K*K doubles per weight (103 MB at K=3584), freed as each weight finalizes. */
+struct ork_gptq_cal {
+    const ggml_tensor * src = nullptr;    // re-read + re-rotate at finalize
+    int K = 0, N = 0, b = 0;              // b = Hadamard block (largest pow2 dividing K)
+    long samples = 0;                     // rows accumulated; rank(H) <= samples
+    std::vector<double> H;                // K*K
+};
+static std::unordered_map<const void *, ork_gptq_cal> g_gptq_cal;
+static bool ork_gptq_on(void)  { static const int e = getenv("ORK_GPTQ") != nullptr; return e; }
+
+/* accumulate H += (A*R)^T (A*R) for one batch of rotated activations.
+ *
+ * BLOCKED over rows, and that is the whole point. The obvious form — one rank-1 update per row — streams
+ * the ENTIRE H in and out once per row: at K=3584 that is 98 MiB x 512 rows = 50 GiB of traffic per weight
+ * per batch, and it made phase 1 memory-bound at ~4 min/batch. Accumulating B rows at a time turns it into
+ * a rank-B update (a small GEMM), touching H once per BLOCK instead of once per row — B-fold less traffic.
+ *
+ * The block is held TRANSPOSED (AbT[i][r], row i's B samples contiguous) so the inner dot product over r is
+ * unit-stride on both operands; the natural [r][i] layout would make it stride-K, which is the same cache
+ * mistake one level down. AbT is B*K floats — 917 KiB at K=3584, B=64 — so it stays in L2. */
+static void ork_gptq_accum(ork_gptq_cal & c, int M, const float * y) {
+    const int K = c.K;
+    const int B = 64;
+    std::vector<float> AbT((size_t)K*B);
+    std::vector<float> a((size_t)K);
+    for (int m0 = 0; m0 < M; m0 += B) {
+        const int nb = (M - m0 < B) ? (M - m0) : B;
+        for (int r = 0; r < nb; r++) {                            /* rotate the block, store transposed */
+            memcpy(a.data(), y + (size_t)(m0+r)*K, (size_t)K*sizeof(float));
+            for (int off = 0; off < K; off += c.b) ork_fwht_norm(a.data() + off, c.b);
+            for (int i = 0; i < K; i++) AbT[(size_t)i*B + r] = a[i];
+        }
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < K; i++) {                             /* H[i][j] += <AbT[i], AbT[j]> over the block */
+            const float * ri = AbT.data() + (size_t)i*B;
+            double * hr = c.H.data() + (size_t)i*K;
+            for (int j = 0; j <= i; j++) {                        /* symmetric: fill lower, mirror after */
+                const float * rj = AbT.data() + (size_t)j*B;
+                double acc = 0.0;
+                for (int r = 0; r < nb; r++) acc += (double)ri[r] * (double)rj[r];
+                hr[j] += acc;
+            }
+        }
+    }
+    c.samples += M;   /* only the LOWER triangle is accumulated; finalize mirrors it once (see below) */
+}
+
 // int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (implied by the int4 tier). Weights are
 // rotated (R·B) and per-channel int4-quantized once at load (cached); activations are rotated (A·R)
 // and per-row int4-quantized each matmul; the rotation cancels in fp32 (A·B = (A·R)·(R·B)) but lets
@@ -2420,41 +2479,30 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                             bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
                         }
                     }
-                    /* ORK_GPTQ: swap the round-to-nearest codes just computed for error-compensated GPTQ
-                     * ones. The loop above already left f32 as the rotated weight in [N x K] — exactly what
-                     * ork_i4_gptq wants — and group=-1 yields per-row scales, i.e. the SAME per-channel layout
-                     * this pack format already uses. So it is a drop-in code/scale swap, not a format change,
-                     * and a failure falls back to the RTN codes already in bi. Off by default: three O(K^3)
-                     * factorisations per weight. */
-                    if (getenv("ORK_GPTQ")) {
-                        const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
-                        std::vector<float>  Hc((size_t)K*K);
-                        std::vector<int8_t> codes((size_t)N*K);
-                        std::vector<float>  sc((size_t)N);
-                        if (M < K) fprintf(stderr,
-                            "[ORK GPTQ] %s: calibration batch M=%d < K=%d — H is rank-deficient; GPTQ tends to "
-                            "RTN in the null space. Use a longer calibration prompt.\n", src0->name, M, K);
-                        double g0 = ork_now_us();
-                        ork_gptq_hessian(M, K, b, y, Hc.data());
-                        int grc = ork_i4_gptq(K, N, f32, Hc.data(), -1, codes.data(), sc.data(), damp);
-                        if (grc) {
-                            fprintf(stderr, "[ORK GPTQ] %s: ork_i4_gptq rc=%d — keeping RTN codes\n", src0->name, grc);
-                        } else {
-                            for (int n = 0; n < N; n++) {
-                                ow.bscale[n] = sc[n];
-                                for (int k = 0; k < K; k++) bi[(size_t)k*N + n] = codes[(size_t)n*K + k];
-                            }
-                            fprintf(stderr, "[ORK GPTQ] %s K=%d N=%d M=%d damp=%.3g -> GPTQ codes (%.1f s)\n",
-                                    src0->name, K, N, M, damp, (ork_now_us()-g0)/1e6);
-                        }
-                    }
+                    /* ORK_GPTQ PHASE 1: register this weight for calibration and DO NOT persist — the
+                     * RTN codes below are only so the calibration forwards have something to compute with.
+                     * ggml_backend_ork_gptq_finalize() re-quantizes with the accumulated H and persists that. */
                     ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi);
                     if (!ow.w) return false;
-                    ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
+                    if (ork_gptq_on()) {
+                        ork_gptq_cal & c = g_gptq_cal[x];
+                        if (c.H.empty()) {
+                            c.src = src0; c.K = K; c.N = N; c.b = b;
+                            c.H.assign((size_t)K*K, 0.0);
+                            fprintf(stderr, "[ORK GPTQ] calibrating %s K=%d N=%d (H = %.0f MiB)\n",
+                                    src0->name, K, N, (double)K*K*8/1048576.0);
+                        }
+                    } else {
+                        ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
+                    }
                 }
                 it = ctx->wcache.emplace(x, std::move(ow)).first;
             }
             const ork_weight & ow = it->second;
+            if (ork_gptq_on()) {                                   /* PHASE 1: keep accumulating H every forward */
+                auto ci = g_gptq_cal.find(x);
+                if (ci != g_gptq_cal.end()) ork_gptq_accum(ci->second, M, y);
+            }
             double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
@@ -2512,6 +2560,124 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
         }
     }
     return true;
+}
+
+/* ORK_GPTQ PHASE 2. Called once after the calibration forwards (ork_bench does it). For every weight
+ * registered in phase 1: re-read + re-rotate the source tensor, run GPTQ against the H accumulated over
+ * ALL calibration batches, re-pack, swap the wcache entry, persist THAT, and free H.
+ *
+ * Re-deriving the rotated weight here (rather than stashing it in phase 1) trades O(N*K) recompute for
+ * O(N*K) floats per weight held across the whole calibration — the recompute is noise beside GPTQ's three
+ * O(K^3) factorisations, and it keeps peak memory to the H accumulators alone.
+ *
+ * Weights are finalized largest-K first so the biggest H is freed earliest, and the running log makes the
+ * K^3 cost visible while it happens rather than after. */
+/* How many calibration ROWS this model actually needs: the largest K among the registered weights.
+ * GPTQ's error feedback is weighted by H^-1, and rank(H) <= rows — so below K rows the damping term owns
+ * the null space, H^-1 ~ I/lambda there, the propagation row goes to zero and GPTQ SILENTLY degenerates to
+ * round-to-nearest in exactly those directions. That threshold is a property of the weight shapes, not a
+ * preference, so the caller derives the batch count from this instead of being told a number. Returns 0
+ * when nothing is registered (not a GPTQ run). */
+extern "C" int ggml_backend_ork_gptq_min_rows(void) {
+    int mx = 0;
+    for (const auto & kv : g_gptq_cal) if (kv.second.K > mx) mx = kv.second.K;
+    return mx;
+}
+
+/* Rows accumulated so far (they are identical across weights — every weight sees every batch). */
+extern "C" long ggml_backend_ork_gptq_rows(void) {
+    return g_gptq_cal.empty() ? 0 : g_gptq_cal.begin()->second.samples;
+}
+
+extern "C" void ggml_backend_ork_gptq_finalize(void) {
+    if (!ork_gptq_on() || g_gptq_cal.empty()) return;
+    ggml_backend_ork_context * ctx = g_ork_ctx;
+    if (!ctx) { fprintf(stderr, "[ORK GPTQ] finalize: no backend context\n"); return; }
+
+    const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
+    std::vector<const void *> keys;
+    keys.reserve(g_gptq_cal.size());
+    for (auto & kv : g_gptq_cal) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end(), [](const void * a, const void * b){
+        return g_gptq_cal[a].K > g_gptq_cal[b].K; });          // biggest H freed first
+
+    fprintf(stderr, "[ORK GPTQ] finalize: %zu weights, damp=%.3g\n", keys.size(), damp);
+    double all0 = ork_now_us(); size_t done = 0, failed = 0;
+
+    /* CHUNKED, parallel over WEIGHTS. ork_i4_gptq is internally OpenMP but its inner loops are short at
+     * small K, so the cores idle; weights are completely independent, so the outer loop is where the
+     * parallelism actually is. OpenMP nesting is off by default, which is exactly right here — each weight
+     * gets one thread and the inner regions run serially.
+     * Two-stage per chunk because ork_i4_mm_pack touches the NPU and is NOT thread-safe: compute all the
+     * codes in parallel, then pack + persist SERIALLY. Chunked rather than one big pass so peak memory stays
+     * bounded (holding every weight's codes at once would be the whole model in int8). */
+    const int CH = 4;
+    for (size_t base = 0; base < keys.size(); base += CH) {
+        const size_t n_ch = (keys.size() - base < (size_t)CH) ? keys.size() - base : (size_t)CH;
+        std::vector<std::vector<int8_t>> codes(n_ch);
+        std::vector<std::vector<float>>  scal(n_ch);
+        std::vector<int>                 rcs(n_ch, -1);
+        std::vector<double>              secs(n_ch, 0.0);
+
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(CH)
+        for (int u = 0; u < (int)n_ch; u++) {
+            ork_gptq_cal & c = g_gptq_cal[keys[base + u]];
+            const ggml_tensor * src = c.src;
+            const int K = c.K, N = c.N, b = c.b;
+            double t0 = ork_now_us();
+
+            std::vector<float> W((size_t)N*K);                    /* re-read + re-rotate, as phase 1 did */
+            const auto * tt = ggml_get_type_traits(src->type);
+            ggml_to_float_t const to_float = tt->to_float;
+            const char * x = (const char *) src->data;
+            for (int n = 0; n < N; n++) {
+                float * col = W.data() + (size_t)n*K;
+                if (src->type == GGML_TYPE_F32) memcpy(col, x + (size_t)n*src->nb[1], (size_t)K*sizeof(float));
+                else                            to_float(x + (size_t)n*src->nb[1], col, K);
+                for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);
+            }
+            /* accum filled only the LOWER triangle (halving its inner loop); mirror once, here. */
+            std::vector<float> Hf((size_t)K*K);
+            for (int i = 0; i < K; i++) {
+                const double * lo = c.H.data() + (size_t)i*K;
+                for (int j = 0; j <= i; j++) { const float v = (float) lo[j];
+                    Hf[(size_t)i*K + j] = v; Hf[(size_t)j*K + i] = v; }
+            }
+            std::vector<double>().swap(c.H);                      /* free the accumulator as soon as it is copied */
+            codes[u].resize((size_t)N*K); scal[u].resize((size_t)N);
+            rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), -1, codes[u].data(), scal[u].data(), damp);
+            secs[u] = (ork_now_us() - t0) / 1e6;
+        }
+
+        for (size_t u = 0; u < n_ch; u++) {                       /* SERIAL: the NPU pack is not thread-safe */
+            ork_gptq_cal & c = g_gptq_cal[keys[base + u]];
+            const ggml_tensor * src = c.src;
+            const int K = c.K, N = c.N;
+            if (c.samples < K)
+                fprintf(stderr, "[ORK GPTQ] %s: %ld calibration rows < K=%d — H rank-deficient; GPTQ tends to "
+                                "RTN in the null space\n", src->name, c.samples, K);
+            if (rcs[u]) { fprintf(stderr, "[ORK GPTQ] %s: ork_i4_gptq rc=%d — leaving RTN codes\n", src->name, rcs[u]);
+                          failed++; continue; }
+            auto it = ctx->wcache.find(keys[base + u]);
+            if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
+            ork_weight & ow = it->second;
+            std::vector<int8_t> bi((size_t)K*N);
+            for (int n = 0; n < N; n++) {
+                ow.bscale[n] = scal[u][n];
+                for (int k = 0; k < K; k++) bi[(size_t)k*N + n] = codes[u][(size_t)n*K + k];
+            }
+            if (ow.w) { ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; }
+            ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi.data());
+            if (!ow.w) { fprintf(stderr, "[ORK GPTQ] %s: repack FAILED\n", src->name); failed++; continue; }
+            ork_persist_write_i4native(ctx, src->name, K, N, ow);
+            done++;
+            fprintf(stderr, "[ORK GPTQ] %s K=%d N=%d rows=%ld -> GPTQ (%.1f s)  [%zu/%zu, %.1f min]\n",
+                    src->name, K, N, c.samples, secs[u], done, keys.size(), (ork_now_us()-all0)/6e7);
+        }
+    }
+    g_gptq_cal.clear();
+    fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min\n",
+            done, failed, (ork_now_us()-all0)/6e7);
 }
 
 // Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V

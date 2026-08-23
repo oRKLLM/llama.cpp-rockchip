@@ -38,6 +38,15 @@ GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflas
 // A tool/frontend uses this to decide whether to run a one-time build pass (which packs + writes the .orkpack)
 // BEFORE timing, so the measured run always reads a prebuilt pack instead of JIT-packing into the hot path.
 GGML_BACKEND_API bool                ggml_backend_ork_orkpack_valid(const char * path);
+/* ORK_GPTQ phase 2: quantize every calibrated native-W4A4 weight with the Hessian accumulated over the
+ * calibration forwards, then persist. Call ONCE after the calibration batches; a no-op unless ORK_GPTQ
+ * is set. Heavy — three O(K^3) factorisations per weight. */
+GGML_BACKEND_API void                ggml_backend_ork_gptq_finalize(void);
+/* Calibration rows this model NEEDS (= largest registered K) and how many it has. rank(H) <= rows, and
+ * below K rows GPTQ silently degrades to round-to-nearest in the null space — so the batch count is derived
+ * from these, not configured. Both 0 outside a GPTQ run. */
+GGML_BACKEND_API int                 ggml_backend_ork_gptq_min_rows(void);
+GGML_BACKEND_API long                ggml_backend_ork_gptq_rows(void);
 
 // ---- Async cross-stream submit path ----
 // Run this backend's NPU graph on a worker thread: the launch returns immediately so the caller can do CPU
