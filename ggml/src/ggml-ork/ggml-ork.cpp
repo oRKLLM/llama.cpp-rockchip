@@ -205,14 +205,23 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 5u   // v5 adds quant_sig (build-config precision signature) to the footer; v4 adds bf_size
+#define ORKPACK_VERSION 6u   // v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
+                             // quant_sig (build-config precision signature) to the footer; v4 adds bf_size
                              // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
-struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; };
+/* qerr = the MEASURED relative output error this weight suffers at the tier it was stored at (the
+ * ORK_W4A4_DIAG metric: exact product vs quantised product over a fixed subsample, ||dC|| / ||C||).
+ *
+ * WHY IT BELONGS IN THE FILE. The pack decides each weight's ROUTE; without this it does not record WHY,
+ * so the decision cannot be audited, reproduced, or re-optimised without re-running the model. It was
+ * previously computed at build time, printed to stderr, ranked BY HAND, and re-applied as an env list —
+ * which is not a mechanism, it is a person with sed. With qerr stored, re-tiering under a memory budget is
+ * a pure function of the pack: rank by qerr, promote until the byte budget is spent. 0 = not measured. */
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; float qerr; uint32_t _pad; };
 // The footer is the pack's self-describing header metadata (EXIF-style): validation keys on it, NOT the filename.
 //   ork_fmt   = ork_pack_format_version() at write — a tile-layout/quant MAJOR change bumps it => tiled bytes incompatible.
 //   quant_sig = ork_build_sig() at write — the build-config PRECISION signature (forced ORK_QUANT + hybrid + hadamard).
@@ -360,6 +369,7 @@ static size_t ork_stream_ram_budget() {
 //   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
 struct ork_weight {
     ork_w * w = nullptr;
+    float   qerr = 0.0f;     // measured diag(H)-weighted relative error at the stored tier; persisted
     ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
     int gsize = 0;
@@ -968,6 +978,26 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
+                    /* ORK_PACK_RANK: print the pack's own quality evidence, worst first, with the bytes a
+                     * promotion to int8 would cost (int8 = 2x int4, so +K*N/2). This is the input a
+                     * re-tiering policy needs, and it comes from the FILE — no model run, no diagnostic
+                     * pass, no hand-ranking with sed, which is how the previous "worst layers" list was
+                     * produced and why it could not be reproduced. */
+                    if (getenv("ORK_PACK_RANK")) {
+                        std::vector<std::pair<float,std::string>> rank;
+                        for (const auto & kv : ctx->persist_idx)
+                            if (kv.second.qerr > 0.0f) rank.emplace_back(kv.second.qerr, kv.first);
+                        std::sort(rank.rbegin(), rank.rend());
+                        if (rank.empty()) fprintf(stderr, "[ORK PACK-RANK] no qerr in this pack (built before v6) — rebuild to record it\n");
+                        double cum = 0;
+                        for (size_t i = 0; i < rank.size() && i < 20; i++) {
+                            const orkpack_entry & e2 = ctx->persist_idx[rank[i].second];
+                            const double mb = (double) e2.K * e2.N / 2.0 / 1048576.0;   /* int4 -> int8 delta */
+                            cum += mb;
+                            fprintf(stderr, "[ORK PACK-RANK] %2zu  qerr=%.4f  %-34s K=%-5u N=%-5u  +%.2f MiB (cum %.2f)\n",
+                                    i+1, rank[i].first, rank[i].second.c_str(), e2.K, e2.N, mb, cum);
+                        }
+                    }
                     // Not VERBOSE-gated: a pack silently switching the run's weight tier is the one adoption
                     // a reader must not have to guess at. (Tier only — the 4-bit COMPUTE path stays opt-in.)
                     if (ctx->persist_qbits == 4)
@@ -1318,6 +1348,7 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
     orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    e.qerr = ow.qerr;   /* the evidence for this weight's tier, so re-tiering needs no model run */
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
     e.bscale_off = ctx->persist_off;
@@ -2849,6 +2880,7 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
         std::vector<std::vector<int8_t>> codes(n_ch);
         std::vector<std::vector<float>>  scal(n_ch);
         std::vector<int>                 rcs(n_ch, -1);
+        std::vector<float>               qerr(n_ch, 0.0f);   /* measured below, persisted in the pack entry */
         std::vector<double>              secs(n_ch, 0.0);
 
         #pragma omp parallel for schedule(dynamic, 1) num_threads(CH)
@@ -2884,6 +2916,26 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             if (GRP > 0) scal[u].resize((size_t) N * NGP);
             rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), GRP > 0 ? GRP : -1,
                                   codes[u].data(), scal[u].data(), damp);
+            /* MEASURE what this weight actually lost, and store it in the pack (entry.qerr).
+             *
+             * diag(H) weights each input channel by the activation energy that flows through it, which is
+             * why this predicts OUTPUT error far better than ||W-Q||: a large weight error on a channel the
+             * activations never excite costs nothing. The full H-weighted form is the exact GPTQ objective
+             * but O(N*K^2) — as expensive as the sweep itself — whereas the diagonal is O(N*K) and free
+             * beside work already done. Relative, so it is comparable ACROSS weights of different shapes,
+             * which is the entire point: ranking them is what re-tiering needs. */
+            if (rcs[u] == 0) {
+                const int NGe = (GRP > 0) ? (K + GRP - 1) / GRP : 1;
+                double num = 0.0, den = 0.0;
+                for (int n = 0; n < N; n++) for (int k = 0; k < K; k++) {
+                    const double hd = (double) Hf[(size_t) k*K + k];
+                    const double w  = (double) W[(size_t) n*K + k];
+                    const double sc = (double) scal[u][GRP > 0 ? (size_t) n*NGe + k/GRP : (size_t) n];
+                    const double d  = w - (double) codes[u][(size_t) n*K + k] * sc;
+                    num += hd * d * d; den += hd * w * w;
+                }
+                qerr[u] = (den > 0.0) ? (float) sqrt(num / den) : 0.0f;
+            }
             secs[u] = (ork_now_us() - t0) / 1e6;
         }
 
@@ -2900,6 +2952,7 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
             ork_weight & ow = it->second;
             std::vector<int8_t> bi((size_t)K*N);
+            ow.qerr = qerr[u];
             const int GQ = ow.gsize, NGq = GQ > 0 ? K / GQ : 1;
             if (GQ > 0) ow.bscale.resize((size_t) NGq * N);
             for (int n = 0; n < N; n++) {
@@ -7341,6 +7394,50 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         // (int4 weights inflated int4->int8 on the NPU — robust, no wedge); compact i4a8 STORAGE is
                         // chosen separately at persist (ork_orkpack_tier).
                         bool native_w4a4 = (target_qbits == 4) && ctx->hadamard;
+
+                        /* THE PACK DECIDES THE ROUTE, per weight.
+                         *
+                         * ORK_QUANT / ORK_MIXED_W4A4 describe what to BUILD. They must not decide how to RUN
+                         * a weight that already exists on disk at a definite precision — when the two
+                         * disagree the weight is served as one tier and computed as another, which is how a
+                         * strictly-higher-precision config scored WORSE than the tier it was meant to beat.
+                         *
+                         * The format already carries the route per entry, so use it:
+                         *   DT_I4_NATIVE -> W4A4  (rotated int4 weights + int4 activations; the rotation is
+                         *                          intrinsic to the stored bytes, not to an env flag)
+                         *   DT_I4        -> i4a8  (int4 storage inflated to int8; int8 activations, so the
+                         *                          ACTIVATION half of the error is gone at no disk cost)
+                         *   DT_I8        -> W8A8  (int8 weights + int8 activations)
+                         * This is what makes a MIXED-tier pack work: per-layer precision becomes a build
+                         * decision recorded in the file, and scoring needs no env at all. A homogeneous pack
+                         * is unaffected — every entry maps to the route it already took. */
+                        if (ctx->persist_mode == 1) {
+                            auto pit = ctx->persist_idx.find(name);
+                            /* A MISS is the dangerous case: routing silently does nothing and the env decides
+                             * after all, which looks identical to "routing agreed" on a homogeneous pack.
+                             * Say so once, or this cannot be distinguished from working. */
+                            if (pit == ctx->persist_idx.end()) {
+                                static int warned_miss = 0;
+                                if (!warned_miss++) fprintf(stderr,
+                                    "[ORK ROUTE] WARNING: '%s' not in the pack index — falling back to the env "
+                                    "tier. Pack-driven routing is NOT in effect for it.\n", name);
+                            }
+                            if (pit != ctx->persist_idx.end()) {
+                                const uint32_t dt = pit->second.dtype;
+                                const bool want_i4n = (dt == ORKPACK_DT_I4_NATIVE);
+                                static int n_route[3] = {0,0,0}, n_override = 0;
+                                n_route[dt == ORKPACK_DT_I4_NATIVE ? 0 : dt == ORKPACK_DT_I4 ? 1 : 2]++;
+                                if (want_i4n != native_w4a4) n_override++;
+                                native_w4a4 = want_i4n;
+                                static int said = 0;
+                                if (!said++ && (getenv("ORK_ROUTE_STATS") || getenv("ORK_VERBOSE")))
+                                    fprintf(stderr, "[ORK ROUTE] pack-driven routing ACTIVE (first: %s -> %s)\n",
+                                            name, want_i4n ? "W4A4" : dt == ORKPACK_DT_I4 ? "i4a8" : "W8A8");
+                                if (getenv("ORK_ROUTE_STATS") && ((n_route[0]+n_route[1]+n_route[2]) % 100) == 0)
+                                    fprintf(stderr, "[ORK ROUTE] pack-driven: W4A4=%d i4a8=%d W8A8=%d (env overridden %d)\n",
+                                            n_route[0], n_route[1], n_route[2], n_override);
+                            }
+                        }
                         bool mm_ok = native_w4a4 ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
                                                  : ggml_backend_ork_mul_mat_i8(ctx, node);
                         if (!mm_ok) return GGML_STATUS_FAILED;
