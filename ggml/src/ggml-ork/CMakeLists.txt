@@ -57,9 +57,16 @@ set_source_files_properties(
 # Activation int8-quant in ggml-ork.cpp is parallelized with #pragma omp parallel for (per-row,
 # independent). The pragmas are no-ops unless OpenMP is linked into THIS target (ggml-base linking it
 # does not propagate here). Link it so prefill activation-quant runs multi-threaded.
+# NOTE both languages. OpenMP::OpenMP_CXX carries -fopenmp guarded by $<COMPILE_LANGUAGE:CXX>, so linking
+# only it leaves ork-driver's C sources (npu/, ork_gptq.c, the offline CPU GEMM) compiling WITHOUT the flag
+# — every #pragma omp in them is then a silent no-op. That was measured: an offline scoring run pinned at
+# 145% CPU on a 16-core host because orki_cpu_gemm_i32's per-row parallel for never took effect.
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if (OpenMP_C_FOUND)
+    target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_C)
 endif()
 
 # ork_bench / ork_ppl — open-stack perf + quality harnesses that drive the llama.cpp C API against the

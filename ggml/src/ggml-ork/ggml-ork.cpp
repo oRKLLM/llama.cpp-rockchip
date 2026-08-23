@@ -167,6 +167,9 @@ extern "C" {
 #include <fcntl.h>
 #include <unistd.h>
 #include <strings.h>   // strcasecmp (env_enabled)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // Truthy-VALUE env gate (not mere presence). Returns true only when the named var is set to one of
 // 1/true/yes/on (case-insensitive); UNSET or 0/false/off/empty -> false. Use this for any flag whose
@@ -266,6 +269,30 @@ static int ork_sig_qbits(uint32_t sig) {
 // neither enforce nor check. ggml-ork applies R to the weight column at pack AND to the activation row at
 // run (both at the same block size), so ggml-ork is the only layer that can hold the invariant.
 static bool ork_w4a4_native_on(void) { return env_enabled("ORK_MIXED_W4A4"); }
+
+/* OFFLINE PACK MODE — build an .orkpack on a machine that has no NPU.
+ *
+ * Packing is the slow half of every quantization experiment (measured: 12.9 of ~13.5 min is GPTQ finalize,
+ * pure double-precision CPU math) and the board is both the weakest machine available and a single shared,
+ * wedge-prone resource. Nothing about the work needs hardware: the tiling has a CPU twin asserted
+ * byte-identical to the NPU's own (ork_i4_w_dump_cpu / test_i4_dump_cpu), and the int4 MAC is INTEGER, so
+ * a CPU GEMM reproduces the NPU's int32 accumulator exactly rather than approximately.
+ *
+ * ORK_OFFLINE=<soc-id> (e.g. "rk3588") selects it. The SoC must be named because there is no device tree
+ * to detect from, and a wrong nmax would tile a subtly wrong pack. Compute falls back to an exact CPU int4
+ * GEMM so calibration forwards still produce real activations for the Hessian. */
+static const char * ork_offline_soc(void) { static const char * s = getenv("ORK_OFFLINE"); return (s && *s) ? s : nullptr; }
+static bool ork_offline(void) { return ork_offline_soc() != nullptr; }
+
+/* PER-GROUP int4 weight scales (ORK_I4_GROUP=<G>, 0/unset = per-channel, the shipped default).
+ *
+ * One scale per (channel, K-group of G) instead of one per channel. It cannot factor out of the
+ * K-accumulation, so it needs K/G narrow matmuls plus a weighted reduction — which sounded fatal until
+ * measured: on the NONBLOCK doorbell with chaining that is 1.18x the per-channel cost at M=1, because the
+ * reduction is only ~5% and chaining removes ~96% of the dispatch. ork_i4_mm_pack_grouped /
+ * ork_i4_mm_run_grouped already implement the datapath; this wires the ROTATED (Hadamard) weights to it.
+ * NOTE the two APIs disagree on scale layout: ork_i4_gptq emits [n*ng+g], run_grouped wants [g*N+n]. */
+static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? atoi(getenv("ORK_I4_GROUP")) : 0; return g; }
 
 // Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —
 // unless ORK_QUANT explicitly forces a tier, in which case a conflicting pack is stale and gets rebuilt.
@@ -1287,7 +1314,7 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
 static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
     if (ctx->persist_mode != 2 || !ctx->persist_out || !ow.w) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped (convert-decode re-pack)
-    size_t tb = ork_w_dump(ow.w, nullptr, 0);
+    size_t tb = ork_w_dump(ow.w, nullptr, 0);   // offline: ork_w_dump CPU-tiles, same bytes
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
     orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
@@ -1321,12 +1348,17 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
         if (!ow.w) ow.w = ork_i4_mm_load(ctx->npu, K, N, blob, e.blob_size);
     }
     if (!ow.w) return false;
-    ow.gsize = 0; ow.bscale.resize(e.bscale_n);
+    /* gsize is not a field in the pack entry — recover it from the scale COUNT: per-channel stores N,
+     * per-group stores (K/G)*N, so G = K / (bscale_n / N). Keeps old packs loading unchanged. */
+    ow.gsize = (e.bscale_n > (uint32_t) N && N > 0 && (e.bscale_n % (uint32_t) N) == 0)
+             ? (int) (K / (e.bscale_n / (uint32_t) N)) : 0;
+    ow.bscale.resize(e.bscale_n);
     if (e.bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + e.bscale_off, (size_t) e.bscale_n * sizeof(float));
     ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
     if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
     ctx->persist_hits++;
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native LOAD %s K=%d N=%d dom=%d\n", name, K, N, _dom);
+        if (ow.gsize > 0 && ow.w) ork_w_set_group(ow.w, ow.gsize);   // the pack entry has no gsize; it came from the scale count
     return true;
 }
 
@@ -2354,6 +2386,40 @@ static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
     }
 }
 
+/* MSE-optimal symmetric int4 scale for one row/column.
+ *
+ * absmax/7 is a poor choice at 4 bits. After the Hadamard rotation a row is ~Gaussian, so the absmax over
+ * K samples lands ~3.6 sigma (K=3584); the step is then ~0.51 sigma and most of the 16 levels are spent
+ * representing tails that essentially never occur, while the bulk near zero is coarsely quantized.
+ * Clipping trades a few saturated outliers for a smaller step everywhere else, which is a large net win in
+ * squared error.
+ *
+ * Rather than assume Gaussian and hard-code the optimal ratio, search a small grid of clip fractions and
+ * take the true minimum — the rotation makes rows approximately Gaussian but not exactly, and the search
+ * costs one pass per candidate. alpha=1.0 (plain absmax) is always in the grid, so this can never be worse
+ * than the previous behaviour on any row. */
+#define ORK_I4_CLIP_N 8
+static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") == nullptr; return e; }
+static inline float ork_i4_scale_mse(const float * a, int K) {
+    float mx = 1e-9f;
+    for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
+    float best_s = mx / 7.0f; double best_e = -1.0;
+    for (int t = 0; t < ORK_I4_CLIP_N; t++) {
+        const float alpha = 1.0f - 0.0625f * (float) t;        /* 1.000 .. 0.5625 */
+        const float s = alpha * mx / 7.0f;
+        if (s <= 0.0f) continue;
+        const float inv = 1.0f / s;
+        double e = 0.0;
+        for (int k = 0; k < K; k++) {
+            int q = (int) lrintf(a[k] * inv); q = q > 7 ? 7 : (q < -8 ? -8 : q);
+            const double d = (double) a[k] - (double) q * s;
+            e += d * d;
+        }
+        if (best_e < 0.0 || e < best_e) { best_e = e; best_s = s; }
+    }
+    return best_s;
+}
+
 /* ORK_W4A4_DIAG — split the W4A4 error into its WEIGHT and ACTIVATION halves.
  *
  * Everything invested in W4A4 quality so far (Hadamard, GPTQ) touches only W. A is still plain per-row
@@ -2374,7 +2440,7 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
     const int NS = N < 128 ? N : 128;                     /*            output channels */
     if (MS < 1 || NS < 1) return;
 
-    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K);
+    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K), Ac((size_t)MS*K);
     for (int m = 0; m < MS; m++) {                        /* rotate + quantize A exactly as the runtime does */
         float * a = A.data() + (size_t)m*K;
         memcpy(a, y + (size_t)m*K, (size_t)K*sizeof(float));
@@ -2383,28 +2449,50 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
         const float s = mx / 7.0f;
         float * aq = Aq.data() + (size_t)m*K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s); q = q>7?7:(q<-8?-8:q); aq[k] = q*s; }
+        const float sc = ork_i4_scale_mse(a, K);               /* same rows, MSE-optimal clip */
+        float * ac = Ac.data() + (size_t)m*K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/sc); q = q>7?7:(q<-8?-8:q); ac[k] = q*sc; }
     }
-    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0;
-    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b)
+    /* PER-GROUP weight scales (the deferred pack-format change): instead of one scale per output channel,
+     * one per (channel, K-group). Measured here BEFORE paying for the format change and the K/G submits it
+     * costs at runtime, because the diagnostic is what told us per-channel weights were already the
+     * well-served half. G=128 is the conventional choice. */
+    const int GS = 128;
+    const int NGRP = (K + GS - 1) / GS;
+    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0, e_ac = 0, e_wg = 0;
+    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b,e_ac,e_wg)
     for (int n = 0; n < NS; n++) {
         const float * w  = Wrot + (size_t)n*K;
         const float sw = ws[n];
-        std::vector<float> wq((size_t)K);
+        std::vector<float> wq((size_t)K), wg((size_t)K);
         for (int k = 0; k < K; k++) { int q = (int) lrintf(w[k]/sw); q = q>7?7:(q<-8?-8:q); wq[k] = q*sw; }
+        /* per-group: an independent absmax scale per K-group of GS */
+        for (int g0 = 0; g0 < K; g0 += GS) {
+            const int g1 = (g0 + GS < K) ? g0 + GS : K;
+            float gmx = 1e-9f;
+            for (int k = g0; k < g1; k++) { const float v = fabsf(w[k]); if (v > gmx) gmx = v; }
+            const float sg = gmx / 7.0f;
+            for (int k = g0; k < g1; k++) { int q = (int) lrintf(w[k]/sg); q = q>7?7:(q<-8?-8:q); wg[k] = q*sg; }
+        }
         for (int m = 0; m < MS; m++) {
             const float * a  = A.data()  + (size_t)m*K;
             const float * aq = Aq.data() + (size_t)m*K;
-            double r = 0, dw = 0, da = 0, db = 0;
+            const float * ac = Ac.data() + (size_t)m*K;
+            double r = 0, dw = 0, da = 0, db = 0, dc = 0, dg = 0;
             for (int k = 0; k < K; k++) { r += (double)a[k]*w[k]; dw += (double)a[k]*wq[k];
-                                          da += (double)aq[k]*w[k]; db += (double)aq[k]*wq[k]; }
+                                          da += (double)aq[k]*w[k]; db += (double)aq[k]*wq[k];
+                                          dc += (double)ac[k]*w[k]; dg += (double)a[k]*wg[k]; }
             e_ref += r*r; e_w += (dw-r)*(dw-r); e_a += (da-r)*(da-r); e_b += (db-r)*(db-r);
+            e_ac += (dc-r)*(dc-r); e_wg += (dg-r)*(dg-r);
         }
     }
     if (e_ref <= 0) return;
     const double nrm = sqrt(e_ref);
-    fprintf(stderr, "[W4A4-DIAG] %-28s K=%-5d N=%-6d | rel err  W-only %.4f  A-only %.4f  both %.4f  "
-                    "| A/W = %.2fx\n", name, K, N,
-            sqrt(e_w)/nrm, sqrt(e_a)/nrm, sqrt(e_b)/nrm, sqrt(e_w) > 0 ? sqrt(e_a)/sqrt(e_w) : 0.0);
+    fprintf(stderr, "[W4A4-DIAG] %-28s K=%-5d N=%-6d | W %.4f  A %.4f  both %.4f | A/W %.2f | "
+                    "A-clipped %.4f (%+.1f%%) | W-group%d %.4f (%+.1f%%)\n", name, K, N,
+            sqrt(e_w)/nrm, sqrt(e_a)/nrm, sqrt(e_b)/nrm, sqrt(e_w) > 0 ? sqrt(e_a)/sqrt(e_w) : 0.0,
+            sqrt(e_ac)/nrm, sqrt(e_a) > 0 ? 100.0*(sqrt(e_ac)-sqrt(e_a))/sqrt(e_a) : 0.0,
+            GS, sqrt(e_wg)/nrm, sqrt(e_w) > 0 ? 100.0*(sqrt(e_wg)-sqrt(e_w))/sqrt(e_w) : 0.0);
 }
 
 /* ---- TWO-PHASE GPTQ CALIBRATION ----------------------------------------------------------------
@@ -2514,7 +2602,10 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if (it == ctx->wcache.end()) {
                 ork_weight ow;
                 if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
-                    ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
+                    const int GRP = ork_i4_group();
+                    const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+                    ow.gsize = GRP;
+                    ow.bscale.resize(GRP > 0 ? (size_t) NGP * N : (size_t) N);   // [g*N+n] grouped, else ws[n]
                     // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
                     // OpenMP iteration (each n is independent — disjoint f32/bi/bscale). This is the per-weight
                     // one-time conversion cost; threading it over N cuts the user's wait ~ncore-fold.
@@ -2524,6 +2615,19 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
                         else                       to_float((const char *) x + (size_t) n*nb01, col, K);
                         for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);   // rotate weight column R·B
+                        if (GRP > 0) {                       /* one scale per (channel, K-group), laid out [g*N+n] */
+                            for (int g = 0; g < NGP; g++) {
+                                const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
+                                float mx = 1e-9f;
+                                for (int k = k0; k < k1; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                                const float s = mx / 7.0f;
+                                ow.bscale[(size_t) g*N + n] = s;
+                                for (int k = k0; k < k1; k++) {
+                                    int q = (int) lrintf(col[k] / s);
+                                    bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                                }
+                            }
+                        } else {
                         float mx = 1e-9f;
                         for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
                         float s = mx / 7.0f; ow.bscale[n] = s;
@@ -2531,11 +2635,13 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                             int q = (int) lrintf(col[k] / s);
                             bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
                         }
+                        }
                     }
                     /* ORK_GPTQ PHASE 1: register this weight for calibration and DO NOT persist — the
                      * RTN codes below are only so the calibration forwards have something to compute with.
                      * ggml_backend_ork_gptq_finalize() re-quantizes with the accumulated H and persists that. */
-                    ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi);
+                    ow.w = GRP > 0 ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi, GRP)
+                                   : ork_i4_mm_pack(ctx->npu, K, N, bi);   // offline: CPU-backed weight
                     if (!ow.w) return false;
                     if (getenv("ORK_W4A4_DIAG")) ork_w4a4_diag(src0->name, M, K, N, b, y, f32, ow.bscale);
                     if (ork_gptq_on()) {
@@ -2570,11 +2676,21 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         for (int off = 0; off < K; off += b) {
                             ork_fwht_norm(arow_local + off, b);
                         }
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; as[m] = s;
+                        /* MSE-optimal clip rather than absmax/7 — measured (ORK_W4A4_DIAG) to cut the
+                         * ACTIVATION half of the W4A4 error by 11-39% (mean ~26%) on every weight of
+                         * qwen3.5-0.8B. The two error halves are at parity and independent, so this is
+                         * roughly a 12% cut in total matmul error. The search runs inside this existing
+                         * per-row omp loop, so it costs passes, not parallelism. ORK_I4_NOCLIP=1 restores
+                         * plain absmax for A/B. */
+                        float s;
+                        if (ork_i4_clip_on()) s = ork_i4_scale_mse(arow_local, K);
+                        else { float mx = 1e-9f;
+                               for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                               s = mx / 7.0f; }
+                        as[m] = s;
+                        const float inv = 1.0f / s;
                         for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(arow_local[k] / s);
+                            int q = (int) lrintf(arow_local[k] * inv);
                             ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
                         }
                     } else {
@@ -2589,6 +2705,41 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
+            }
+
+            /* PER-GROUP: activations get one scale per (row, K-group) too, and run_grouped writes fp32
+             * directly (its drain does the per-group scale-accumulate), so the per-channel dequant below
+             * is skipped entirely. */
+            if (ow.gsize > 0) {
+                const int GRP = ow.gsize, SK = K / GRP;
+                std::vector<float> asg((size_t) M * SK);
+                #pragma omp parallel for schedule(static) if (M >= 16)
+                for (int m = 0; m < M; m++) {
+                    float arow[K];
+                    memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+                    for (int off = 0; off < K; off += b) ork_fwht_norm(arow + off, b);
+                    for (int g = 0; g < SK; g++) {
+                        const int k0 = g*GRP, k1 = k0 + GRP;
+                        float s;
+                        if (ork_i4_clip_on()) s = ork_i4_scale_mse(arow + k0, GRP);
+                        else { float mx = 1e-9f;
+                               for (int k = k0; k < k1; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                               s = mx / 7.0f; }
+                        asg[(size_t) m*SK + g] = s;
+                        const float inv = 1.0f / s;
+                        for (int k = k0; k < k1; k++) {
+                            int q = (int) lrintf(arow[k] * inv);
+                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                        }
+                    }
+                }
+                if (ork_i4_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d)) {
+                    fprintf(stderr, "[ORK] %s: grouped W4A4 run REFUSED (K=%d N=%d G=%d M=%d)\n",
+                            src0->name, K, N, GRP, M);
+                    return false;
+                }
+                if (ctx->profile) { ctx->t_run += ork_now_us() - _t0; ctx->n_mm += 1; }
+                return true;
             }
 
             ork_mm_task_i4 task = { ow.w, M_padded, ai, ci };
@@ -2665,7 +2816,34 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
      * Two-stage per chunk because ork_i4_mm_pack touches the NPU and is NOT thread-safe: compute all the
      * codes in parallel, then pack + persist SERIALLY. Chunked rather than one big pass so peak memory stays
      * bounded (holding every weight's codes at once would be the whole model in int8). */
-    const int CH = 4;
+    /* CH was hardcoded to 4 — right for the RK3588's 4 big cores, and a 75% waste on any bigger host
+     * (an offline build on a 16-core box ran finalize on 4 threads). Derive it instead: weights are
+     * independent, so the ceiling is core count, bounded by MEMORY because each in-flight weight holds
+     * ork_i4_gptq's three K^2-ish doubles (Hd + H^-1 + W) plus its codes. Size that from the LARGEST K
+     * registered, since chunks are not sorted and a chunk may be all-large. ORK_GPTQ_CHUNK overrides. */
+    int CH;
+    if (const char * e = getenv("ORK_GPTQ_CHUNK")) CH = atoi(e);
+    else {
+        int kmax = 0, nmax = 0;
+        for (const auto & kv : g_gptq_cal) { if (kv.second.K > kmax) kmax = kv.second.K; if (kv.second.N > nmax) nmax = kv.second.N; }
+        const double per = 2.0*(double)kmax*kmax*sizeof(double)          /* Hd + H^-1            */
+                         + (double)kmax*nmax*sizeof(double)              /* W (double, N x K)    */
+                         + (double)kmax*nmax;                            /* int8 codes           */
+        double budget = 8.0*1024*1024*1024;                              /* stay well clear of the box */
+        #ifdef _SC_PHYS_PAGES
+        const long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
+        if (pg > 0 && ps > 0) budget = 0.25 * (double) pg * (double) ps;
+        #endif
+        int by_mem = per > 0 ? (int) (budget / per) : 4;
+        int by_cpu = 4;
+        #ifdef _OPENMP
+        by_cpu = omp_get_max_threads();
+        #endif
+        CH = by_cpu < by_mem ? by_cpu : by_mem;
+        if (CH < 1) CH = 1;
+        fprintf(stderr, "[ORK GPTQ] finalize chunk = %d (cores %d, memory allows %d @ %.0f MiB/weight, kmax=%d)\n",
+                CH, by_cpu, by_mem, per/1048576.0, kmax);
+    }
     for (size_t base = 0; base < keys.size(); base += CH) {
         const size_t n_ch = (keys.size() - base < (size_t)CH) ? keys.size() - base : (size_t)CH;
         std::vector<std::vector<int8_t>> codes(n_ch);
@@ -2699,7 +2877,13 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             }
             std::vector<double>().swap(c.H);                      /* free the accumulator as soon as it is copied */
             codes[u].resize((size_t)N*K); scal[u].resize((size_t)N);
-            rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), -1, codes[u].data(), scal[u].data(), damp);
+            /* group = -1 -> per-channel (one group spanning K). ORK_I4_GROUP=G asks for one scale per
+             * (channel, K-group); ork_i4_gptq then emits [N x ng] as scal[n*ng+g]. */
+            const int GRP = ork_i4_group();
+            const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+            if (GRP > 0) scal[u].resize((size_t) N * NGP);
+            rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), GRP > 0 ? GRP : -1,
+                                  codes[u].data(), scal[u].data(), damp);
             secs[u] = (ork_now_us() - t0) / 1e6;
         }
 
@@ -2716,12 +2900,17 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
             ork_weight & ow = it->second;
             std::vector<int8_t> bi((size_t)K*N);
+            const int GQ = ow.gsize, NGq = GQ > 0 ? K / GQ : 1;
+            if (GQ > 0) ow.bscale.resize((size_t) NGq * N);
             for (int n = 0; n < N; n++) {
-                ow.bscale[n] = scal[u][n];
+                /* ork_i4_gptq emits [n*ng+g]; run_grouped indexes [g*N+n]. Transpose here, once. */
+                if (GQ > 0) for (int g = 0; g < NGq; g++) ow.bscale[(size_t) g*N + n] = scal[u][(size_t) n*NGq + g];
+                else        ow.bscale[n] = scal[u][n];
                 for (int k = 0; k < K; k++) bi[(size_t)k*N + n] = codes[u][(size_t)n*K + k];
             }
             if (ow.w) { ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; }
-            ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi.data());
+            ow.w = GQ > 0 ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi.data(), GQ)
+                          : ork_i4_mm_pack(ctx->npu, K, N, bi.data());
             if (!ow.w) { fprintf(stderr, "[ORK GPTQ] %s: repack FAILED\n", src->name); failed++; continue; }
             ork_persist_write_i4native(ctx, src->name, K, N, ow);
             done++;
@@ -7340,9 +7529,16 @@ ggml_backend_t ggml_backend_ork_init(void) {
         // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
         // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
         setenv("ORK_NO_AFFINITY", "1", 0);
+        if (ork_offline()) {
+            npu = ork_npu_init_offline(ork_offline_soc());   // pack-only: SoC caps, no device
+            if (!npu) { GGML_LOG_ERROR("%s: ORK_OFFLINE=%s is not a known SoC id\n", __func__, ork_offline_soc()); return NULL; }
+            GGML_LOG_INFO("%s: OFFLINE pack mode (soc=%s) — no NPU; int4 compute runs an exact CPU GEMM\n",
+                          __func__, ork_offline_soc());
+        } else {
         npu = ork_npu_init();       // DEFAULT: direct in-process NPU
         if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
         GGML_LOG_INFO("%s: in-process lib NPU path (direct — default; single-stream, no concurrent NPU procs)\n", __func__);
+        }
     }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
