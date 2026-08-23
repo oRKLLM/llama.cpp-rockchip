@@ -205,12 +205,37 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 6u   // v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
+#define ORKPACK_VERSION 8u   // v8 adds DT_I4_ROT_A8 (rotated int4 weights + int8 activations);
+                             // v7 adds DT_I8_ROT; v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
                              // quant_sig (build-config precision signature) to the footer; v4 adds bf_size
                              // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
+/* ROTATED int8: the same Hadamard-rotated weight the native-W4A4 tier stores, quantised at 8 bits instead
+ * of 4. It exists because the tier set was incoherent: the rotated path was int4-ONLY, so promoting a
+ * layer for quality necessarily dropped the rotation — and measurement showed that dropping rotation
+ * costs ~7x more than the added precision buys (mixing an unrotated int8 layer into a rotated model:
+ * +2.8% PPL; mixing a rotated higher-precision layer: +0.41%). In a rotated model every tier must be
+ * rotated. */
+#define ORKPACK_DT_I8_ROT     6u
+/* ROTATED i4a8: the stored bytes are EXACTLY a DT_I4_NATIVE weight (rotated int4, per-channel mx/7
+ * scales) — so it costs nothing extra on disk — but at run time the weight is inflated to int8 containers
+ * and the ACTIVATIONS are quantised to int8 instead of int4. The error diagnostic rates this the best of
+ * the tiers: its residual equals the WEIGHT-ONLY error (0.1578 vs W-only 0.1576, three decimals, on every
+ * weight measured), i.e. int8 activations remove the activation half of the budget entirely, for -28.6%
+ * total error at zero storage cost. Distinct from DT_I4 (i4a8) because that one drops the rotation, which
+ * measured WORSE than plain W4A4 — rotation is what makes 4-bit weights coherent. */
+#define ORKPACK_DT_I4_ROT_A8  7u
+/* ADDITIVE pack versions stay readable, and this is the ONE predicate that decides it.
+ * v6 added a trailing entry field; v7 and v8 only added dtype VALUES — none of them changes a byte an
+ * older pack already contains, so a v8 binary can read v6/v7 packs and refuse an unknown dtype per-entry.
+ * It lives here because it was previously open-coded at THREE sites and only one of them was relaxed:
+ * the staleness check accepted a v7 pack while the adopt gate and ork_orkpack_usable still demanded
+ * version==8, so the pack was neither regenerated nor loaded — it was silently ignored, the run fell
+ * back to inline packing, and every arm printed the SAME number. That reads as a quality regression,
+ * not as "your pack was dropped". Keep all version comparisons going through this function. */
+static inline bool ork_pack_version_ok(uint32_t v) { return v >= 6u && v <= ORKPACK_VERSION; }
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
 /* qerr = the MEASURED relative output error this weight suffers at the tier it was stored at (the
@@ -303,6 +328,107 @@ static bool ork_offline(void) { return ork_offline_soc() != nullptr; }
  * NOTE the two APIs disagree on scale layout: ork_i4_gptq emits [n*ng+g], run_grouped wants [g*N+n]. */
 static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? atoi(getenv("ORK_I4_GROUP")) : 0; return g; }
 
+/* BUILD-TIME per-layer precision (ORK_I4_INT8_LAYERS=name,name,...). Names listed here are WRITTEN to the
+ * pack at the int8 tier instead of native W4A4; everything else stays W4A4. This is the only place the
+ * choice is made — at RUN time the pack's stored dtype decides the route (orkpack v6), so no env is needed
+ * to score the result and the decision cannot drift from what the bytes actually are.
+ *
+ * Pick the names from ORK_PACK_RANK (entry.qerr, worst first, with the MiB each promotion costs) rather
+ * than by hand: the stored metric is diag(H)-weighted against the final GPTQ weights, and it disagrees
+ * with eyeballed rankings. Substring match, so a whole family ("ffn_down") works too. */
+/* The build configuration (see ggml-ork.h). Defaults live HERE so the header documents intent and the
+ * implementation cannot drift from it: mixed on, a modest promotion budget, and a floor below which
+ * promoting a weight is not worth its bytes. */
+static ggml_backend_ork_pack_config g_pack_cfg = { 4, true, nullptr, nullptr, 8.0f, 0.05f };
+static bool g_pack_cfg_set = false;
+
+extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pack_config * cfg) {
+    if (!cfg) return;
+    cfg->weight_bits = 4; cfg->mixed = true; cfg->promote_list = nullptr;
+    cfg->qerr_source_pack = nullptr; cfg->promote_budget_mb = 8.0f; cfg->promote_qerr_min = 0.05f;
+}
+
+extern "C" void ggml_backend_ork_set_pack_config(const struct ggml_backend_ork_pack_config * cfg) {
+    if (!cfg) { ggml_backend_ork_pack_config_defaults(&g_pack_cfg); g_pack_cfg_set = false; return; }
+    g_pack_cfg = *cfg; g_pack_cfg_set = true;
+    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%d mixed=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
+            cfg->weight_bits, cfg->mixed ? "yes" : "no (pure)", cfg->promote_budget_mb, cfg->promote_qerr_min,
+            cfg->promote_list ? " list=explicit" : "", cfg->qerr_source_pack ? " qerr_source=set" : "");
+}
+
+/* Which weights get promoted to int8 at BUILD time. Precedence: an explicit list, else the qerr-ranked
+ * policy over a source pack, else nothing (a first, uniform build — which is what RECORDS the qerr that
+ * makes the next build informed). ORK_I4_INT8_LAYERS remains as a scripting fallback. */
+/* Per-layer GROUPING (ORK_I4_GROUP_LAYERS=name,...): the named weights get per-group int4 scales while
+ * the rest stay per-channel. Both remain ROTATED, i.e. both stay on the native-W4A4 path.
+ *
+ * This exists to isolate ONE variable. Promoting a layer to int8 changes precision AND drops the Hadamard
+ * rotation at the same time, and the resulting model was worse than either pure tier — with every
+ * individual matmul measuring correct. Raising precision while STAYING rotated separates the two: if
+ * mixing rotated tiers is harmless and mixing an unrotated tier is not, rotation is the culprit and
+ * "rotated w8a8" is the fix. If both degrade, rotation is exonerated and the cause is elsewhere. */
+static int ork_i4_group_for(const char * name) {
+    static const char * spec = getenv("ORK_I4_GROUP_LAYERS");
+    const int g = ork_i4_group();
+    if (!spec || !*spec) return g;                    /* no list -> the global setting applies to all */
+    if (!name) return 0;
+    const size_t nlen = strlen(name);
+    for (const char * p = spec; *p; ) {
+        const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
+        const size_t l = (size_t)(e - p);
+        if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
+            if (!strncmp(name + i, p, l)) return g > 0 ? g : 128;   /* listed -> grouped */
+        p = (*e == ',') ? e + 1 : e;
+    }
+    return 0;                                          /* not listed -> per-channel */
+}
+
+/* Which int8 tier a promoted weight goes to. ORK_I4_PROMOTE_ROT=0 selects PLAIN (unrotated) int8.
+ *
+ * Default is rotated, on the reasoning that a rotated model should keep every tier rotated. The sweep
+ * questions that: all-ROTATED-int8 scores 13.321 where the stock UNROTATED int8 pack scores 11.952 on the
+ * same screen — 11% worse. Plausible mechanism: per-channel scaling exploits inter-channel variance, and
+ * Hadamard deliberately flattens it. At 4 bits that trade wins (outliers dominate 16 levels); at 8 bits
+ * there is ample resolution and flattening just discards the adaptivity. So rotation may help int4 and
+ * HURT int8, which would make plain DT_I8 the right tier for promoted layers. This knob makes that a
+ * measurement rather than an argument. */
+/* ORK_I4_PROMOTE = rot8 (default) | i8 | i4a8 — which tier a promoted weight is written to:
+ *   rot8  DT_I8_ROT  rotated int8 weights + rotated int8 activations  (+1 MiB/weight over int4)
+ *   i8    DT_I8      plain int8, no rotation, per-channel scales       (+3 MiB/weight — also writes Bf)
+ *   i4a8  DT_I4      int4 STORAGE inflated to int8, int8 activations   (+0 bytes on disk)
+ * The three differ in what they cost as much as in what they buy, so they are worth measuring together:
+ * i4a8 is free on disk but pays inflation into IOVA on every domain swap; i8 is the most accurate tier but
+ * the most expensive; rot8 sits between and keeps the model in one basis. */
+static int ork_promote_tier(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("ORK_I4_PROMOTE");
+        const char * r = getenv("ORK_I4_PROMOTE_ROT");          /* back-compat with the earlier knob */
+        v = 0;                                                   /* 0 = rot8, 1 = i8, 2 = i4a8 */
+        if (e && !strcmp(e, "i8"))   v = 1;
+        else if (e && !strcmp(e, "i4a8")) v = 2;
+        else if (e && !strcmp(e, "roti4a8")) v = 3;   /* rotated int4 weights + int8 activations */
+        else if (r && atoi(r) == 0)  v = 1;
+    }
+    return v;
+}
+static bool ork_promote_rotated(void) { const int t = ork_promote_tier(); return t == 0 || t == 3; }
+
+static bool ork_i4_force_i8(const char * name) {
+    static const char * spec = g_pack_cfg.promote_list ? g_pack_cfg.promote_list : getenv("ORK_I4_INT8_LAYERS");
+    if (g_pack_cfg_set && !g_pack_cfg.mixed) return false;         // pure int4: explicit opt-out
+    if (!spec || !*spec || !name) return false;
+    const size_t nlen = strlen(name);
+    for (const char * p = spec; *p; ) {
+        const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
+        const size_t l = (size_t)(e - p);
+        if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
+            if (!strncmp(name + i, p, l)) return true;
+        p = (*e == ',') ? e + 1 : e;
+    }
+    return false;
+}
+
 // Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —
 // unless ORK_QUANT explicitly forces a tier, in which case a conflicting pack is stale and gets rebuilt.
 static bool ork_sig_compatible(uint32_t sig) {
@@ -370,6 +496,10 @@ static size_t ork_stream_ram_budget() {
 struct ork_weight {
     ork_w * w = nullptr;
     float   qerr = 0.0f;     // measured diag(H)-weighted relative error at the stored tier; persisted
+    int     wbits = 4;       // WEIGHT container width: 4 = int4 MAC, 8 = int8 MAC (native int8, or int4
+                             // values inflated into int8 containers for DT_I4_ROT_A8).
+    int     abits = 4;       // ACTIVATION width, independent of the weight: DT_I4_ROT_A8 pairs int4 weights
+                             // with int8 activations, which is the whole point of that tier.
     ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
     int gsize = 0;
@@ -928,6 +1058,12 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (!p || !*p) return;
     ctx->persist_final = p;    // resolved pack path, valid in BOTH read and write mode (sidecars key off it)
     bool stale = false;   // present-but-incompatible pack seen -> regenerate + delete the old sidecar
+    /* A well-formed pack that we neither ADOPTED nor diagnosed as stale means the load gates disagree
+     * with each other. That is not a rebuild condition, it is a bug, and the write path below would
+     * destroy the file while "self-healing" it. Measured cost of not having this: a version gate that
+     * accepted a pack as fresh and then failed to adopt it silently overwrote two GPTQ packs with RTN
+     * content and reported the result as a quality regression. */
+    bool pack_well_formed = false;
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
         off_t sz = lseek(fd, 0, SEEK_END);
@@ -952,7 +1088,15 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 // change bumps ork-driver's MAJOR version). Same-(K,N) blobs from an incompatible major
                 // are the SAME size, so this token is the only thing that catches them.
                 bool magic_ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
-                if (magic_ok && f.version != ORKPACK_VERSION) {        // older footer schema (pre-v3, no token)
+                pack_well_formed = magic_ok;
+                /* ADDITIVE versions stay readable. A strict != rejected every existing pack whenever a new
+                 * dtype was added, forcing a full repack for a change that does not alter any byte an old
+                 * pack contains — and a rejected pack silently falls back to inline packing, which reads as
+                 * a mysterious quality regression rather than "your pack was ignored". v6 added a trailing
+                 * entry field, v7 and v8 only added dtype VALUES, so v6+ packs are readable by a v8 binary;
+                 * an entry whose dtype this build does not know is refused individually at load. */
+                const bool version_ok = ork_pack_version_ok(f.version);
+                if (magic_ok && !version_ok) {                         // older footer schema (pre-v3, no token)
                     fprintf(stderr, "[ORK PERSIST] %s predates the pack-compat token (footer < v%u) — regenerating\n", p, ORKPACK_VERSION);
                     stale = true;
                 } else if (magic_ok && f.ork_fmt != ork_pack_format_version()) {  // v3 file, but tiling/quant major differs
@@ -964,7 +1108,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             p, f.quant_sig, ork_build_sig());
                     stale = true;
                 }
-                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
                     f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
@@ -1012,6 +1156,18 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // WRITE mode (build the .orkpack) works under orkd too: the tiling is done PURE-CPU (ork_i8_w_dump_cpu for
     // Bb + ork_i8_w_dump_bf_cpu for Bf) from the live-converted raw int8 — no resident NPU tile, no daemon. So a
     // missing/stale .orkpack self-heals: this run rebuilds it (one-time), future runs READ + import it.
+    /* REFUSE to overwrite a pack we should have been able to read. See pack_well_formed above: reaching
+     * the writer with a well-formed, non-stale pack on disk means an adopt gate rejected what the
+     * staleness gate accepted, and rebuilding would silently replace hours of GPTQ work with RTN
+     * weights AND make the run report a bogus number. Fail loudly instead; ORK_ORKPACK_CLOBBER=1 is
+     * the deliberate override for the case where the operator really does want it rebuilt in place. */
+    if (pack_well_formed && !stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+        fprintf(stderr,
+            "[ORK PERSIST] FATAL: %s is well-formed and NOT stale, but was not adopted — refusing to\n"
+            "              overwrite it. This is a loader bug, not a stale pack. Re-run with\n"
+            "              ORK_ORKPACK_CLOBBER=1 only if you intend to discard and rebuild this pack.\n", p);
+        abort();
+    }
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     // Stale pack: the fresh one is written to <p>.tmp and atomically rename()'d over the old <p> at finalize
     // (create-new-then-replace-old, crash-safe). The <p>.gmax sidecar is NOT covered by that rename, so delete
@@ -1041,7 +1197,7 @@ extern "C" bool ggml_backend_ork_orkpack_valid(const char * path) {
     if (sz > (off_t) sizeof(orkpack_footer) && lseek(fd, sz - (off_t) sizeof(orkpack_footer), SEEK_SET) >= 0) {
         orkpack_footer f;
         if (read(fd, &f, sizeof f) == (ssize_t) sizeof f)
-            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
                  f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz;
     }
     close(fd);
@@ -1192,6 +1348,7 @@ static const float * ork_imatrix_lookup(const char * name, int K) {
 //       ORK_ORKPACK_I4_FFN=1          force int4 on the FFN/expert tensors, int8 the rest
 //
 // int4 needs K%32==0 && N%32==0; tensors that don't satisfy it stay int8 regardless. Returns 4 or 8.
+static bool ork_i4_force_i8(const char * name);   /* selective per-layer precision (defined below) */
 static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_type) {
     static int init = 0, i4_ffn = 0, from_src = 1, q4_force = 0; static long i4_above_bytes = -1;
     if (!init) {
@@ -1205,6 +1362,18 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
         if (q && q[0] == '4') q4_force = 1;                       // eligible tensor (compute stays W8A8-inflate on the NPU)
     }
     if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
+
+    /* SELECTIVE PRECISION WINS OVER THE GLOBAL TIER. This must be tested BEFORE q4_force, which is a
+     * blanket "everything eligible becomes int4 storage" — it was silently overriding the per-weight
+     * decision, so a weight routed to the int8 COMPUTE path was still written at int4 STORAGE and came
+     * back as i4a8. Two decisions about one weight, made in two places, disagreeing: the pack recorded
+     * int4 while the caller believed it had asked for int8, and the resulting file looked "mixed" while
+     * containing no int8 at all.
+     * (Note q4_force also preempts the ORK_ORKPACK_TIERMAP override below, which looks like the same
+     * bug in an older guise — that map documents itself as winning over source-type, and under
+     * ORK_QUANT=4 it never gets the chance.) */
+    if (ork_i4_force_i8(name)) { const int t = ork_promote_tier(); return (t == 2 || t == 3) ? 4 : 8; }   /* i4a8 + rot-i4a8 keep int4 STORAGE */
+
     if (q4_force) return 4;                                // ORK_QUANT=4 forces int4 storage regardless of source type
 
     // (A0) external tier map (ORK_ORKPACK_TIERMAP) — wins over source-type so an fp16 source can
@@ -1347,7 +1516,11 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     size_t tb = ork_w_dump(ow.w, nullptr, 0);   // offline: ork_w_dump CPU-tiles, same bytes
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    orkpack_entry e{}; e.K = K; e.N = N;
+    e.dtype = (ow.wbits == 8) ? ORKPACK_DT_I8_ROT
+            : (ow.abits == 8) ? ORKPACK_DT_I4_ROT_A8      /* rotated int4 bytes, int8 activations */
+                              : ORKPACK_DT_I4_NATIVE;
+    e.bscale_n = (uint32_t) ow.bscale.size();
     e.qerr = ow.qerr;   /* the evidence for this weight's tier, so re-tiering needs no model run */
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
@@ -1364,19 +1537,57 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
     if (ctx->persist_mode != 1 || !ctx->persist_map) return false;
     auto pit = ctx->persist_idx.find(name);
     if (pit == ctx->persist_idx.end() || pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N ||
-        pit->second.dtype != ORKPACK_DT_I4_NATIVE) return false;
+        (pit->second.dtype != ORKPACK_DT_I4_NATIVE && pit->second.dtype != ORKPACK_DT_I8_ROT &&
+         pit->second.dtype != ORKPACK_DT_I4_ROT_A8)) return false;
     const orkpack_entry & e = pit->second;
     const char * blob = (const char *) ctx->persist_map + e.blob_off;
     // Multi-domain residence: byte-balance this dense int4 weight across domains (same as the int8 resolve +
     // expert paths) so domain_bytes stays accurate (else experts over-admit to domain 0 and overfill it) and
     // retry the next domain on IOVA exhaustion. IMPORT first (bimport, multi-domain-safe); bcreate fallback.
-    int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(name));
+    /* WIDTH comes from the stored dtype, and it selects the loader: DT_I8_ROT holds int8 tiles (2x the
+     * bytes), DT_I4_NATIVE holds int4. Both hold a ROTATED weight — that is what the two share and what
+     * the run path relies on; only the width differs. */
+    /* DT_I4_ROT_A8 stores int4 bytes but RUNS on the int8 MAC: inflate at load (ork_i4a8_mm_load turns
+     * int4 tiles into int8 containers) and pair with int8 activations. bscale stays the int4 mx/7 scale,
+     * which is correct — inflation does not change the represented values. */
+    const bool rot_a8 = (e.dtype == ORKPACK_DT_I4_ROT_A8);
+    ow.wbits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
+    ow.abits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
+    const size_t wbytes = (size_t) K * N / (ow.wbits == 8 ? 1 : 2);   /* rot_a8: int8 RESIDENT though int4 on disk */
+    int _dom = ork_weight_domain(ctx, wbytes, ork_layer_of(name));
     ork_npu_set_pack_domain(ctx->npu, _dom);
-    ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+    if (rot_a8) {                                   /* int4 bytes -> int8 containers */
+        ow.w = ork_i4a8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
+            ow.w = ork_i4a8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+    } else if (ow.wbits == 8) {
+        ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
+            ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+    } else {
+    /* ORK_NO_IMPORT also gates the native-W4A4 loader. It previously guarded only the spool/i4a8 paths, so
+     * this one had no way to be taken out of the picture — and the zero-copy import maps .orkpack page-cache
+     * pages at blob_off, which is sensitive to things a plain memcpy of the same bytes is not. When the board
+     * and an exact CPU emulation disagreed on the SAME pack (0.168 vs 0.111 relative error on the first
+     * matmul, identical inputs) with the MAC, the tiler and the un-tiler each independently proven exact,
+     * the loader was the only remaining difference and there was no switch to test it with. */
+    const bool no_import_i4n = env_enabled("ORK_NO_IMPORT");
+    if (!no_import_i4n) ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+    /* Report the import outcome ONCE. Zero-copy import is a real feature (it maps .orkpack page-cache pages
+     * straight into IOVA instead of copying), and a silent fallback to the copying path is indistinguishable
+     * from it working — which is how it went unnoticed that toggling ORK_NO_IMPORT changed nothing at all. */
+    { static int said_imp = 0;
+      if (!said_imp++ && !no_import_i4n)
+          fprintf(stderr, "[ORK PERSIST] i4-native zero-copy import %s (blob_off=%llu%s, size=%llu)\n",
+                  ow.w ? "OK" : "FAILED -> copying fallback",
+                  (unsigned long long) e.blob_off,
+                  (e.blob_off & 4095) ? " NOT page-aligned" : " page-aligned",
+                  (unsigned long long) e.blob_size); }
     if (!ow.w) ow.w = ork_i4_mm_load(ctx->npu, K, N, blob, e.blob_size);
     while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) {
-        ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+        if (!no_import_i4n) ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
         if (!ow.w) ow.w = ork_i4_mm_load(ctx->npu, K, N, blob, e.blob_size);
+    }
     }
     if (!ow.w) return false;
     /* gsize is not a field in the pack entry — recover it from the scale COUNT: per-channel stores N,
@@ -2011,6 +2222,9 @@ static inline int ork_submit_sync(ggml_backend_ork_context * ctx, std::vector<or
 }
 static inline int ork_submit_end(ork_dyn_chain * h) { return h ? (ork_dyn_end(h) < 0 ? -1 : 0) : 0; }
 
+static void ork_mm_check(const char * name, const float * d, const float * y,
+                         const char * xsrc, size_t nb01, enum ggml_type stype, int M, int K, int N);
+static void ork_act_trace(const char * name, const float * y, const float * d, int M, int K, int N);
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -2224,6 +2438,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
             }
+            ork_mm_check(src0->name, d, (const float *) src1->data, x, nb01, src0->type, M, K, N);
+            ork_act_trace(src0->name, (const float *) src1->data, d, M, K, N);
         }
 
         if (ctx->profile) {
@@ -2451,6 +2667,130 @@ static inline float ork_i4_scale_mse(const float * a, int K) {
     return best_s;
 }
 
+/* ORK_MM_DUMP=<name-substring> — hash every intermediate of ONE matmul so two machines can be compared
+ * stage by stage. Five candidate causes were eliminated one at a time by inference; this replaces that with
+ * a byte diff that cannot be ambiguous. The FIRST stage whose hash differs is the culprit: weight bytes ->
+ * the pack or its loader; ai/as -> activation quantisation; ci -> the MAC; d -> the dequant. If every hash
+ * matches then the outputs are identical and the error metric itself is what disagrees. */
+static uint64_t ork_fnv(const void * p, size_t n) {
+    const uint8_t * b = (const uint8_t *) p; uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+static void ork_mm_dump(const char * name, ork_w * w, const int8_t * ai, const float * as,
+                        const float * bscale, size_t nbs, const int32_t * ci, const float * d,
+                        int K, int N) {
+    static const char * want = getenv("ORK_MM_DUMP");
+    static int done = 0;
+    if (!want || !*want || !name || !strstr(name, want) || done++) return;
+    /* ORK_MM_DUMP_ROW: row 0 is the WRONG row to check alone. The NPU M-tiles (orki_i4_hcap is 4 rows at
+     * K=2048, so M=256 is 64 tiles) while a CPU emulation computes every row in one pass — so a tiling
+     * defect shows up in later rows while row 0 matches perfectly. Row 0 agreeing was taken as "this matmul
+     * is bit-exact" for both the dense and chain paths; the activation trace, which averages 4 rows,
+     * disagreed. */
+    const int R = getenv("ORK_MM_DUMP_ROW") ? atoi(getenv("ORK_MM_DUMP_ROW")) : 0;
+    ai += (size_t) R * K; ci += (size_t) R * N; d += (size_t) R * N; as += R;
+    std::vector<char> wb;
+    size_t wn = w ? ork_w_dump(w, nullptr, 0) : 0;
+    if (wn) { wb.resize(wn); ork_w_dump(w, wb.data(), wn); }
+    fprintf(stderr,
+        "[ORK MM-DUMP] %s K=%d N=%d ROW=%d\n"
+        "  weight  %zu B  fnv=%016llx\n"
+        "  ai row  %d B   fnv=%016llx  [%d %d %d %d %d %d %d %d]\n"
+        "  as[0]   %.9g\n"
+        "  bscale  %zu f  fnv=%016llx  [%.6g %.6g %.6g %.6g]\n"
+        "  ci row  %d i32 fnv=%016llx  [%d %d %d %d]\n"
+        "  d  row  %d f   fnv=%016llx  [%.6g %.6g %.6g %.6g]\n",
+        name, K, N, R,
+        wn, (unsigned long long) (wn ? ork_fnv(wb.data(), wn) : 0),
+        K, (unsigned long long) ork_fnv(ai, (size_t) K),
+        ai[0], ai[1], ai[2], ai[3], ai[4], ai[5], ai[6], ai[7],
+        as[0],
+        nbs, (unsigned long long) ork_fnv(bscale, nbs * sizeof(float)),
+        bscale[0], bscale[1], bscale[2], bscale[3],
+        N, (unsigned long long) ork_fnv(ci, (size_t) N * sizeof(int32_t)),
+        ci[0], ci[1], ci[2], ci[3],
+        N, (unsigned long long) ork_fnv(d, (size_t) N * sizeof(float)),
+        d[0], d[1], d[2], d[3]);
+    fflush(stderr);
+}
+
+/* ORK_OP_STATS also tallies WHICH HANDLER each MUL_MAT takes. supports_op says 1058 matmuls are claimed,
+ * but the activation trace only ever saw 102 — the dense weights. The rest go through chain/group/attention
+ * handlers that were never instrumented, so "all matmuls agree between board and offline" was really "all
+ * 102 dense matmuls agree". A per-handler count makes the whole 1058 visible and shows immediately if the
+ * two machines route the same graph differently. */
+static void ork_route_stat(const char * handler) {
+    static int on = -1;
+    if (on < 0) on = getenv("ORK_OP_STATS") ? 1 : 0;
+    if (!on) return;
+    struct RT { std::map<std::string,long> m;
+        ~RT() { fprintf(stderr, "[ORK ROUTE-STATS] handler                 calls\n");
+                for (const auto & kv : m) fprintf(stderr, "[ORK ROUTE-STATS] %-24s %8ld\n", kv.first.c_str(), kv.second); } };
+    static RT t;
+    t.m[handler]++;
+}
+
+/* ORK_ACT_TRACE=<path> — fingerprint the residual stream ENTERING and LEAVING every matmul.
+ *
+ * ORK_MM_CHECK validates a matmul against its OWN inputs, so it is structurally blind to a matmul that
+ * computed faithfully from activations that were already wrong. That blindness is why a mixed-precision
+ * regression survived every per-matmul test while each matmul measured fine. This closes it: dumping the
+ * INPUT fingerprint per matmul makes the residual stream itself observable, so two configurations can be
+ * diffed layer by layer and the FIRST point of divergence located — rather than inferring from a single
+ * end-of-run perplexity that something, somewhere, got worse.
+ *
+ * Cheap on purpose (a few rows, RMS only): the goal is to localise WHERE, then point a precise instrument
+ * at that one layer. */
+static void ork_act_trace(const char * name, const float * y, const float * d, int M, int K, int N) {
+    static int on = -1; static FILE * f = nullptr;
+    if (on < 0) { const char * p = getenv("ORK_ACT_TRACE"); on = (p && *p) ? 1 : 0; if (on) f = fopen(p, "w"); }
+    if (!on || !f) return;
+    const int MS = M < 4 ? M : 4;
+    double sy = 0, sd = 0;
+    for (int m = 0; m < MS; m++) for (int k = 0; k < K; k++) sy += (double) y[(size_t) m*K+k] * y[(size_t) m*K+k];
+    for (int m = 0; m < MS; m++) for (int n = 0; n < N; n++) sd += (double) d[(size_t) m*N+n] * d[(size_t) m*N+n];
+    fprintf(f, "%-34s M=%-4d K=%-5d N=%-5d in_rms=%.6e out_rms=%.6e\n", name, M, K, N,
+            sqrt(sy / ((double) MS*K)), sqrt(sd / ((double) MS*N)));
+    fflush(f);
+}
+
+/* ORK_MM_CHECK=<name-substring> — verify ONE matmul's actual output against an exact fp32 reference.
+ *
+ * Full-model PPL can only say "something got worse"; it cannot say WHICH value is wrong, and chasing a
+ * mixed-precision regression with it produced several confident wrong diagnoses. This measures the thing
+ * directly: dequantised output vs the exact product of the SOURCE weight and the real activations, on a
+ * subsample, reported as relative error. Tier-agnostic, so the same weight can be compared as W4A4 and as
+ * int8 and the broken one identified rather than inferred. */
+static void ork_mm_check(const char * name, const float * d, const float * y,
+                         const char * xsrc, size_t nb01, enum ggml_type stype, int M, int K, int N) {
+    static const char * want = getenv("ORK_MM_CHECK");
+    if (!want || !*want || !name || !strstr(name, want)) return;
+    const int MS = M < 8 ? M : 8, NS = N < 64 ? N : 64;
+    if (MS < 1 || NS < 1) return;
+    const auto * tt = ggml_get_type_traits(stype);
+    if (!tt || !tt->to_float) return;
+    std::vector<float> wcol((size_t) K);
+    double num = 0, den = 0, sum_e = 0, sum_r = 0; long cnt = 0;
+    for (int n = 0; n < NS; n++) {
+        if (stype == GGML_TYPE_F32) memcpy(wcol.data(), xsrc + (size_t) n*nb01, (size_t) K*sizeof(float));
+        else tt->to_float((const char *) xsrc + (size_t) n*nb01, wcol.data(), K);
+        for (int m = 0; m < MS; m++) {
+            double ref = 0;
+            for (int k = 0; k < K; k++) ref += (double) y[(size_t) m*K + k] * (double) wcol[k];
+            const double got = (double) d[(size_t) m*N + n];
+            num += (got - ref) * (got - ref); den += ref * ref;
+            sum_e += (got - ref); sum_r += fabs(ref); cnt++;   /* BIAS: rotation should give a zero-mean
+                                                                * error; an unrotated tier's error is aligned
+                                                                * with the weight and accumulates coherently
+                                                                * down the residual stream. */
+        }
+    }
+    const double rms = cnt ? sqrt(num/cnt) : 0.0, bias = cnt ? sum_e/cnt : 0.0;
+    fprintf(stderr, "[ORK MM-CHECK] %-34s M=%-4d K=%-5d N=%-5d  rel %.5f  bias/rms %+.4f  (mean|ref| %.4g)\n",
+            name, M, K, N, den > 0 ? sqrt(num/den) : 0.0, rms > 0 ? bias/rms : 0.0, cnt ? sum_r/cnt : 0.0);
+}
+
 /* ORK_W4A4_DIAG — split the W4A4 error into its WEIGHT and ACTIVATION halves.
  *
  * Everything invested in W4A4 quality so far (Hadamard, GPTQ) touches only W. A is still plain per-row
@@ -2471,7 +2811,7 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
     const int NS = N < 128 ? N : 128;                     /*            output channels */
     if (MS < 1 || NS < 1) return;
 
-    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K), Ac((size_t)MS*K);
+    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K), Ac((size_t)MS*K), A8((size_t)MS*K);
     for (int m = 0; m < MS; m++) {                        /* rotate + quantize A exactly as the runtime does */
         float * a = A.data() + (size_t)m*K;
         memcpy(a, y + (size_t)m*K, (size_t)K*sizeof(float));
@@ -2480,6 +2820,13 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
         const float s = mx / 7.0f;
         float * aq = Aq.data() + (size_t)m*K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s); q = q>7?7:(q<-8?-8:q); aq[k] = q*s; }
+        /* ROTATED i4a8: the SAME Hadamard-rotated activations, quantised to int8 (127 levels) instead of
+         * int4 (7). Isolating this is the whole point — the shipped i4a8 route drops the rotation, so
+         * comparing it against W4A4 moves two variables at once and says nothing about the tier itself. */
+        float * a8 = A8.data() + (size_t)m*K;
+        { float mx8 = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(a[k]); if (v > mx8) mx8 = v; }
+          const float s8 = mx8 / 127.0f;
+          for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s8); q = q>127?127:(q<-127?-127:q); a8[k] = q*s8; } }
         const float sc = ork_i4_scale_mse(a, K);               /* same rows, MSE-optimal clip */
         float * ac = Ac.data() + (size_t)m*K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/sc); q = q>7?7:(q<-8?-8:q); ac[k] = q*sc; }
@@ -2490,8 +2837,8 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
      * well-served half. G=128 is the conventional choice. */
     const int GS = 128;
     const int NGRP = (K + GS - 1) / GS;
-    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0, e_ac = 0, e_wg = 0;
-    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b,e_ac,e_wg)
+    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0, e_ac = 0, e_wg = 0, e_i4a8 = 0;
+    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b,e_ac,e_wg,e_i4a8)
     for (int n = 0; n < NS; n++) {
         const float * w  = Wrot + (size_t)n*K;
         const float sw = ws[n];
@@ -2509,21 +2856,24 @@ static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
             const float * a  = A.data()  + (size_t)m*K;
             const float * aq = Aq.data() + (size_t)m*K;
             const float * ac = Ac.data() + (size_t)m*K;
-            double r = 0, dw = 0, da = 0, db = 0, dc = 0, dg = 0;
+            const float * a8 = A8.data() + (size_t)m*K;
+            double r = 0, dw = 0, da = 0, db = 0, dc = 0, dg = 0, d8 = 0;
             for (int k = 0; k < K; k++) { r += (double)a[k]*w[k]; dw += (double)a[k]*wq[k];
                                           da += (double)aq[k]*w[k]; db += (double)aq[k]*wq[k];
-                                          dc += (double)ac[k]*w[k]; dg += (double)a[k]*wg[k]; }
+                                          dc += (double)ac[k]*w[k]; dg += (double)a[k]*wg[k];
+                                          d8 += (double)a8[k]*wq[k]; }   /* rotated i4a8: int8 A, int4 W */
             e_ref += r*r; e_w += (dw-r)*(dw-r); e_a += (da-r)*(da-r); e_b += (db-r)*(db-r);
-            e_ac += (dc-r)*(dc-r); e_wg += (dg-r)*(dg-r);
+            e_ac += (dc-r)*(dc-r); e_wg += (dg-r)*(dg-r); e_i4a8 += (d8-r)*(d8-r);
         }
     }
     if (e_ref <= 0) return;
     const double nrm = sqrt(e_ref);
     fprintf(stderr, "[W4A4-DIAG] %-28s K=%-5d N=%-6d | W %.4f  A %.4f  both %.4f | A/W %.2f | "
-                    "A-clipped %.4f (%+.1f%%) | W-group%d %.4f (%+.1f%%)\n", name, K, N,
+                    "A-clipped %.4f (%+.1f%%) | W-group%d %.4f (%+.1f%%) | ROT-i4a8 %.4f (%+.1f%% vs W4A4)\n", name, K, N,
             sqrt(e_w)/nrm, sqrt(e_a)/nrm, sqrt(e_b)/nrm, sqrt(e_w) > 0 ? sqrt(e_a)/sqrt(e_w) : 0.0,
             sqrt(e_ac)/nrm, sqrt(e_a) > 0 ? 100.0*(sqrt(e_ac)-sqrt(e_a))/sqrt(e_a) : 0.0,
-            GS, sqrt(e_wg)/nrm, sqrt(e_w) > 0 ? 100.0*(sqrt(e_wg)-sqrt(e_w))/sqrt(e_w) : 0.0);
+            GS, sqrt(e_wg)/nrm, sqrt(e_w) > 0 ? 100.0*(sqrt(e_wg)-sqrt(e_w))/sqrt(e_w) : 0.0,
+            sqrt(e_i4a8)/nrm, sqrt(e_b) > 0 ? 100.0*(sqrt(e_i4a8)-sqrt(e_b))/sqrt(e_b) : 0.0);
 }
 
 /* ---- TWO-PHASE GPTQ CALIBRATION ----------------------------------------------------------------
@@ -2633,8 +2983,16 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if (it == ctx->wcache.end()) {
                 ork_weight ow;
                 if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
-                    const int GRP = ork_i4_group();
+                    const int GRP = ork_i4_group_for(src0->name);
                     const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+                    /* ROTATED tier WIDTH. Promotion keeps the rotation and widens the quantiser instead of
+                     * leaving the rotated path — measurement said losing rotation costs ~7x what the extra
+                     * precision buys. QMAX is the only thing that differs downstream. */
+                    const bool promo = (ctx->persist_mode == 2 && ork_i4_force_i8(src0->name));
+                    ow.wbits = (promo && ork_promote_tier() == 0) ? 8 : 4;          /* rot8 widens the weight */
+                    ow.abits = (promo && (ork_promote_tier() == 0 || ork_promote_tier() == 3)) ? 8 : 4;
+                    const int QMAX = ow.wbits == 8 ? 127 : 7;
+                    const int QMIN = ow.wbits == 8 ? -127 : -8;
                     ow.gsize = GRP;
                     ow.bscale.resize(GRP > 0 ? (size_t) NGP * N : (size_t) N);   // [g*N+n] grouped, else ws[n]
                     // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
@@ -2651,35 +3009,55 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                                 const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
                                 float mx = 1e-9f;
                                 for (int k = k0; k < k1; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                                const float s = mx / 7.0f;
+                                const float s = mx / (float) QMAX;
                                 ow.bscale[(size_t) g*N + n] = s;
                                 for (int k = k0; k < k1; k++) {
                                     int q = (int) lrintf(col[k] / s);
-                                    bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                                    bi[(size_t) k*N + n] = (int8_t) (q > QMAX ? QMAX : q < QMIN ? QMIN : q);
                                 }
                             }
                         } else {
                         float mx = 1e-9f;
                         for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; ow.bscale[n] = s;
+                        float s = mx / (float) QMAX; ow.bscale[n] = s;
                         for (int k = 0; k < K; k++) {
                             int q = (int) lrintf(col[k] / s);
-                            bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            bi[(size_t) k*N + n] = (int8_t) (q > QMAX ? QMAX : q < QMIN ? QMIN : q);
                         }
                         }
                     }
                     /* ORK_GPTQ PHASE 1: register this weight for calibration and DO NOT persist — the
                      * RTN codes below are only so the calibration forwards have something to compute with.
                      * ggml_backend_ork_gptq_finalize() re-quantizes with the accumulated H and persists that. */
-                    ow.w = GRP > 0 ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi, GRP)
-                                   : ork_i4_mm_pack(ctx->npu, K, N, bi);   // offline: CPU-backed weight
+                    ow.w = ow.wbits == 8 ? ork_i8_mm_pack(ctx->npu, K, N, bi)        /* rotated int8 tier */
+                         : GRP > 0       ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi, GRP)
+                                         : ork_i4_mm_pack(ctx->npu, K, N, bi);   // offline: CPU-backed weight
                     if (!ow.w) return false;
                     if (getenv("ORK_W4A4_DIAG")) ork_w4a4_diag(src0->name, M, K, N, b, y, f32, ow.bscale);
-                    if (ork_gptq_on()) {
+                    /* A ROTATED INT8 weight does not go through the int4 quantiser. GPTQ's error feedback
+                     * is a 4-bit concern — at 8 bits the residual it compensates is already below the noise
+                     * it would introduce, and ork_i4_gptq emits [-8,7] codes against /7 scales, so running
+                     * it here would silently re-quantise the weight back down to int4. That is exactly what
+                     * happened before this branch existed: finalize re-packed unconditionally, the pack came
+                     * out byte-identical to pure int4, and the "rotated int8" measurement was meaningless.
+                     * So: persist it now, from phase 1, and let finalize leave it alone. */
+                    if (ork_gptq_on() && ow.wbits == 8) {
+                        ork_persist_write_i4native(ctx, src0->name, K, N, ow);   /* writes DT_I8_ROT */
+                        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] %s -> DT_I8_ROT (rotated int8, GPTQ skipped)\n", src0->name);
+                    } else if (ork_gptq_on()) {
                         ork_gptq_cal & c = g_gptq_cal[x];
                         if (c.H.empty()) {
                             c.src = src0; c.K = K; c.N = N; c.b = b;
                             c.H.assign((size_t)K*K, 0.0);
+                            /* PIN until finalize. In CONVERT mode ork_wcache_evict's budget is deliberately
+                             * ZERO (pack -> dump -> free each weight, so conversion fits any model size), so
+                             * ANY call to it evicts every unpinned entry. A pure-int4 build never calls it and
+                             * the entries happen to survive; the moment one weight takes the int8 route — i.e.
+                             * exactly a MIXED-tier pack, the thing this is all for — that call wipes the
+                             * entries GPTQ still needs, and finalize reports "wcache entry vanished" for most
+                             * of the model (measured: 78 of 96). GPTQ holds a reference across the whole
+                             * calibration, so it must say so rather than rely on nobody triggering eviction. */
+                            ctx->wcache_pin.insert(x);
                             fprintf(stderr, "[ORK GPTQ] calibrating %s K=%d N=%d (H = %.0f MiB)\n",
                                     src0->name, K, N, (double)K*K*8/1048576.0);
                         }
@@ -2713,16 +3091,20 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                          * roughly a 12% cut in total matmul error. The search runs inside this existing
                          * per-row omp loop, so it costs passes, not parallelism. ORK_I4_NOCLIP=1 restores
                          * plain absmax for A/B. */
+                        /* Activations take the SAME width as the weight tier: a rotated int8 weight is
+                         * pointless against int4 activations, since the activation half would then
+                         * dominate the error budget it was promoted to reduce. */
+                        const int AQMAX = ow.abits == 8 ? 127 : 7, AQMIN = ow.abits == 8 ? -127 : -8;
                         float s;
-                        if (ork_i4_clip_on()) s = ork_i4_scale_mse(arow_local, K);
+                        if (ow.abits == 4 && ork_i4_clip_on()) s = ork_i4_scale_mse(arow_local, K);
                         else { float mx = 1e-9f;
                                for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                               s = mx / 7.0f; }
+                               s = mx / (float) AQMAX; }
                         as[m] = s;
                         const float inv = 1.0f / s;
                         for (int k = 0; k < K; k++) {
                             int q = (int) lrintf(arow_local[k] * inv);
-                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            ai[(size_t) m*K + k] = (int8_t) (q > AQMAX ? AQMAX : q < AQMIN ? AQMIN : q);
                         }
                     } else {
                         memset(ai + (size_t) m*K, 0, K);
@@ -2777,7 +3159,10 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
             fflush(stderr);
             double _t1 = ctx->profile ? ork_now_us() : 0.0;
-            if (ork_i4_mm_run(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
+            /* Same rotated datapath, wider MAC. int8 is also the FASTER MAC on this part, so the rotated
+             * int8 tier costs quality nothing and dispatch nothing relative to W4A4. */
+            if (ow.wbits == 8 ? ork_i8_mm_run(ctx->npu, task.w, task.M, task.A, task.C)
+                              : ork_i4_mm_run(ctx->npu, task.w, task.M, task.A, task.C)) return false;
             double _t2 = ctx->profile ? ork_now_us() : 0.0;
             #pragma omp parallel for if (M >= 16)
             for (int m = 0; m < M; m++) {
@@ -2785,6 +3170,9 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
                 }
             }
+            ork_mm_dump(src0->name, ow.w, ai, as, ow.bscale.data(), ow.bscale.size(), ci, d, K, N);
+            ork_mm_check(src0->name, d, y, (const char *) x, nb01, src0->type, M, K, N);
+            ork_act_trace(src0->name, y, d, M, K, N);
             if (ctx->profile) {
                 double _t3 = ork_now_us();
                 ctx->t_quant += _t1 - _t0; ctx->t_run += _t2 - _t1; ctx->t_deq += _t3 - _t2; ctx->n_mm += 1;
@@ -2829,6 +3217,10 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
     if (!ork_gptq_on() || g_gptq_cal.empty()) return;
     ggml_backend_ork_context * ctx = g_ork_ctx;
     if (!ctx) { fprintf(stderr, "[ORK GPTQ] finalize: no backend context\n"); return; }
+    /* Release the calibration pins on the way out (see the insert in phase 1): finalize is the last reader,
+     * and leaving them pinned would defeat convert mode's zero-residency policy for the rest of the run. */
+    struct GptqPinRelease { ggml_backend_ork_context * c; ~GptqPinRelease() {
+        for (const auto & kv : g_gptq_cal) c->wcache_pin.erase(kv.first); } } _gptq_pins{ ctx };
 
     const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
     std::vector<const void *> keys;
@@ -2911,7 +3303,7 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             codes[u].resize((size_t)N*K); scal[u].resize((size_t)N);
             /* group = -1 -> per-channel (one group spanning K). ORK_I4_GROUP=G asks for one scale per
              * (channel, K-group); ork_i4_gptq then emits [N x ng] as scal[n*ng+g]. */
-            const int GRP = ork_i4_group();
+            const int GRP = ork_i4_group_for(src->name);
             const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
             if (GRP > 0) scal[u].resize((size_t) N * NGP);
             rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), GRP > 0 ? GRP : -1,
@@ -3658,6 +4050,19 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
             for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
         }
+        /* Last ork-executed path with no instrumentation: 48 of the 150 matmuls this model runs on
+         * ork go through the chain handler, and "board and offline agree" was only ever verified for
+         * the other 102. On the board this is the NPU hardware chain; offline it is orki_cpu_chain_i4
+         * exact int32 GEMM — so if the hardware chain carries int16 partials (as the grouped path
+         * does) these 48 are systematically less precise and nothing upstream would reveal it. */
+        ork_act_trace(dst->src[0]->name, (const float *) dst->src[1]->data, d, M, (int) dst->src[0]->ne[0], N);
+        /* Same stage-by-stage dump the dense path has. The chain's activations live in chain_act_cache
+         * (quantised once and shared across the chained tasks) rather than ctx->ai, so pass that buffer —
+         * comparing the wrong one would show a spurious difference and send the next person chasing it. */
+        { auto ai_it = chain_act_cache.find(src1->data);
+          if (ai_it != chain_act_cache.end())
+              ork_mm_dump(dst->src[0]->name, ow.w, ai_it->second.first, task_as,
+                          ow.bscale.data(), ow.bscale.size(), ctr, d, (int) dst->src[0]->ne[0], N); }
     }
 
     if (ctx->profile) {
@@ -7312,8 +7717,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (chain_nodes.size() >= 2) {
                     bool chain_ok = false;
                     if (type == ORK_CHAIN_I8) {
+                        ork_route_stat("chain_i8"); for (size_t z=1;z<chain_nodes.size();z++) ork_route_stat("chain_i8");
                         chain_ok = ggml_backend_ork_mul_mat_chain_i8(ctx, chain_nodes.data(), chain_nodes.size());
                     } else if (type == ORK_CHAIN_I4) {
+                        ork_route_stat("chain_i4"); for (size_t z=1;z<chain_nodes.size();z++) ork_route_stat("chain_i4");
                         chain_ok = ggml_backend_ork_mul_mat_chain_i4(ctx, chain_nodes.data(), chain_nodes.size());
                     }
                     if (!chain_ok) return GGML_STATUS_FAILED;
@@ -7357,6 +7764,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         }
                     }
                     if (ng >= 2) {
+                        for (int z = 0; z < ng; z++) ork_route_stat(grp_tier == 4 ? "group_i4" : "group_i8");
                         bool grp_ok = (grp_tier == 4) ? ggml_backend_ork_mul_mat_group_i4(ctx, grp, ng)
                                                       : ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng);
                         if (!grp_ok) return GGML_STATUS_FAILED;
@@ -7394,6 +7802,14 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         // (int4 weights inflated int4->int8 on the NPU — robust, no wedge); compact i4a8 STORAGE is
                         // chosen separately at persist (ork_orkpack_tier).
                         bool native_w4a4 = (target_qbits == 4) && ctx->hadamard;
+                        /* UNROTATED promotion: leave the rotated path entirely so the weight is written
+                         * as plain DT_I8 (mul_mat_i8 quantises from source per-channel, no Hadamard). */
+                        if (native_w4a4 && ctx->persist_mode == 2 && !ork_promote_rotated() && ork_i4_force_i8(name))
+                            native_w4a4 = false;
+
+                        /* BUILD side only (persist_mode 2 = convert). A promoted weight STAYS on the
+                         * rotated path and is written as DT_I8_ROT — it does not leave the rotated regime,
+                         * which is the whole point (see ORKPACK_DT_I8_ROT). At run time the pack decides. */
 
                         /* THE PACK DECIDES THE ROUTE, per weight.
                          *
@@ -7438,6 +7854,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                                             n_route[0], n_route[1], n_route[2], n_override);
                             }
                         }
+                        ork_route_stat(native_w4a4 ? "mul_mat_i4_hadamard" : "mul_mat_i8");
                         bool mm_ok = native_w4a4 ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
                                                  : ggml_backend_ork_mul_mat_i8(ctx, node);
                         if (!mm_ok) return GGML_STATUS_FAILED;
@@ -7970,7 +8387,31 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
 }
 
 
-static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+/* ORK_OP_STATS=1 — tally which ops this backend CLAIMS, dumped at exit.
+ *
+ * Two builds can agree on every matmul and still produce different perplexity if they disagree about which
+ * NON-matmul ops they take: an op claimed here runs on ork's primitives (reduced precision), an op declined
+ * falls to ggml's fp32 CPU kernels. That asymmetry is invisible in a matmul-level trace and is the leading
+ * explanation for a board-vs-offline gap that survived verifying the model, the pack, the text, the
+ * activations and the MAC output as bit-identical. */
+static void ork_op_stat(const char * name, bool claimed) {
+    static int on = -1;
+    if (on < 0) on = getenv("ORK_OP_STATS") ? 1 : 0;
+    if (!on) return;
+    struct Tally {
+        std::map<std::string, std::pair<long,long>> m;   /* op -> (claimed, declined) */
+        ~Tally() {
+            fprintf(stderr, "[ORK OP-STATS] op                      claimed   declined\n");
+            for (const auto & kv : m)
+                fprintf(stderr, "[ORK OP-STATS] %-22s %8ld %10ld\n", kv.first.c_str(), kv.second.first, kv.second.second);
+        }
+    };
+    static Tally t;
+    auto & e = t.m[name ? name : "?"];
+    if (claimed) e.first++; else e.second++;
+}
+
+static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
     if (ork_off) return false;
     // orkd: only MUL_MAT is daemon-routed (ork_i8_mm_pack + ork_i8_mm_run). The other NPU ops here — MoE
@@ -8353,6 +8794,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
 
 static bool ggml_backend_ork_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     return ggml_backend_buft_is_host(buft); GGML_UNUSED(dev);
+}
+
+/* Thin wrapper so every accept/decline is tallied (ORK_OP_STATS). The decision logic stays in
+ * ork_supports_op_inner. */
+static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    const bool r = ork_supports_op_inner(dev, op);
+    ork_op_stat(ggml_op_name(op->op), r);
+    return r;
 }
 
 // This is a buffer-less (BLAS-style) backend: weights live on the CPU buffer, so the scheduler only
