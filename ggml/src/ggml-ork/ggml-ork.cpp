@@ -668,6 +668,11 @@ struct ggml_backend_ork_context {
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
     std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
+    // Tier 15: name -> domain, planned ONCE over the complete index at pack open (see the planner). Not
+    // stored in the pack: a domain id is hardware-specific (domain count, IOVA width, RAM budget), and
+    // baking it in would mean one artifact per memory configuration. The pack stays portable; the PLAN is
+    // derived locally and is a pure function of (index, hardware), so it is identical run to run.
+    std::unordered_map<std::string, int> placement;
     FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
     std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
@@ -864,6 +869,17 @@ static int ork_layer_of(const char * name) {
 // domain (it's under-filled by ceil rounding). When domain_layers==0 (byte-balanced auto sizing) the fill
 // still advances ONLY at a layer boundary, so a layer stays co-domain — preserving ork_dispatch_i8's
 // cross-core RR chains. `layer` = ork_layer_of(name), or -1 if non-layer/unknown.
+/* Planned placement if we have one for this weight, else the incremental fill below. The plan is what
+ * makes the layout DETERMINISTIC: the fallback assigns domains in graph-VISIT order, which is why the same
+ * 9B pack has landed as 5 domains (46 t/s) on one run and 7 (4.3 t/s) on another. */
+static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int layer);
+static int ork_weight_domain_named(ggml_backend_ork_context * ctx, const char * name, size_t bytes, int layer) {
+    if (name && !ctx->placement.empty()) {
+        auto it = ctx->placement.find(name);
+        if (it != ctx->placement.end()) return it->second;
+    }
+    return ork_weight_domain(ctx, bytes, layer);
+}
 static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int layer) {
     if (ctx->n_domains <= 1) return 0;
     if (ctx->domain_layers > 0) {
@@ -1686,7 +1702,7 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
     ow.wbits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
     ow.abits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
     const size_t wbytes = (size_t) K * N / (ow.wbits == 8 ? 1 : 2);   /* rot_a8: int8 RESIDENT though int4 on disk */
-    int _dom = ork_weight_domain(ctx, wbytes, ork_layer_of(name));
+    int _dom = ork_weight_domain_named(ctx, name, wbytes, ork_layer_of(name));
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (rot_a8) {                                   /* int4 bytes -> int8 containers */
         /* _tiled, not ork_i4a8_mm_load. The blob here was written by ork_w_dump in the i4-NATIVE TILED
@@ -2151,7 +2167,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
-            int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
+            int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             for (;;) {                                             // retry in the next domain on IOVA exhaustion
@@ -2294,7 +2310,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         else            ork_wcache_evict(ctx, (size_t) K * N);
     }
     const double _p0 = ctx->profile ? ork_now_us_e() : 0;
-    int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
+    int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_i8_mm_pack(ctx->npu, K, N, bi);
@@ -4817,7 +4833,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 // 2nd+ buffer (int8's run reads imported non-0 weights bit-exact — this is an int4-run-specific
                 // integration bug still to fix). Per-expert import also saturates IOMMU mappings (~2340/dom) at
                 // full scale. ORK_I4_ARENA consolidates to fewer chunks but hit a chunk-boundary read bug.
-                int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(src0->name));
+                int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N / 2, ork_layer_of(src0->name));
                 ork_npu_set_pack_domain(ctx->npu, _dom);
                 auto mk = [&]() -> ork_w * {
                     if (!pe) return ork_i4_mm_pack(ctx->npu, K, N, bi.data());
@@ -5916,7 +5932,7 @@ ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     for (int n = 0; n < N; n++) { const float * frow = f32.data() + (size_t) n * K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(frow[k] * inv);
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
-    int dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));
+    int dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));
     ork_npu_set_pack_domain(ctx->npu, dom);
     ork_w * w = ork_i8_mm_pack(ctx->npu, K, N, bi.data());
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_i8_mm_pack(ctx->npu, K, N, bi.data());
@@ -8676,6 +8692,62 @@ ggml_backend_t ggml_backend_ork_init(void) {
           // Hard headroom clamp: never target a fill so high that fill + a full-layer overshoot could approach the
           // ~2.9 GiB hard IOVA edge and starve the run scratch (protects models the byte-balance leaves lumpy).
           if (ctx->domain_fill_cap > (size_t) 1900 * 1024 * 1024) ctx->domain_fill_cap = (size_t) 1900 * 1024 * 1024;
+          /* ---- DETERMINISTIC PLACEMENT PLAN (Tier 15) --------------------------------------------
+           * Assign every weight a domain HERE, over the complete index, instead of letting
+           * ork_weight_domain fill incrementally in graph-visit order. Two things this buys:
+           *   - Reproducibility. The incremental fill depends on the order weights happen to be touched,
+           *     which is why the same 9B W4A8 pack has resided as 5 domains (46 t/s) and 7 (4.3 t/s).
+           *   - Failure at OPEN, not at layer 48. The 27B overflow (a 22.66 GiB footprint asking for 24
+           *     domains against the driver's 16, filling 0..15, then EINVAL'ing off the end and leaking a
+           *     mapping per attempt) is a single up-front check once the whole plan is known.
+           * The plan is NOT written to the pack: a domain id depends on domain count, IOVA width and RAM,
+           * so storing it would demand one artifact per memory configuration. It is derived locally and is
+           * a pure function of (index, hardware). Canonical order is (layer, name) so it never depends on
+           * unordered_map iteration order. Same layer-boundary rule as the fallback, so a layer's matmuls
+           * stay co-domain. */
+          {
+              std::vector<std::pair<std::string, size_t>> ents;
+              ents.reserve(ctx->persist_idx.size());
+              for (const auto & kv : ctx->persist_idx) {
+                  const int K = (int) kv.second.K, N = (int) kv.second.N;
+                  const uint32_t dt = kv.second.dtype;
+                  const bool i8r = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
+                                    dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
+                                   (dt == 0 && ctx->qbits == 8);
+                  ents.emplace_back(kv.first, ork_w_resident_bytes(ctx->npu, K, N, i8r ? 8 : 4, want_bf ? 1 : 0));
+              }
+              std::sort(ents.begin(), ents.end(), [](const std::pair<std::string,size_t> & a,
+                                                     const std::pair<std::string,size_t> & b) {
+                  int la = ork_layer_of(a.first.c_str()), lb = ork_layer_of(b.first.c_str());
+                  if (la < 0) la = 1 << 28;                 /* non-layer tensors (embeddings, output) last */
+                  if (lb < 0) lb = 1 << 28;
+                  if (la != lb) return la < lb;
+                  return a.first < b.first;
+              });
+              int d = 0, last_layer = -2; size_t used = 0, worst = 0;
+              for (const auto & e : ents) {
+                  const int L = ork_layer_of(e.first.c_str());
+                  const bool new_layer = (L != last_layer);
+                  if (d < ctx->n_domains - 1 && used + e.second > ctx->domain_fill_cap && new_layer) {
+                      if (used > worst) worst = used;
+                      d++; used = 0;
+                  }
+                  ctx->placement[e.first] = d;
+                  used += e.second; last_layer = L;
+              }
+              if (used > worst) worst = used;
+              /* A plan that does not fit is a BUILD-time-visible fact; say so now rather than discovering
+               * it mid-forward as an EINVAL that leaks IOVA on every retry. ~2.9 GiB is the measured
+               * usable IOVA per domain (domain_probe says ~4.16; the margin covers Bf + one overshoot). */
+              const size_t hard = (size_t) 2900 * 1024 * 1024;
+              if (worst > hard)
+                  fprintf(stderr, "[ORK] WARNING: planned placement puts %.2f GiB in one domain (usable ~%.2f GiB) "
+                                  "across %d domains — expect an IOVA failure; reduce the resident set\n",
+                          worst / (1024.0*1024*1024), hard / (1024.0*1024*1024), ctx->n_domains);
+              if (getenv("ORK_VERBOSE"))
+                  fprintf(stderr, "[ORK] placement planned: %zu weights over %d domains, worst domain %.2f GiB\n",
+                          ents.size(), d + 1, worst / (1024.0*1024*1024));
+          }
           ctx->residence_footprint = inflated;
           ctx->residence_ram_budget = budget;
           ctx->residence_stream = (inflated > budget) ? 1 : 0;       // even Bb-only overflows -> stream by layer
