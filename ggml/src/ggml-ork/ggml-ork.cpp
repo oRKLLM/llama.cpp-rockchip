@@ -1221,6 +1221,30 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             "              ORK_ORKPACK_CLOBBER=1 only if you intend to discard and rebuild this pack.\n", p);
         abort();
     }
+    /* REGENERATING A LARGE PACK IS DESTRUCTIVE, AND "STALE" DOES NOT MEAN "DISPOSABLE".
+     *
+     * The no-clobber guard above only fires for a pack that is well-formed AND not stale. A pack from an
+     * older format version IS legitimately stale, so the guard stands aside and this writer rebuilds over
+     * it -- correct for a 155 MiB pack that takes two minutes, catastrophic for a 17 GiB one that takes
+     * hours and whose source GGUF or build config may no longer exist. Measured 2026-08-24: 53 packs
+     * totalling 220 GiB on the board were pre-v6, every one of which this path would have overwritten on
+     * first read, including several 15-17 GiB packs. A run was seconds from doing exactly that.
+     *
+     * So above a size threshold, regeneration requires saying so. ORK_ORKPACK_MAX_REGEN_MB tunes it
+     * (default 2048); ORK_ORKPACK_CLOBBER=1 overrides entirely, same escape hatch the no-clobber guard uses. */
+    if (stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+        struct stat pst;
+        const long long capmb = getenv("ORK_ORKPACK_MAX_REGEN_MB") ? atoll(getenv("ORK_ORKPACK_MAX_REGEN_MB")) : 2048;
+        if (stat(p, &pst) == 0 && (long long) pst.st_size > capmb * 1024 * 1024) {
+            fprintf(stderr,
+                "[ORK PERSIST] FATAL: %s is %.2f GiB and STALE (older format) - refusing to regenerate over it.\n"
+                "              Rebuilding a pack this size costs hours and its source may no longer exist, so\n"
+                "              staleness alone is not authority to destroy it. Archive or delete it first, or\n"
+                "              set ORK_ORKPACK_CLOBBER=1 (or raise ORK_ORKPACK_MAX_REGEN_MB=%lld) to proceed.\n",
+                p, pst.st_size / (1024.0*1024*1024), capmb);
+            abort();
+        }
+    }
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     // Stale pack: the fresh one is written to <p>.tmp and atomically rename()'d over the old <p> at finalize
     // (create-new-then-replace-old, crash-safe). The <p>.gmax sidecar is NOT covered by that rename, so delete
@@ -8580,7 +8604,40 @@ ggml_backend_t ggml_backend_ork_init(void) {
            * domains is fine and keeps each domain's IOVA window mostly free for the run scratch. 1 GiB/domain. */
           const size_t cap = (size_t) 1000 * 1024 * 1024;
           long nd = (long) ((inflated + cap - 1) / cap);
-          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // 63 = owned_dom bitmask ceiling (~155 GiB)
+          /* HARD KERNEL CEILING: RKNPU_MAX_IOMMU_DOMAIN_NUM is 16 (drivers/rknpu/include/rknpu_drv.h), so
+           * valid domain ids are 0..15 and rknpu_iommu_switch_domain() returns -EINVAL for anything above.
+           * The old clamp used 63 -- the orkd owned_dom BITMASK ceiling, which is a different limit -- and
+           * the "many light domains are fine, count limit >> 8" premise above is simply wrong. A 27B pack
+           * (22.66 GiB inflated) asked for 23 domains at 1 GiB each, filled 0..15, then walked off the end:
+           * every allocation past 15 came back EINVAL, which ork_domain_advance reads as "domain full" and
+           * answers by advancing to the NEXT invalid id. Kernel log: "invalid iommu domain id: 16, reuse
+           * domain id: 15". Clamping the COUNT also fixes the fill: n_domains feeds domain_fill_cap below,
+           * so 22.66 GiB over 16 domains targets ~1.48 GiB each -- still far under the ~2.9 GiB IOVA edge
+           * that the headroom clamp protects. */
+          const long ORK_KERNEL_MAX_DOMAINS = 16;   /* RKNPU_MAX_IOMMU_DOMAIN_NUM */
+          if (nd > ORK_KERNEL_MAX_DOMAINS) {
+              fprintf(stderr, "[ORK] footprint %.2f GiB wants %ld domains; the rknpu driver has %ld "
+                              "(ids 0..%ld) — packing %.2f GiB/domain instead\n",
+                      inflated/(1024.0*1024*1024), nd, ORK_KERNEL_MAX_DOMAINS, ORK_KERNEL_MAX_DOMAINS-1,
+                      inflated/(double)ORK_KERNEL_MAX_DOMAINS/(1024.0*1024*1024));
+              nd = ORK_KERNEL_MAX_DOMAINS;
+          }
+          ctx->n_domains = nd < 1 ? 1 : (int) nd;
+          /* ORK_DOMAINS_FORCE — DEBUG ONLY, clamp UP. The multi-domain teardown leak (Tier 17) is invisible
+           * on a single-domain model, so reproducing it used to require a 12 GiB / 27B pack and ~20 minutes
+           * per run. Forcing a small pack across several domains reproduces the DOMAIN SWITCHING, which is
+           * what the bug actually needs -- gigabytes are incidental. A 155 MiB 0.8B pack across 3 domains
+           * runs in seconds, which is the difference between a bisect that is worth running and one that is
+           * not. Clamp-UP only: it can never make the auto count unsafe, only more fragmented. This is a
+           * reproducer knob, NOT a tuning knob -- the auto count remains the sole authority for real runs. */
+          if (const char * fd_ = getenv("ORK_DOMAINS_FORCE")) {
+              const int f = atoi(fd_);
+              if (f > ctx->n_domains && f <= 16) {   /* 16 = RKNPU_MAX_IOMMU_DOMAIN_NUM */
+                  fprintf(stderr, "[ORK] ORK_DOMAINS_FORCE=%d (auto was %d) — DEBUG reproducer, clamp-up only\n",
+                          f, ctx->n_domains);
+                  ctx->n_domains = f;
+              }
+          }
           if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
           // Hard headroom clamp: never target a fill so high that fill + a full-layer overshoot could approach the
           // ~2.9 GiB hard IOVA edge and starve the run scratch (protects models the byte-balance leaves lumpy).
