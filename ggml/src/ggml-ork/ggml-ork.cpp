@@ -206,7 +206,11 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 8u   // v8 adds DT_I4_ROT_A8 (rotated int4 weights + int8 activations);
+#define ORKPACK_VERSION 6u   // v6 = the 2026-08-24 format: dtype-tagged entries (incl. DT_I4_ROT_A8) plus
+                             // an embedded GGUF metadata section. v7/v8 were EXPERIMENTAL and never left
+                             // this workstation (no remote contains them), so they are collapsed back into
+                             // a single public increment rather than publishing two throwaway versions.
+                             // Every v7/v8 pack is archived and must be rebuilt.
                              // v7 adds DT_I8_ROT; v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
                              // quant_sig (build-config precision signature) to the footer; v4 adds bf_size
                              // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
@@ -236,7 +240,10 @@ static bool env_enabled(const char * name) {
  * version==8, so the pack was neither regenerated nor loaded — it was silently ignored, the run fell
  * back to inline packing, and every arm printed the SAME number. That reads as a quality regression,
  * not as "your pack was dropped". Keep all version comparisons going through this function. */
-static inline bool ork_pack_version_ok(uint32_t v) { return v >= 6u && v <= ORKPACK_VERSION; }
+// EXACTLY 6. The old range accepted 6..8, which was right while 7 and 8 were live formats; now that they
+// are collapsed, a v7/v8 file on disk is a DIFFERENT layout wearing a number we reuse, so it must be
+// rejected, not read. It reports as STALE and (over ORK_ORKPACK_MAX_REGEN_MB) refuses to regenerate.
+static inline bool ork_pack_version_ok(uint32_t v) { return v == ORKPACK_VERSION; }
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
 /* qerr = the MEASURED relative output error this weight suffers at the tier it was stored at (the
@@ -673,6 +680,11 @@ struct ggml_backend_ork_context {
     // baking it in would mean one artifact per memory configuration. The pack stays portable; the PLAN is
     // derived locally and is a pure function of (index, hardware), so it is identical run to run.
     std::unordered_map<std::string, int> placement;
+    uint64_t pack_meta_off = 0, pack_meta_size = 0;   // v6 embedded GGUF metadata section (0 = absent)
+    // The model file's packed tensors are HOLES -> ork must serve them on every path. Set from
+    // ORK_SOURCE_IS_STUB (the caller knows: it passed a .orkpack and used the extracted gguf) because
+    // there is no reliable in-backend hook — buffer_set_tensor never fires for model weights.
+    int source_is_stub = getenv("ORK_SOURCE_IS_STUB") ? 1 : 0;
     FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
     std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
@@ -1145,12 +1157,11 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 // are the SAME size, so this token is the only thing that catches them.
                 bool magic_ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
                 pack_well_formed = magic_ok;
-                /* ADDITIVE versions stay readable. A strict != rejected every existing pack whenever a new
-                 * dtype was added, forcing a full repack for a change that does not alter any byte an old
-                 * pack contains — and a rejected pack silently falls back to inline packing, which reads as
-                 * a mysterious quality regression rather than "your pack was ignored". v6 added a trailing
-                 * entry field, v7 and v8 only added dtype VALUES, so v6+ packs are readable by a v8 binary;
-                 * an entry whose dtype this build does not know is refused individually at load. */
+                /* v6 is now an EXACT match (see ork_pack_version_ok). The old 6..8 range was correct while
+                 * 7 and 8 were live formats that only ADDED dtype values; collapsing them back into 6 means
+                 * a v7/v8 file is a different layout wearing a number we reuse, so accepting it by range
+                 * would misread it. A rejected pack falls back to inline packing, which reads as a
+                 * mysterious quality regression -- hence the explicit message below rather than silence. */
                 const bool version_ok = ork_pack_version_ok(f.version);
                 if (magic_ok && !version_ok) {                         // older footer schema (pre-v3, no token)
                     fprintf(stderr, "[ORK PERSIST] %s predates the pack-compat token (footer < v%u) — regenerating\n", p, ORKPACK_VERSION);
@@ -1167,6 +1178,14 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
                     f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
+                    /* v6 METADATA SECTION. Two u64 at the head of the index region -- deliberately here and
+                     * not in the footer, so the footer stays binary-stable and an older reader still finds
+                     * magic where it expects it (it then fails the version check cleanly instead of
+                     * misparsing a longer footer). 0/0 = no embedded metadata. */
+                    uint64_t meta_off = 0, meta_size = 0;
+                    memcpy(&meta_off, idx, 8);  idx += 8;
+                    memcpy(&meta_size, idx, 8); idx += 8;
+                    ctx->pack_meta_off = meta_off; ctx->pack_meta_size = meta_size;
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
                         std::string name(idx, nl); idx += nl;
@@ -2026,10 +2045,27 @@ static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
  * Only tensors ork would claim are checked: a genuinely zero norm/bias in a real model is not our business. */
 static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, const void * data, size_t nbytes) {
     if (ctx->persist_mode != 1) return;                 /* only meaningful when a pack is being read */
-    if (ctx->persist_idx.count(name)) return;           /* the pack serves it -- hole is fine */
     if (!data || nbytes < 4096) return;
     const unsigned char * p = (const unsigned char *) data;   /* sample, don't scan gigabytes */
-    for (size_t i = 0; i < nbytes; i += 4096) if (p[i]) return;
+    bool zero = true;
+    for (size_t i = 0; i < nbytes; i += 4096) if (p[i]) { zero = false; break; }
+    if (!zero) return;
+    if (ctx->persist_idx.count(name)) {
+        /* The pack owns it, so a hole is EXPECTED -- but only SAFE if ork serves this tensor on EVERY
+         * path. It does not: supports_op declines dense MUL_MAT at M==1, and ggml then computes decode
+         * from this hole. MEASURED on Qwen3.6-27B, same pack, only the source differing:
+         *   source gguf : "github.com/sgl-project/sglang/blob/main/LICENSE"
+         *   stub gguf   : "githubFromFile崇仓orchirit斗μβα broynek涯柴"
+         * Perplexity does not catch it -- PPL is teacher-forced over the M>1 prefill path and reads
+         * 10.6780 either way. So record that the source is a stub; supports_op then refuses to decline
+         * anything the pack owns. */
+        if (!ctx->source_is_stub) {
+            ctx->source_is_stub = 1;
+            fprintf(stderr, "[ORK STUB] source is a STUB (packed tensors are holes) — ork will claim every "
+                            "pack-owned matmul, including M=1 decode, since declining would hand ggml a hole\n");
+        }
+        return;
+    }
     fprintf(stderr,
         "[ORK STUB] FATAL: %s reads as all zeros and the .orkpack does not contain it.\n"
         "           This looks like a STUB gguf run without its pack (or with a pack built from a\n"
@@ -2038,13 +2074,151 @@ static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, c
     abort();
 }
 
+/* ---- v6 EMBEDDED GGUF METADATA -----------------------------------------------------------------
+ * Stage 2 of Tier 15: make the pack self-sufficient. The stub GGUF already solved the duplication problem
+ * (a packed run otherwise holds the source weights twice: 28.6 GiB GGUF + 12 GiB pack = 40.8 GiB on a
+ * 31 GiB board) but it is a SECOND FILE that must travel with the pack and match it. Embedding its content
+ * makes the pack the whole artifact.
+ *
+ * Only the non-hole content is stored -- the header/KV/tensor-info block plus the tensors the pack does NOT
+ * own (embeddings, norms, output head). The packed tensors are holes in the stub, so storing them here
+ * would duplicate exactly what the pack already holds.
+ *
+ * Layout:  u64 gguf_total | u64 data_off | data_off bytes (header+KV+tensor-info)
+ *          u32 n_kept | n_kept x { u64 abs_off, u64 size, size bytes }
+ */
+static bool ork_write_pack_meta(FILE * out, const char * src_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed,
+                                uint64_t * bytes_written) {
+    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+    if (!gg) { fprintf(stderr, "[ORK META] cannot read %s — pack will carry no metadata\n", src_path); return false; }
+    std::unordered_set<std::string> own;
+    for (const auto & kv : packed) own.insert(kv.first);
+
+    int sfd = open(src_path, O_RDONLY);
+    if (sfd < 0) { gguf_free(gg); return false; }
+    const uint64_t data_off = (uint64_t) gguf_get_data_offset(gg);
+    const uint64_t total    = (uint64_t) lseek(sfd, 0, SEEK_END);
+    uint64_t w = 0; bool ok = true;
+    std::vector<char> buf(1u << 20);
+
+    ok = ok && fwrite(&total, 8, 1, out) == 1;    w += 8;
+    ok = ok && fwrite(&data_off, 8, 1, out) == 1; w += 8;
+    for (uint64_t got = 0; got < data_off && ok; ) {
+        const size_t want = (size_t) std::min<uint64_t>(data_off - got, buf.size());
+        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
+        if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
+        else { got += (uint64_t) r; w += (uint64_t) r; }
+    }
+    const int64_t nt = gguf_get_n_tensors(gg);
+    uint32_t n_kept = 0;
+    for (int64_t i = 0; i < nt; i++) if (!own.count(gguf_get_tensor_name(gg, i))) n_kept++;
+    ok = ok && fwrite(&n_kept, 4, 1, out) == 1; w += 4;
+    uint64_t kept_b = 0;
+    for (int64_t i = 0; i < nt && ok; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        if (own.count(nm)) continue;
+        const uint64_t sz = (uint64_t) gguf_get_tensor_size(gg, i);
+        const uint64_t at = data_off + (uint64_t) gguf_get_tensor_offset(gg, i);
+        ok = ok && fwrite(&at, 8, 1, out) == 1; w += 8;
+        ok = ok && fwrite(&sz, 8, 1, out) == 1; w += 8;
+        for (uint64_t got = 0; got < sz && ok; ) {
+            const size_t want = (size_t) std::min<uint64_t>(sz - got, buf.size());
+            ssize_t r = pread(sfd, buf.data(), want, (off_t) (at + got));
+            if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
+            else { got += (uint64_t) r; w += (uint64_t) r; }
+        }
+        kept_b += sz;
+    }
+    close(sfd); gguf_free(gg);
+    if (!ok) { fprintf(stderr, "[ORK META] write failed — pack will carry no metadata\n"); return false; }
+    *bytes_written = w;
+    fprintf(stderr, "[ORK META] embedded %u non-packed tensors (%.2f GiB) + %.1f MiB of header/KV; "
+                    "pack is now self-sufficient\n", n_kept, kept_b/1073741824.0, data_off/1048576.0);
+    /* A PARTIAL pack must not look finished. The metadata section embeds whatever the pack does NOT own,
+     * so a run that died early packs a handful of weights and then embeds nearly the whole model as
+     * "non-packed" -- observed: a 27B build that failed at weight 73 of 400 produced a 24.34 GiB pack that
+     * orkpack_info still reported as "ok — loads". Loud, because the file is superficially valid. */
+    if (packed.size() * 4 < (size_t) n_kept)
+        fprintf(stderr, "[ORK META] *** WARNING: only %zu tensors are PACKED against %u embedded — this pack is "
+                        "almost certainly PARTIAL (a failed/aborted build). Delete it and rebuild; it will "
+                        "load and silently serve most weights from the embedded copies at source precision.\n",
+                packed.size(), n_kept);
+    return true;
+}
+
+/* Rebuild a loadable (sparse) GGUF from a pack's embedded metadata. The packed tensors stay holes -- ork
+ * serves them -- so the result is small on disk and identical in layout to the source, which is what lets
+ * stock llama.cpp load it with no loader change. Returns false if the pack carries no metadata. */
+extern "C" bool ggml_backend_ork_extract_gguf(const char * pack_path, const char * out_path) {
+    int pfd = open(pack_path, O_RDONLY);
+    if (pfd < 0) return false;
+    const off_t psz = lseek(pfd, 0, SEEK_END);
+    if (psz < (off_t) sizeof(orkpack_footer)) { close(pfd); return false; }
+    orkpack_footer f;
+    if (pread(pfd, &f, sizeof f, psz - (off_t) sizeof f) != (ssize_t) sizeof f ||
+        memcmp(f.magic, ORKPACK_MAGIC, 8) != 0 || !ork_pack_version_ok(f.version)) { close(pfd); return false; }
+    uint64_t meta_off = 0, meta_size = 0;
+    if (pread(pfd, &meta_off, 8, (off_t) f.index_off) != 8 ||
+        pread(pfd, &meta_size, 8, (off_t) f.index_off + 8) != 8 || meta_size == 0) { close(pfd); return false; }
+
+    uint64_t total = 0, data_off = 0; off_t at = (off_t) meta_off;
+    if (pread(pfd, &total, 8, at) != 8) { close(pfd); return false; } at += 8;
+    if (pread(pfd, &data_off, 8, at) != 8) { close(pfd); return false; } at += 8;
+    int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ofd < 0) { close(pfd); return false; }
+    bool ok = ftruncate(ofd, (off_t) total) == 0;     /* full length first: untouched ranges become holes */
+    std::vector<char> buf(1u << 20);
+    for (uint64_t got = 0; got < data_off && ok; ) {
+        const size_t want = (size_t) std::min<uint64_t>(data_off - got, buf.size());
+        ssize_t r = pread(pfd, buf.data(), want, at + (off_t) got);
+        if (r <= 0 || pwrite(ofd, buf.data(), (size_t) r, (off_t) got) != r) ok = false; else got += (uint64_t) r;
+    }
+    at += (off_t) data_off;
+    uint32_t n_kept = 0;
+    if (ok && pread(pfd, &n_kept, 4, at) != 4) ok = false; at += 4;
+    for (uint32_t i = 0; i < n_kept && ok; i++) {
+        uint64_t off = 0, sz = 0;
+        if (pread(pfd, &off, 8, at) != 8) { ok = false; break; } at += 8;
+        if (pread(pfd, &sz, 8, at) != 8)  { ok = false; break; } at += 8;
+        for (uint64_t got = 0; got < sz && ok; ) {
+            const size_t want = (size_t) std::min<uint64_t>(sz - got, buf.size());
+            ssize_t r = pread(pfd, buf.data(), want, at + (off_t) got);
+            if (r <= 0 || pwrite(ofd, buf.data(), (size_t) r, (off_t) (off + got)) != r) ok = false;
+            else got += (uint64_t) r;
+        }
+        at += (off_t) sz;
+    }
+    close(pfd); close(ofd);
+    if (!ok) { unlink(out_path); return false; }
+    struct stat st; long long blocks_b = (stat(out_path, &st) == 0) ? (long long) st.st_blocks * 512 : -1;
+    fprintf(stderr, "[ORK META] extracted %s from the pack: apparent %.2f GiB, on disk %.2f GiB\n",
+            out_path, total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
+    return true;
+}
+
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
 static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (ctx->persist_built.empty()) {
         fclose(ctx->persist_out); ctx->persist_out = nullptr; unlink(ctx->persist_tmp.c_str()); return;
     }
+    /* v6: embed the GGUF metadata BEFORE the index, so the pack is a complete artifact. */
+    uint64_t meta_off = 0, meta_size = 0;
+    if (!getenv("ORK_NO_META")) {
+        const std::string msrc = ork_find_model_path();
+        if (!msrc.empty()) {
+            const uint64_t at = ctx->persist_off;
+            uint64_t w = 0;
+            if (ork_write_pack_meta(ctx->persist_out, msrc.c_str(), ctx->persist_built, &w)) {
+                meta_off = at; meta_size = w; ctx->persist_off += w;
+            }
+        } else fprintf(stderr, "[ORK META] source model path unknown — pack will carry no metadata\n");
+    }
     uint64_t index_off = ctx->persist_off;
+    fwrite(&meta_off, 8, 1, ctx->persist_out);
+    fwrite(&meta_size, 8, 1, ctx->persist_out);
     for (auto & kv : ctx->persist_built) {
         uint32_t nl = (uint32_t) kv.first.size();
         fwrite(&nl, 4, 1, ctx->persist_out);
@@ -8972,7 +9146,24 @@ static void ork_op_stat(const char * name, bool claimed) {
 
 static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
-    if (ork_off) return false;
+    if (ork_off) {
+        /* ORK_OFF over a STUB source is not a CPU baseline, it is a garbage generator: the weights ggml
+         * would read are holes. Say so rather than producing plausible-looking nonsense. */
+        if (g_ork_ctx && g_ork_ctx->source_is_stub) {
+            static int warned = 0;
+            if (!warned) { warned = 1;
+                fprintf(stderr, "[ORK] *** ORK_OFF=1 with a STUB source: every packed tensor reads as ZERO. "
+                                "Output will be garbage. Use the full source gguf for a CPU baseline.\n"); }
+        }
+        return false;
+    }
+    /* STUB SOURCE: declining a pack-owned matmul hands ggml a HOLE, not a weight — nobody else can compute
+     * it. Claim it whatever the shape, including M==1 decode (normally declined because the NPU submit
+     * floor loses there). Correctness first; the decode cost is the price of a stub source, and it is why
+     * this claim is conditional rather than the default. */
+    if (g_ork_ctx && g_ork_ctx->source_is_stub && op->op == GGML_OP_MUL_MAT &&
+        op->src[0] && op->src[0]->name[0] && g_ork_ctx->persist_idx.count(op->src[0]->name))
+        return true;
     // orkd: only MUL_MAT is daemon-routed (ork_i8_mm_pack + ork_i8_mm_run). The other NPU ops here — MoE
     // (MUL_MAT_ID), attention (SOFT_MAX/FLASH_ATTN), SDP activations (GLU/UNARY/MUL/ADD), SSM_SCAN — run on
     // fd-local primitives (run_i8_silu, doorbell, dom_activate, DMA scratch) that break when the daemon owns
