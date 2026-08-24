@@ -8520,10 +8520,33 @@ ggml_backend_t ggml_backend_ork_init(void) {
           size_t base = 0, bf_extra = 0;
           for (const auto & kv : ctx->persist_idx) {
               const int K = (int) kv.second.K, N = (int) kv.second.N;
-              size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
-                                              : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
-              base += tile;
-              if (K <= 4096) bf_extra += tile;                         // full-K Bf rebuild (decode fast path only)
+              /* ASK THE DRIVER what this weight will occupy; do not model it here.
+               *
+               * The pack dtype -> RESIDENT WIDTH mapping is ours (it is a pack-format concern, and it is the
+               * same mapping ork_persist_load_i4native applies): DT_I4_NATIVE stays int4 nibbles, everything
+               * else is int8-resident -- DT_I4 and DT_I4_ROT_A8 are int4 ON DISK but INFLATE to int8
+               * containers at load. What those bytes then cost in IOVA -- tile geometry, per-tile page
+               * padding, and whether a full-K Bf companion gets built -- is the DRIVER's business, and
+               * ork_w_resident_bytes is the authority for it.
+               *
+               * This used to be re-derived here, and it drifted twice at once: every entry in a MIXED pack
+               * was sized at one global ctx->qbits (missing the 2x on inflated entries, ~3 GiB on the 27B
+               * ra8 pack), and Bf was gated at K<=4096 where the loaders use K<=10752 (missing a companion
+               * on every 4096<K<=10752 weight, and a 27B is full of K=5120). The consequence is not a
+               * mis-plan: the overflowing domain's IOVA allocation fails, and a failed allocation leaks a
+               * mapping the kernel cannot reclaim until reboot. */
+              const uint32_t dt = kv.second.dtype;
+              const bool i8_resident = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
+                                        dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
+                                       (dt == 0 && ctx->qbits == 8);   /* dt==0: pre-dtype pack, fall back */
+              const int    wbits = i8_resident ? 8 : 4;
+              const size_t tile  = (size_t) K * N / (i8_resident ? 1 : 2);   /* Bb only, for the fp16/chain deltas below */
+              /* Ask both ways: base is the always-resident set, bf_extra the optional full-K companion the
+               * adaptive-Bf decision below weighs against the RAM budget. Both include page padding. */
+              const size_t with_bf = ork_w_resident_bytes(ctx->npu, K, N, wbits, 1);
+              const size_t no_bf_b  = ork_w_resident_bytes(ctx->npu, K, N, wbits, 0);
+              base     += no_bf_b;
+              bf_extra += (with_bf > no_bf_b) ? (with_bf - no_bf_b) : 0;
               if (f16route && (kv.first.find("ffn_gate") != std::string::npos ||
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
