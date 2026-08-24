@@ -672,6 +672,7 @@ struct ggml_backend_ork_context {
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
     std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
     long persist_hits = 0, persist_misses = 0;   // weights loaded from .orkpack vs packed (diagnostic)
+    int  dom_advance_fails = 0;   // capped: every failed alloc leaks kernel IOVA (see ork_domain_advance)
     // MoE expert weights are too numerous to keep ALL packed NPU-resident (the IOMMU exhausts ~2k).
     // Fixed pool PER SHAPE: a bounded set of slots allocated once, reused round-robin via repack-in-place
     // (NO alloc/free → no IOMMU fragmentation). Dense/attn weights stay in wcache (resident forever).
@@ -890,8 +891,30 @@ static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int l
 }
 // A pack/load just failed in the current domain (its IOVA window is full). Advance to the next domain if
 // one remains; returns the new domain, or -1 when the last domain is also exhausted (a real OOM).
+/* Advancing is CAPPED, because a failed allocation is not free: the kernel leaves a partially-mapped
+ * object behind, its later unmap trips WARN_ON(unmapped != size) in __iommu_dma_unmap, and that IOVA is
+ * never reclaimed -- it survives process exit and accumulates until reboot. Measured: a clean run leaks
+ * NOTHING, a failed 27B run leaks exactly 5 mappings, and 5 is how many domains the retry walked. So the
+ * retry does not rescue the allocation, it multiplies a kernel bug by the number of domains.
+ *
+ * Advancing is still right when a domain is genuinely full -- that is what it is for. What is NOT right is
+ * continuing after a domain that had plenty of room ALSO failed: the evidence there is unambiguous (every
+ * domain refusing at ~29-36 MB of a 3900 MB ceiling, with PRIME_FD_TO_HANDLE returning ENOMEM), and that is
+ * a kernel allocation failure which the next domain will reproduce exactly. Stop after the first such.
+ * ORK_DOM_ADVANCE_MAX overrides the cap for deliberate experiments. */
 static int ork_domain_advance(ggml_backend_ork_context * ctx) {
     if (ctx->domain_cursor >= ctx->n_domains - 1) return -1;
+    static const int cap = getenv("ORK_DOM_ADVANCE_MAX") ? atoi(getenv("ORK_DOM_ADVANCE_MAX")) : 2;
+    if (++ctx->dom_advance_fails > cap) {
+        static int said = 0;
+        if (!said++)
+            fprintf(stderr,
+                "[ork] domain advance CAPPED after %d failures — each failed allocation leaks an IOVA\n"
+                "[ork]   mapping the kernel cannot reclaim (WARN_ON in __iommu_dma_unmap; survives exit,\n"
+                "[ork]   needs a reboot). Retrying further domains would multiply the leak, not fix it.\n"
+                "[ork]   Reduce resident footprint (coarser group size / fewer promoted weights) instead.\n", cap);
+        return -1;
+    }
     int d = ++ctx->domain_cursor;
     ork_npu_set_pack_domain(ctx->npu, d);
     fprintf(stderr, "[ork] domain %d full — advancing residence to domain %d\n", d - 1, d);
@@ -1648,9 +1671,13 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
          * for EVERY DT_I4_ROT_A8 weight ever written. The miss then fell back to inline packing, which is
          * a legitimate event for a cold weight and therefore silent -- at 0.8B that produced a plausible
          * wrong number, at 27B it inline-packed 80 weights at ~27-89 MB each and exhausted IOVA. */
-        ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size);
+        /* Group size is derived from the SCALE COUNT and must be known BEFORE the load: a group's bytes are
+         * strided across the normal K-slice layout, so group-tiling has to happen while tiling, not after. */
+        const int gpre = (e.bscale_n > (uint32_t) N && N > 0 && (e.bscale_n % (uint32_t) N) == 0)
+                       ? (int) (K / (e.bscale_n / (uint32_t) N)) : 0;
+        ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size, gpre);
         while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
-            ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size);
+            ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size, gpre);
     } else if (ow.wbits == 8) {
         ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
         while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
