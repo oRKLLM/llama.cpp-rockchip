@@ -7918,6 +7918,40 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     return true;
 }
 
+// ---- RESIDENCE ACCOUNTING + READINESS QUERY (Tier 15 stage 3) ----------------------------------
+// Weights are still materialized lazily (see the note in buffer_set_tensor for why an eager hook is not
+// reachable until ork owns the weight buffers). What IS available now is honest accounting of what is
+// resident, so a benchmark can load, wait, query, and only then start its clock -- instead of timing
+// through a load. That distinction is not cosmetic: on Qwen3.6-27B G=512 a single-window run reported
+// 220 s "scored" of which essentially all was weight load and int4->int8 inflate (30/30 profiler frames in
+// ork_i4a8_mm_load_tiled), and it was compared against a CPU control that pays no such cost.
+//
+// The event rides GGML_LOG_INFO -- the ecosystem's existing log stream -- rather than a bespoke channel.
+// Once the orkpack-native loader lands, residence happens inside model load and llama_progress_callback
+// covers it, at which point this collapses into the standard path.
+// Answer from the wcache itself. Deliberately NOT per-site counters: the int8 resolve and the
+// i4/hadamard path keep separate find/emplace sites (and there are ~10 of them), so any hand-placed tally
+// under-reports the moment a path is added -- an early version of this reported "0 weights" on a run with
+// 400 resident, because it only instrumented the int8 resolve. The cache is the one structure every path
+// must update to work at all, so it cannot silently drift. Timing is the CALLER's business: it knows when
+// it started loading; the backend only knows what is resident now.
+extern "C" void ggml_backend_ork_residence(int * n_weights, size_t * bytes) {
+    const ggml_backend_ork_context * c = g_ork_ctx;
+    if (n_weights) *n_weights = c ? (int) c->wcache.size() : 0;
+    if (bytes)     *bytes     = c ? c->wcache_bytes : 0;
+}
+
+// Log what is resident, once, on request. Returns 1 if anything is.
+extern "C" int ggml_backend_ork_residence_report(void) {
+    const ggml_backend_ork_context * c = g_ork_ctx;
+    if (!c || c->wcache.empty()) return 0;
+    size_t tot = 0; for (int d = 0; d < (c->n_domains > 0 ? c->n_domains : 1); d++) tot += c->domain_bytes[d];
+    GGML_LOG_INFO("%s: ork READY — %d weights resident, %.2f GiB (%.2f GiB across %d domain(s))\n", __func__,
+                  (int) c->wcache.size(), c->wcache_bytes / (1024.0*1024.0*1024.0),
+                  tot / (1024.0*1024.0*1024.0), c->n_domains > 0 ? c->n_domains : 1);
+    return 1;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
@@ -8774,7 +8808,13 @@ static void * ggml_backend_ork_buffer_get_base(ggml_backend_buffer_t buffer) { r
 static void   ggml_backend_ork_buffer_free_buffer(ggml_backend_buffer_t buffer) { free(buffer->context); }
 static void   ggml_backend_ork_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (g_ork_ctx && offset == 0) ork_stub_verify(g_ork_ctx, tensor->name, data, size);   /* stub without its pack? */
-    memcpy((char *) tensor->data + offset, data, size); GGML_UNUSED(buffer);
+    memcpy((char *) tensor->data + offset, data, size);
+    /* NOTE (Tier 15 stage 3): this is NOT a per-weight load event for ork. An attempt to record pack-owned
+     * weights here fired ZERO times on Qwen3.6-27B: the ORK_Weights buffer holds only the ~11 MiB compute
+     * buffer, while the model's 400 weights live in CPU buffers and ork merely reads them. llama.cpp does
+     * deliver a per-tensor event, but to whichever backend OWNS the tensor — so tapping it requires ork to
+     * claim the weight tensors via its buffer type, i.e. the orkpack-native loader (stage 2), not a hook. */
+    GGML_UNUSED(buffer);
 }
 static void   ggml_backend_ork_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     memcpy(data, (const char *) tensor->data + offset, size); GGML_UNUSED(buffer);
