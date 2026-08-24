@@ -269,6 +269,7 @@ struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version
 #define ORK_SIG_QB_MASK 0x0ffu   // forced-precision char: '4', '8', or 0 = source-driven default
 #define ORK_SIG_HY_BIT  0x100u   // ORK_HYBRID split
 #define ORK_SIG_HD_BIT  0x200u   // hadamard — now IMPLIED by native W4A4 (see ork_w4a4_native_on); vestigial in the sig
+static bool ork_i4_norot(void);   /* fwd: folded into the pack signature below */
 static uint32_t ork_build_sig(void) {
     const char * q = getenv("ORK_QUANT");
     uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
@@ -277,7 +278,7 @@ static uint32_t ork_build_sig(void) {
     // information. Deriving it keeps the emitted value bit-identical to what the old ORK_QUANT=4 +
     // ORK_HADAMARD=1 build wrote (0x234) and what a plain int8 build wrote (0x0) — no existing pack is
     // invalidated by removing the knob.
-    uint32_t hd = (qb == (uint32_t) '4') ? 1u : 0u;
+    uint32_t hd = (qb == (uint32_t) '4' && !ork_i4_norot()) ? 1u : 0u;   /* NOROT flips it -> pack refused if run rotated */
     return (qb & ORK_SIG_QB_MASK) | (hy << 8) | (hd << 9);
 }
 
@@ -434,6 +435,13 @@ static bool ork_i4_force_i8(const char * name) {
 // unless ORK_QUANT explicitly forces a tier, in which case a conflicting pack is stale and gets rebuilt.
 static bool ork_sig_compatible(uint32_t sig) {
     if ((sig & ORK_SIG_HY_BIT) != (ork_build_sig() & ORK_SIG_HY_BIT)) return false;
+    /* ROTATION (bit 9) is deliberately NOT checked here, and that is a known hole -- see ORK_I4_NOROT.
+     * Checking it looks obvious and is wrong in this spot: a false from ork_sig_compatible marks the pack
+     * STALE, and stale means REGENERATE, not refuse. Adding the check turned a read of a mismatched pack
+     * into a silent destructive rebuild -- it overwrote a G=32 GPTQ pack with a per-channel RTN one and
+     * scored 6795 instead of erroring. The rotation state needs a check on the REFUSE path (like the
+     * pack-miss guard), not on the staleness path. Until then ORK_I4_NOROT is build/run-must-match by
+     * convention, and mismatching it yields garbage (measured: PPL 7,059,519). */
     const char * q = getenv("ORK_QUANT");
     if (q && *q) return ork_sig_qbits(sig) == ((q[0] == '4') ? 4 : 8);
     return true;
@@ -2834,6 +2842,27 @@ static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
  * than the previous behaviour on any row. */
 #define ORK_I4_CLIP_N 8
 static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") == nullptr; return e; }
+
+/* ORK_I4_NOROT=1 — build and run the native-W4A4 tier WITHOUT the Hadamard rotation.
+ *
+ * Rotation exists so a SINGLE PER-CHANNEL scale can cope with outliers: R spreads each outlier across the
+ * FWHT block so no one scale is dominated by it. Per-group scales solve the same problem a different way,
+ * by localising the outlier to 32 weights. The two may therefore be ANTAGONISTIC — rotating first smears an
+ * outlier across a block of up to 1024, destroying exactly the locality that grouping provides. Measured
+ * evidence for suspecting it: G=32 + W4A8 still sits 1.84x above CPU Q4_0 on excess error, and Q4_0 has no
+ * rotation, no error feedback and a coarser scale.
+ *
+ * This is a MEASUREMENT knob, not a shipping mode: section 3 established rotation is not optional in the
+ * PER-CHANNEL regime, and that result is not in question. What is in question is whether it still helps
+ * once groups are fine.
+ *
+ * It gates every W4A4 rotation site — weight pack, activation quant (grouped and not), the GPTQ Hessian
+ * accumulate and the GPTQ finalize re-rotate — through this ONE predicate, because a pack rotated at build
+ * and run unrotated (or vice versa) is not a degraded result, it is noise. The flag is also folded into
+ * ork_build_sig so a mismatched pack is REFUSED rather than silently scored. */
+static bool ork_i4_norot(void) { static const int e = env_enabled("ORK_I4_NOROT"); return e; }
+static inline void ork_w4a4_rot(float * v, int n) { if (!ork_i4_norot()) ork_fwht_norm(v, n); }
+
 static inline float ork_i4_scale_mse(const float * a, int K) {
     float mx = 1e-9f;
     for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
@@ -3151,7 +3180,7 @@ static void ork_gptq_accum(ork_gptq_cal & c, int M, const float * y) {
         const int nb = (M - m0 < B) ? (M - m0) : B;
         for (int r = 0; r < nb; r++) {                            /* rotate the block, store transposed */
             memcpy(a.data(), y + (size_t)(m0+r)*K, (size_t)K*sizeof(float));
-            for (int off = 0; off < K; off += c.b) ork_fwht_norm(a.data() + off, c.b);
+            for (int off = 0; off < K; off += c.b) ork_w4a4_rot(a.data() + off, c.b);
             for (int i = 0; i < K; i++) AbT[(size_t)i*B + r] = a[i];
         }
         #pragma omp parallel for schedule(static)
@@ -3239,7 +3268,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         float * col = f32 + (size_t) n*K;
                         if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
                         else                       to_float((const char *) x + (size_t) n*nb01, col, K);
-                        for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);   // rotate weight column R·B
+                        for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);   // rotate weight column R·B
                         if (GRP > 0) {                       /* one scale per (channel, K-group), laid out [g*N+n] */
                             for (int g = 0; g < NGP; g++) {
                                 const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
@@ -3338,7 +3367,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         float arow_local[K];
                         memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
                         for (int off = 0; off < K; off += b) {
-                            ork_fwht_norm(arow_local + off, b);
+                            ork_w4a4_rot(arow_local + off, b);
                         }
                         /* MSE-optimal clip rather than absmax/7 — measured (ORK_W4A4_DIAG) to cut the
                          * ACTIVATION half of the W4A4 error by 11-39% (mean ~26%) on every weight of
@@ -3386,27 +3415,39 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 for (int m = 0; m < M; m++) {
                     float arow[K];
                     memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
-                    for (int off = 0; off < K; off += b) ork_fwht_norm(arow + off, b);
+                    for (int off = 0; off < K; off += b) ork_w4a4_rot(arow + off, b);
                     for (int g = 0; g < SK; g++) {
                         const int k0 = g*GRP, k1 = k0 + GRP;
+                        /* ACTIVATION WIDTH follows the tier, as it does on the ungrouped path. This branch
+                         * used to hardcode 4 bits (mx/7, clamp [-8,7]), which made grouped scales and int8
+                         * activations mutually exclusive -- a grouped W4A8 pack built fine and then refused
+                         * at run, so the activation half of the W4A4-vs-Q4_0 gap could not be measured. */
+                        const int GQMAX = ow.abits == 8 ? 127 : 7, GQMIN = ow.abits == 8 ? -127 : -8;
                         float s;
-                        if (ork_i4_clip_on()) s = ork_i4_scale_mse(arow + k0, GRP);
+                        if (ow.abits == 4 && ork_i4_clip_on()) s = ork_i4_scale_mse(arow + k0, GRP);
                         else { float mx = 1e-9f;
                                for (int k = k0; k < k1; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
-                               s = mx / 7.0f; }
+                               s = mx / (float) GQMAX; }
                         asg[(size_t) m*SK + g] = s;
                         const float inv = 1.0f / s;
                         for (int k = k0; k < k1; k++) {
                             int q = (int) lrintf(arow[k] * inv);
-                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            ai[(size_t) m*K + k] = (int8_t) (q > GQMAX ? GQMAX : q < GQMIN ? GQMIN : q);
                         }
                     }
                 }
-                if (ork_i4_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d)) {
-                    fprintf(stderr, "[ORK] %s: grouped W4A4 run REFUSED (K=%d N=%d G=%d M=%d)\n",
-                            src0->name, K, N, GRP, M);
+                const int grc = (ow.wbits == 8)
+                    ? ork_i8_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d)
+                    : ork_i4_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d);
+                if (grc) {
+                    fprintf(stderr, "[ORK] %s: grouped W4A%d run REFUSED (K=%d N=%d G=%d M=%d)\n",
+                            src0->name, ow.abits, K, N, GRP, M);
                     return false;
                 }
+                /* The grouped branch returns before the ungrouped path's check, so ORK_MM_CHECK was blind to
+                 * precisely the configuration under investigation -- it silently printed nothing for every
+                 * grouped pack and looked like the probe simply had no findings. */
+                ork_mm_check(src0->name, d, y, (const char *) x, nb01, src0->type, M, K, N);
                 if (ctx->profile) { ctx->t_run += ork_now_us() - _t0; ctx->n_mm += 1; }
                 return true;
             }
@@ -3571,7 +3612,7 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
                 float * col = W.data() + (size_t)n*K;
                 if (src->type == GGML_TYPE_F32) memcpy(col, x + (size_t)n*src->nb[1], (size_t)K*sizeof(float));
                 else                            to_float(x + (size_t)n*src->nb[1], col, K);
-                for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);
+                for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);
             }
             /* accum filled only the LOWER triangle (halving its inner loop); mirror once, here. */
             std::vector<float> Hf((size_t)K*K);

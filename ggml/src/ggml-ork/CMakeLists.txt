@@ -76,7 +76,7 @@ endif()
 # fa_diff_probe / bmm_diff_probe: differential CORRECTNESS oracles — build ONE attention node, compute it
 # on the ggml CPU backend (oracle) and on the ORK backend, and diff. ~20s answers vs 6-min model loads;
 # they call the ork backend directly so supports_op cannot silently decline the path under test.
-foreach(orktool ork_bench ork_ppl fa_diff_probe bmm_diff_probe)
+foreach(orktool ork_bench ork_ppl ork_qerr fa_diff_probe bmm_diff_probe)
     if (EXISTS ${ORK_DIR}/tools/re/${orktool}.cpp)
         add_executable(${orktool} ${ORK_DIR}/tools/re/${orktool}.cpp)
         target_link_libraries(${orktool} PRIVATE llama ggml)
