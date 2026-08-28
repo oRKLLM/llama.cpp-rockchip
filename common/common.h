@@ -563,6 +563,18 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
+    // ---- ggml-ork .orkpack BUILD configuration (see ggml/include/ggml-ork.h) ----
+    // How a pack is WRITTEN. Applied via ggml_backend_ork_set_pack_config before the model loads, and
+    // resolved at runtime so a build without the ork backend simply ignores them. Reading a pack needs
+    // none of this — the file records each weight's tier, so only writing is configurable.
+    int32_t     ork_pack_bits       = 0;      // base tier: 4 or 8; 0 = leave the backend default
+    bool        ork_pack_mixed      = true;   // promote the worst weights to int8
+    bool        ork_pack_mixed_set  = false;  // was --pack-mixed / --no-pack-mixed given?
+    float       ork_pack_budget_mb  = -1.0f;  // extra bytes promotion may spend; <0 = backend default
+    float       ork_pack_qerr_min   = -1.0f;  // never promote below this measured error; <0 = default
+    std::string ork_pack_qerr_src   = "";     // a prior .orkpack to rank qerr from
+    std::string ork_pack_promote    = "";     // explicit "name,name,..." promotion list
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 

@@ -2044,6 +2044,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = !value;
         }
     ).set_env("LLAMA_ARG_REPACK"));
+    // ---- .orkpack build configuration (ggml-ork) ----
+    // The pack is the artifact these produce, so how it is built is a real user decision: the base tier,
+    // and which weights are worth spending extra bytes on. Promotion is ranked by qerr — the measured
+    // per-weight quantisation error the pack itself records — so a MIXED build wants --pack-qerr-source
+    // pointing at an earlier pack of the same model. Without one the first build is uniform, and it is
+    // that build which records the qerr making the second informed.
+    add_opt(common_arg(
+        {"--pack-bits"}, "N",
+        "orkpack base tier: 4 or 8 (default: backend's own, currently 4).\n"
+        "note: 4 from an UNQUANTIZED source selects the NF4 codebook; from an already-quantized source it\n"
+        "falls back to uniform int4, which is markedly worse — prefer an f16/bf16 source for 4-bit packs",
+        [](common_params & params, int value) {
+            if (value != 4 && value != 8) throw std::invalid_argument("--pack-bits must be 4 or 8");
+            params.ork_pack_bits = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-mixed"},
+        {"--no-pack-mixed"},
+        "promote the worst-quantised weights to int8 (default: enabled). --no-pack-mixed builds a pure\n"
+        "single-tier pack",
+        [](common_params & params, bool value) {
+            params.ork_pack_mixed = value; params.ork_pack_mixed_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-budget"}, "MiB",
+        "how much EXTRA pack size promotion to int8 may spend (default: 8)",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_budget_mb = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-qerr-min"}, "F",
+        "never promote a weight whose measured error is below this (default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_qerr_min = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-qerr-source"}, "FNAME",
+        "a previously built .orkpack to rank qerr from; without it the build is uniform and merely\n"
+        "RECORDS the qerr that makes a later mixed build possible",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_qerr_src = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-promote"}, "NAMES",
+        "explicit comma-separated tensor names to promote to int8; wins over the qerr policy",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_promote = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--no-host"},
         "bypass host buffer allowing extra buffers to be used",
