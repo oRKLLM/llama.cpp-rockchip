@@ -54,7 +54,8 @@ GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflas
 // promote_budget_mb is spent. With neither, the first build is uniform and records the qerr that makes the
 // second build informed.
 struct ggml_backend_ork_pack_config {
-    int          weight_bits;        // base tier for the bulk of the model: 4 (default) or 8
+    int          weight_bits;        // base tier for the bulk of the model: 4 or 8; 0 = UNSET (the
+                                     // default), leaving ORK_QUANT / the source-type policy to decide
     bool         mixed;              // default true — promote the worst weights to int8
     const char * promote_list;       // explicit "name,name,..."; NULL = use the policy below
     const char * qerr_source_pack;   // a previously built pack to read qerr from; NULL = no ranking available

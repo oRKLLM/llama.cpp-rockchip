@@ -277,9 +277,13 @@ struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version
 #define ORK_SIG_HY_BIT  0x100u   // ORK_HYBRID split
 #define ORK_SIG_HD_BIT  0x200u   // hadamard — now IMPLIED by native W4A4 (see ork_w4a4_native_on); vestigial in the sig
 static bool ork_i4_norot(void);   /* fwd: folded into the pack signature below */
+/* The forced base tier for THIS build. ONE function, because the tier is decided in TWO places — what
+ * ork_orkpack_tier WRITES, and what ork_build_sig says the pack IS — and those disagreeing is a bug this
+ * file has already had once (see the note in ork_orkpack_tier). --pack-bits wins when given; 0 means the
+ * caller said nothing, so ORK_QUANT decides as it always did. Returns '4', '8', or 0 = source-driven. */
+static uint32_t ork_forced_qb(void);
 static uint32_t ork_build_sig(void) {
-    const char * q = getenv("ORK_QUANT");
-    uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
+    uint32_t qb = ork_forced_qb();                                   // '4','8',… or 0 = source-driven default
     uint32_t hy = (getenv("ORK_HYBRID") != nullptr) ? 1u : 0u;
     // hd is DERIVED, not read: native W4A4 is always rotated (see ork_w4a4_native_on), so it carries no independent
     // information. Deriving it keeps the emitted value bit-identical to what the old ORK_QUANT=4 +
@@ -348,21 +352,31 @@ static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? at
 /* The build configuration (see ggml-ork.h). Defaults live HERE so the header documents intent and the
  * implementation cannot drift from it: mixed on, a modest promotion budget, and a floor below which
  * promoting a weight is not worth its bytes. */
-static ggml_backend_ork_pack_config g_pack_cfg = { 4, true, nullptr, nullptr, 8.0f, 0.05f };
+static ggml_backend_ork_pack_config g_pack_cfg = { 0, true, nullptr, nullptr, 8.0f, 0.05f };
 static bool g_pack_cfg_set = false;
 
 extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pack_config * cfg) {
     if (!cfg) return;
-    cfg->weight_bits = 4; cfg->mixed = true; cfg->promote_list = nullptr;
+    cfg->weight_bits = 0; cfg->mixed = true; cfg->promote_list = nullptr;   /* 0 = unset: ORK_QUANT / source policy decides */
     cfg->qerr_source_pack = nullptr; cfg->promote_budget_mb = 8.0f; cfg->promote_qerr_min = 0.05f;
 }
 
 extern "C" void ggml_backend_ork_set_pack_config(const struct ggml_backend_ork_pack_config * cfg) {
     if (!cfg) { ggml_backend_ork_pack_config_defaults(&g_pack_cfg); g_pack_cfg_set = false; return; }
     g_pack_cfg = *cfg; g_pack_cfg_set = true;
-    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%d mixed=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
-            cfg->weight_bits, cfg->mixed ? "yes" : "no (pure)", cfg->promote_budget_mb, cfg->promote_qerr_min,
+    char wb[32];
+    if (cfg->weight_bits) snprintf(wb, sizeof wb, "%d", cfg->weight_bits);
+    else                  snprintf(wb, sizeof wb, "unset (ORK_QUANT/source)");
+    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%s mixed=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
+            wb, cfg->mixed ? "yes" : "no (pure)", cfg->promote_budget_mb, cfg->promote_qerr_min,
             cfg->promote_list ? " list=explicit" : "", cfg->qerr_source_pack ? " qerr_source=set" : "");
+}
+
+static uint32_t ork_forced_qb(void) {
+    if (g_pack_cfg.weight_bits == 4) return (uint32_t) '4';
+    if (g_pack_cfg.weight_bits == 8) return (uint32_t) '8';
+    const char * q = getenv("ORK_QUANT");
+    return (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;
 }
 
 /* Which weights get promoted to int8 at BUILD time. Precedence: an explicit list, else the qerr-ranked
@@ -1577,8 +1591,10 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
         i4_ffn = getenv("ORK_ORKPACK_I4_FFN") ? 1 : 0;
         const char * fs = getenv("ORK_ORKPACK_TIER_FROM_SRC");   // default ON; "0" disables
         if (fs && fs[0] == '0' && fs[1] == '\0') from_src = 0;
-        const char * q = getenv("ORK_QUANT");                    // ORK_QUANT=4: force compact i4a8 STORAGE for every
-        if (q && q[0] == '4') q4_force = 1;                       // eligible tensor (compute stays W8A8-inflate on the NPU)
+        // --pack-bits 4 (or ORK_QUANT=4) forces compact i4a8 STORAGE for every eligible tensor; the compute
+        // stays W8A8-inflate on the NPU. Via ork_forced_qb so the bytes written and the signature stamped
+        // on them cannot disagree -- --pack-bits used to be inert here, which is oRKLLM/llama.cpp-rockchip#3.
+        if (ork_forced_qb() == (uint32_t) '4') q4_force = 1;
     }
     if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
 
