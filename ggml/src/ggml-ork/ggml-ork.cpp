@@ -423,19 +423,112 @@ static int ork_promote_tier(void) {
 }
 static bool ork_promote_rotated(void) { const int t = ork_promote_tier(); return t == 0 || t == 3; }
 
+/* THE QERR-RANKED PROMOTION SET — the middle clause of the precedence documented above, which was
+ * described there long before it existed (oRKLLM/llama.cpp-rockchip#1: --pack-qerr-source, --pack-budget
+ * and --pack-qerr-min parsed, echoed, and then read by nothing).
+ *
+ * Reads ONLY the source pack's index. entry.qerr plus K/N is everything the policy needs, so this maps no
+ * blobs, allocates no IOVA and never runs the model — the whole point of storing qerr in the pack was that
+ * re-tiering becomes a pure function of the file. Ranks worst-first, promotes while qerr >= qerr_min and the
+ * cumulative int4->int8 delta (+K*N/2, the same figure ORK_PACK_RANK prints) still fits the budget.
+ *
+ * Built once, and it REPORTS what it did. A policy that silently promotes nothing is indistinguishable from
+ * one that is not wired up at all, which is exactly how the inert flags survived a release. */
+static const std::unordered_set<std::string> & ork_qerr_promote_set(void) {
+    static std::unordered_set<std::string> promo;
+    static bool built = false;
+    if (built) return promo;
+    built = true;
+
+    const char * path = g_pack_cfg.qerr_source_pack;
+    if (!path || !*path) return promo;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' cannot be opened — no promotion\n", path); return promo; }
+    off_t sz = lseek(fd, 0, SEEK_END);
+    orkpack_footer f;
+    if (sz <= (off_t) sizeof f || pread(fd, &f, sizeof f, sz - (off_t) sizeof f) != (ssize_t) sizeof f ||
+        memcmp(f.magic, ORKPACK_MAGIC, 8) != 0 || f.index_off >= (uint64_t) sz) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' is not an .orkpack — no promotion\n", path);
+        close(fd); return promo;
+    }
+    if (!ork_pack_version_ok(f.version)) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' is format v%u, this build reads v%u — no promotion\n",
+                path, f.version, ORKPACK_VERSION);
+        close(fd); return promo;
+    }
+    const size_t idx_n = (size_t) (sz - (off_t) f.index_off) - sizeof f;
+    std::vector<char> buf(idx_n);
+    if (pread(fd, buf.data(), idx_n, (off_t) f.index_off) != (ssize_t) idx_n) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': short read of the index — no promotion\n", path);
+        close(fd); return promo;
+    }
+    close(fd);
+
+    /* Same index layout as the load path: two u64 of metadata offsets, then n_entries of
+     * {u32 name_len, name bytes, orkpack_entry}. Bounds-checked because this file is user-supplied. */
+    const char * idx = buf.data(); const char * end = buf.data() + idx_n;
+    if (end - idx < 16) return promo;
+    idx += 16;
+    std::vector<std::pair<float, std::string>> rank;
+    std::unordered_map<std::string, orkpack_entry> ent;
+    uint32_t n_read = 0;
+    for (uint32_t i = 0; i < f.n_entries; i++) {
+        if (end - idx < 4) break;
+        uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
+        if (nl > (uint32_t) (end - idx)) break;
+        std::string name(idx, nl); idx += nl;
+        if ((size_t) (end - idx) < sizeof(orkpack_entry)) break;
+        orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+        n_read++;
+        if (e.qerr > 0.0f) { rank.emplace_back(e.qerr, name); ent.emplace(std::move(name), e); }
+    }
+
+    if (rank.empty()) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': %u entries, none carry qerr — "
+                        "that pass recorded no error, so there is nothing to rank (no promotion)\n", path, n_read);
+        return promo;
+    }
+
+    std::sort(rank.rbegin(), rank.rend());                       /* worst qerr first */
+    const double budget_mb = g_pack_cfg.promote_budget_mb;
+    const float  qmin      = g_pack_cfg.promote_qerr_min;
+    double spent = 0;
+    for (const auto & r : rank) {
+        if (r.first < qmin) continue;                             /* below the floor: not worth its bytes */
+        const orkpack_entry & e = ent.at(r.second);
+        const double mb = (double) e.K * e.N / 2.0 / 1048576.0;   /* int4 -> int8 delta */
+        if (spent + mb > budget_mb) continue;                     /* keep going: a smaller one may still fit */
+        spent += mb;
+        promo.insert(r.second);
+    }
+    fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': %u entries, %zu with qerr, %zu promoted to int8 "
+                    "(qerr >= %.3f), %.2f of %.2f MiB budget spent\n",
+            path, n_read, rank.size(), promo.size(), (double) qmin, spent, budget_mb);
+    if (promo.empty())
+        fprintf(stderr, "[ORK PACK-PROMOTE] nothing promoted — every qerr is below --pack-qerr-min %.3f "
+                        "(worst is %.4f), or the budget is smaller than the cheapest candidate\n",
+                (double) qmin, (double) rank.front().first);
+    return promo;
+}
+
 static bool ork_i4_force_i8(const char * name) {
     static const char * spec = g_pack_cfg.promote_list ? g_pack_cfg.promote_list : getenv("ORK_I4_INT8_LAYERS");
     if (g_pack_cfg_set && !g_pack_cfg.mixed) return false;         // pure int4: explicit opt-out
-    if (!spec || !*spec || !name) return false;
-    const size_t nlen = strlen(name);
-    for (const char * p = spec; *p; ) {
-        const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
-        const size_t l = (size_t)(e - p);
-        if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
-            if (!strncmp(name + i, p, l)) return true;
-        p = (*e == ',') ? e + 1 : e;
+    if (!name) return false;
+    if (spec && *spec) {                                           // clause 1: an explicit list is EXCLUSIVE
+        const size_t nlen = strlen(name);
+        for (const char * p = spec; *p; ) {
+            const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
+            const size_t l = (size_t)(e - p);
+            if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
+                if (!strncmp(name + i, p, l)) return true;
+            p = (*e == ',') ? e + 1 : e;
+        }
+        return false;
     }
-    return false;
+    const std::unordered_set<std::string> & promo = ork_qerr_promote_set();   // clause 2: qerr-ranked
+    return !promo.empty() && promo.count(name) != 0;                          // clause 3: else nothing
 }
 
 // Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —

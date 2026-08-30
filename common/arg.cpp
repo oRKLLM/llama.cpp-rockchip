@@ -2047,9 +2047,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // ---- .orkpack build configuration (ggml-ork) ----
     // The pack is the artifact these produce, so how it is built is a real user decision: the base tier,
     // and which weights are worth spending extra bytes on. Promotion is ranked by qerr — the measured
-    // per-weight quantisation error the pack itself records — so a MIXED build wants --pack-qerr-source
-    // pointing at an earlier pack of the same model. Without one the first build is uniform, and it is
-    // that build which records the qerr making the second informed.
+    // per-weight quantisation error the pack records — so a MIXED build wants --pack-qerr-source pointing
+    // at an earlier pack of the same model.
+    //
+    // qerr is NOT recorded by every build. It is written only by the GPTQ finalize pass (ORK_GPTQ, which
+    // ork_bench drives), because that is the only path holding the calibration Hessian the metric is
+    // weighted by. A plain uniform build records nothing, so pointing --pack-qerr-source at one yields an
+    // empty ranking and no promotion — the backend says so rather than failing silently. Producing qerr
+    // from an imatrix on ordinary int4 builds is oRKLLM/ork-driver#2.
     add_opt(common_arg(
         {"--pack-bits"}, "N",
         "orkpack base tier: 4 or 8 (default: backend's own, currently 4).\n"
@@ -2085,8 +2090,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--pack-qerr-source"}, "FNAME",
-        "a previously built .orkpack to rank qerr from; without it the build is uniform and merely\n"
-        "RECORDS the qerr that makes a later mixed build possible",
+        "a previously built .orkpack to rank qerr from. That pack must carry qerr, which today means it\n"
+        "was built under ORK_GPTQ (an ordinary build records none); the backend reports what it read,\n"
+        "promoted and spent, so an empty ranking is visible rather than silent",
         [](common_params & params, const std::string & value) {
             params.ork_pack_qerr_src = value;
         }
