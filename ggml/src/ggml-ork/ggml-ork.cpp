@@ -378,6 +378,15 @@ static uint32_t ork_forced_qb(void) {
     const char * q = getenv("ORK_QUANT");
     return (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;
 }
+/* The forced tier as 4 / 8, or 0 when nothing forces one. EVERY tier decision goes through this — the
+ * signature, the pack-staleness check, ctx->qbits, and the two supports_op gates. #3 routed only two of
+ * them and #4 was the result: --pack-bits stamped a pack int4 while the weights were still written int8,
+ * because ctx->qbits read the environment directly. A tier decided in six places needs one function, not
+ * a fix per place. */
+static int ork_forced_qbits(void) {
+    const uint32_t qb = ork_forced_qb();
+    return qb == (uint32_t) '4' ? 4 : qb == (uint32_t) '8' ? 8 : 0;
+}
 
 /* Which weights get promoted to int8 at BUILD time. Precedence: an explicit list, else the qerr-ranked
  * policy over a source pack, else nothing (a first, uniform build — which is what RECORDS the qerr that
@@ -572,8 +581,8 @@ static bool ork_sig_compatible(uint32_t sig) {
      * scored 6795 instead of erroring. The rotation state needs a check on the REFUSE path (like the
      * pack-miss guard), not on the staleness path. Until then ORK_I4_NOROT is build/run-must-match by
      * convention, and mismatching it yields garbage (measured: PPL 7,059,519). */
-    const char * q = getenv("ORK_QUANT");
-    if (q && *q) return ork_sig_qbits(sig) == ((q[0] == '4') ? 4 : 8);
+    const int fq = ork_forced_qbits();
+    if (fq) return ork_sig_qbits(sig) == fq;
     return true;
 }
 
@@ -9020,13 +9029,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
               if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-GMAX] loaded %zu-layer gmax profile from %s\n", ctx->gmax_loaded.size(), sp.c_str()); } } }
     // Weight tier. The .orkpack is the normal source of truth: ork_persist_init (above) decoded the tier the
     // pack was BUILT at into persist_qbits, so loading an int4 pack selects the int4 path with nothing set.
-    // ORK_QUANT stays as a DEVELOPMENT OVERRIDE — it forces the tier for a run with no pack yet (the build
-    // pass that CREATES an int4 pack) or to deliberately rebuild at a different tier. With no pack and no
-    // override the default is W8A8.
-    const char * q = getenv("ORK_QUANT");
-    ctx->qbits = (q && *q)         ? ((q[0] == '4') ? 4 : 8)
-               : ctx->persist_qbits ? ctx->persist_qbits
-                                    : 8;
+    // --pack-bits (else ORK_QUANT, the older development spelling) FORCES the tier for a run with no pack
+    // yet (the build pass that CREATES an int4 pack) or to deliberately rebuild at a different tier. With
+    // no pack and no override the default is W8A8. Both spellings arrive via ork_forced_qbits so this
+    // agrees with the signature stamped into the pack — they disagreed, and that was #4.
+    const int fq = ork_forced_qbits();          /* --pack-bits, else ORK_QUANT; 0 = neither */
+    ctx->qbits = fq                    ? fq
+               : ctx->persist_qbits    ? ctx->persist_qbits
+                                       : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
@@ -9598,7 +9608,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // ACCEPTS the sub-5-bit tensors and runs them native-W4A4 (per-tensor dispatch in graph_compute),
             // keeping the >4-bit tensors on W8A8 — the mixed-precision q4 NPU path.
             {
-                static const int i4_env = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
+                static const int i4_env = (ork_forced_qbits() == 4
                     || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
                 // Read the ctx live rather than folding it into the static: supports_op can be reached
                 // before backend init has published g_ork_ctx, and a cached 0 would stick for the run.
@@ -9628,7 +9638,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
             static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
-            int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4') ? 4 : 8);
+            int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : (ork_forced_qbits() == 4 ? 4 : 8);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
             const char * name_src = src0->name;
             bool is_expert = ork_is_expert(name_src);
