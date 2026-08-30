@@ -8546,6 +8546,28 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             }
                         }
                     }
+                    // STUB SAFETY: group fusion builds ONE fused weight, and on a read pass it either loads a
+                    // fused ".. #grpNxM" entry from the pack or falls back to BUILDING it from the members'
+                    // src[0]->data. On a stub gguf those bytes are file holes that read as zeros, so a missing
+                    // fused entry silently yields an all-zero weight and a subtly wrong model — greedy decoding
+                    // still looks perfect because only the distribution flattens. This is the M>1 twin of the
+                    // hole-leak ork_stub_verify already guards at M==1; that comment even notes perplexity does
+                    // not catch it. The members ARE in the pack individually, so decline the fusion and let each
+                    // node take the single mul_mat path, which resolves from the pack. Non-stub sources and packs
+                    // that do contain the fused entry are untouched, so this costs nothing in the normal case.
+                    if (ng >= 2 && ctx->source_is_stub && ctx->persist_mode == 1) {
+                        int _Ntot = 0; for (int z = 0; z < ng; z++) _Ntot += (int) grp[z]->src[0]->ne[1];
+                        char _gname[256];
+                        snprintf(_gname, sizeof _gname, "%s#grp%dx%d", grp[0]->src[0]->name, ng, _Ntot);
+                        if (!ctx->persist_idx.count(_gname)) {
+                            static std::unordered_set<std::string> _said;
+                            if (_said.insert(_gname).second)
+                                fprintf(stderr, "[ORK STUB] no fused pack entry '%s' and the source is a STUB — "
+                                                "declining group fusion so the members resolve from the pack "
+                                                "(building it from src->data would read holes as zeros)\n", _gname);
+                            ng = 1;   // fall through to the single-node path, which pack-loads each member
+                        }
+                    }
                     if (ng >= 2) {
                         for (int z = 0; z < ng; z++) ork_route_stat(grp_tier == 4 ? "group_i4" : "group_i8");
                         bool grp_ok = (grp_tier == 4) ? ggml_backend_ork_mul_mat_group_i4(ctx, grp, ng)
