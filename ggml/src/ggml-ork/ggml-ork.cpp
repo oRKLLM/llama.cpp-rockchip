@@ -437,6 +437,22 @@ static int ork_promote_tier(void) {
 }
 static bool ork_promote_rotated(void) { const int t = ork_promote_tier(); return t == 0 || t == 3; }
 
+/* What promoting ONE weight from int4 to int8 actually costs the .orkpack, in MiB.
+ *
+ * The blob doubles (K*N/2 -> K*N, so +K*N/2), and that is the whole story ONLY outside the Bf envelope.
+ * An int8 entry inside it ALSO carries a full-K Bf sidecar (ork_i8_w_dump_bf_cpu, K%512==0 && K<=4096)
+ * that the int4 form never has, worth another K*N — so the true cost there is 3x the blob delta, not 1x.
+ * Counting only the delta let a 32 MiB budget spend 36 MiB, measured: five ffn_down (K=6144, outside the
+ * envelope) plus one attn_output (K=2048, inside it) came to 32.00 MiB budgeted and 36.00 MiB on disk.
+ *
+ * ONE function, used by both the budget and ORK_PACK_RANK's printed cost, so what the ranking quotes and
+ * what the policy spends cannot drift — the same reason ork_forced_qb exists. */
+static double ork_promote_cost_mb(uint32_t K, uint32_t N) {
+    const double blob_delta = (double) K * N / 2.0;                    /* int4 -> int8 */
+    const double bf         = (K % 512u == 0 && K <= 4096u) ? (double) K * N : 0.0;   /* Bf sidecar */
+    return (blob_delta + bf) / 1048576.0;
+}
+
 /* THE QERR-RANKED PROMOTION SET — the middle clause of the precedence documented above, which was
  * described there long before it existed (oRKLLM/llama.cpp-rockchip#1: --pack-qerr-source, --pack-budget
  * and --pack-qerr-min parsed, echoed, and then read by nothing).
@@ -511,7 +527,7 @@ static const std::unordered_set<std::string> & ork_qerr_promote_set(void) {
     for (const auto & r : rank) {
         if (r.first < qmin) continue;                             /* below the floor: not worth its bytes */
         const orkpack_entry & e = ent.at(r.second);
-        const double mb = (double) e.K * e.N / 2.0 / 1048576.0;   /* int4 -> int8 delta */
+        const double mb = ork_promote_cost_mb(e.K, e.N);          /* blob delta + Bf sidecar where it applies */
         if (spent + mb > budget_mb) continue;                     /* keep going: a smaller one may still fit */
         spent += mb;
         promo.insert(r.second);
@@ -1345,7 +1361,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                         double cum = 0;
                         for (size_t i = 0; i < rank.size() && i < 20; i++) {
                             const orkpack_entry & e2 = ctx->persist_idx[rank[i].second];
-                            const double mb = (double) e2.K * e2.N / 2.0 / 1048576.0;   /* int4 -> int8 delta */
+                            const double mb = ork_promote_cost_mb(e2.K, e2.N);   /* blob delta + Bf where it applies */
                             cum += mb;
                             fprintf(stderr, "[ORK PACK-RANK] %2zu  qerr=%.4f  %-34s K=%-5u N=%-5u  +%.2f MiB (cum %.2f)\n",
                                     i+1, rank[i].first, rank[i].second.c_str(), e2.K, e2.N, mb, cum);
