@@ -1700,12 +1700,21 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
         size_t tb = ork_i4a8_pack_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, nullptr, 0);
         if (tb) {
             std::vector<char> tmp(tb);
-            ork_i4a8_pack_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, tmp.data(), tb);
-            orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+            /* RECORD the quantisation error while the packer still has both w and the codes in hand. Same
+             * blob either way (the _qerr form is byte-identical), and the same metric the GPTQ path stores:
+             * sqrt(SUM imp*(w-q)^2 / SUM imp*w^2), imp = the imatrix when supplied. That matters because the
+             * two must be COMPARABLE — imatrix importance is in_sum2[k]/counts and diag(H)[k] is SUM a_k^2,
+             * the same quantity up to a scale factor, and ranking is scale-invariant. Without this, qerr was
+             * written only by ORK_GPTQ finalize, so an ordinary build recorded 0 for every entry and
+             * --pack-qerr-source had nothing to rank (#2). */
+            float qerr = 0.0f;
+            ork_i4a8_pack_cpu_blob_qerr(ctx->npu, K, N, f32_plane, im, nf4, tmp.data(), tb, &qerr);
+            orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0; e.qerr = qerr;
             e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
             fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
             ctx->persist_built.emplace_back(std::string(name), e);
-            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B)\n", name, K, N, tb);
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B) qerr=%.4f%s\n",
+                                               name, K, N, tb, (double) qerr, im ? "" : " (unweighted: no imatrix)");
             return;
         }
         // CPU int4 pack failed → fall through to int8 (never persist a broken entry)
