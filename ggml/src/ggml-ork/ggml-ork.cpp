@@ -74,7 +74,7 @@
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
 //   (QKV/gate-up group fusion is DEFAULT-ON for M>=2 (ORK_FUSE_MINM): +11% @M2 .. +17% @M64, bit-exact,
-//    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
+//    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE_MINM moves the floor.)
 //   ORK_QUANT=4          int4 tier — a BUILD-TIME override, not a run-time mode. Set it for the run that CREATES
 //                        the .orkpack; afterwards the pack is self-describing (its footer records the tier) and
 //                        loading it selects int4 on its own, so steady-state runs need nothing set. Also use it
@@ -660,6 +660,28 @@ struct ork_weight {
     uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
     bool     is_expert = false;   // MoE STREAM: a routed-expert slice (evicted by ork_wcache_evict_experts; dense stays)
 };
+
+/* Does a cached weight have the geometry the caller is about to use it with?
+ *
+ * The wcache is keyed by the SOURCE TENSOR'S DATA POINTER, and a fused group weight is stored under its
+ * FIRST MEMBER'S pointer. So one key legitimately names two different weights: the per-tensor one the
+ * unfused path wants (decode, M<32) and the K x Ntot concatenation the group path wants (prefill).
+ * Nothing checked, so whichever route populated the entry first won, and the other silently computed
+ * against the wrong shape -- the matmul then wrote nothing and the zeros propagated to constant logits
+ * (ork-driver#4). A mismatch is a MISS, not a hit: the caller rebuilds the weight it actually needs.
+ * Cheap: two ints from the driver, once per matmul, against work measured in millions of MACs. */
+static bool ork_wcache_shape_ok(const ork_weight & ow, int K, int N) {
+    if (!ow.w) return false;
+    int wk = 0, wn = 0;
+    ork_w_dims(ow.w, &wk, &wn);
+    if (wk == K && wn == N) return true;
+    if (getenv("ORK_VERBOSE")) {
+        static int warned = 0;
+        if (warned++ < 8) fprintf(stderr, "[ork] wcache SHAPE MISMATCH: cached %dx%d, caller wants %dx%d — rebuilding\n", wk, wn, K, N);
+    }
+    return false;
+}
+
 
 // One reusable slot in the MoE expert pool: a packed weight whose DMA buffer is reused (repack-in-place)
 // across different experts of the SAME shape, so the NPU IOMMU isn't churned/fragmented by alloc+free.
@@ -2467,6 +2489,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     const double _r0 = ctx->profile ? ork_now_us_e() : 0;
     const char * x = (const char *) src0->data + (expert >= 0 ? (size_t) expert * src0->nb[2] : 0);   // MoE: per-expert slice key
     auto it = ctx->wcache.find(x);
+    /* The OTHER direction of the fused/per-tensor key collision: a prefill group stored its K x Ntot
+     * concatenation under this same pointer, and the unfused path (decode) must not run against it.
+     * Rebuild rather than trust the key. See ork_wcache_shape_ok. */
+    if (it != ctx->wcache.end() && expert < 0 && !ork_wcache_shape_ok(it->second, K, N)) {
+        ctx->wcache_bytes -= it->second.bytes;
+        ork_w_free(it->second.w);
+        ctx->wcache.erase(it);
+        it = ctx->wcache.end();
+    }
     if (it != ctx->wcache.end()) {
         if (ctx->spool && it->second.se && !ork_stream_entry_mapped(it->second.se)) {
             // STREAM-POOL hit, but IOVA-unmapped (evicted from the hot tier): re-map (cheap, ~170us;
@@ -4205,6 +4236,14 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
     const void * key = g[0]->src[0]->data;
     auto it = ctx->wcache.find(key);
+    /* A hit under this key may be the PER-TENSOR weight (preload, or an earlier unfused decode), which is
+     * not what this path is about to run. Drop it and rebuild the concatenation. See ork_wcache_shape_ok. */
+    if (it != ctx->wcache.end() && !ork_wcache_shape_ok(it->second, K, Ntot)) {
+        ctx->wcache_bytes -= it->second.bytes;
+        ork_w_free(it->second.w);
+        ctx->wcache.erase(it);
+        it = ctx->wcache.end();
+    }
     if (it == ctx->wcache.end()) {                       // load-or-(build+pack)+persist the fused weight once
         ork_weight ow; ow.bscale.resize(Ntot);
         // Synthetic name for the FUSED (concatenated) group weight — stable across runs (grouping is
@@ -8394,10 +8433,68 @@ extern "C" int ggml_backend_ork_preload(void) {
         return strcmp(a->name, b->name) < 0;
     });
 
-    int n_ok = 0, n_fail = 0;
+    /* FUSION-AWARE: resolve what the OP PATH will ask for, not what the registry lists.
+     *
+     * The int8 op path concatenates same-input matmuls into one K x Ntot group weight and caches it under
+     * its FIRST MEMBER'S data pointer. Preloading that member per-tensor therefore populated the group's
+     * key with the wrong shape, and the group path used it -- silently, until the shape check above.
+     * With the check, a per-tensor preload of a fusible weight is merely WASTED (built, then discarded and
+     * rebuilt at first prefill), which throws away the residency preload exists to provide.
+     *
+     * The pack already records the grouping: the group path persists each fused weight under the synthetic
+     * name "<first-member>#grp<ng>x<Ntot>". So in READ mode the grouping is knowable BEFORE any graph runs
+     * -- map first-member name -> fused N, and preload the fused geometry under that member's pointer.
+     * Both routes then agree by construction, and the shape check stays as the backstop that made the
+     * disagreement visible in the first place. */
+    std::unordered_map<std::string, int> fused_n;      /* first-member name -> fused Ntot */
+    for (const auto & pe : ctx->persist_idx) {
+        const std::string & nm = pe.first;
+        const size_t h = nm.find("#grp");
+        if (h == std::string::npos) continue;
+        const size_t x = nm.find('x', h + 4);
+        if (x == std::string::npos) continue;
+        const int ntot = atoi(nm.c_str() + x + 1);
+        if (ntot > 0) fused_n[nm.substr(0, h)] = ntot;
+    }
+    if (!fused_n.empty()) fprintf(stderr, "[ork READY] %zu fused group weight(s) in the pack — preloading the CONCATENATED geometry\n", fused_n.size());
+
+    int n_ok = 0, n_fail = 0, n_fused = 0, n_skip = 0;
     for (const struct ggml_tensor * w : order) {
         const int K = (int) w->ne[0], N = (int) w->ne[1];
         if (ctx->wcache.count(w->data)) { n_ok++; continue; }          /* already resident */
+        /* This weight is a group's first member: preload the FUSED entry under its pointer instead. */
+        auto fit = fused_n.find(w->name);
+        if (fit != fused_n.end()) {
+            char gname[256];
+            snprintf(gname, sizeof gname, "%s#grp", w->name);
+            std::string want;                                   /* find the full synthetic name again */
+            for (const auto & pe : ctx->persist_idx)
+                if (pe.first.compare(0, strlen(gname), gname) == 0) { want = pe.first; break; }
+            auto pg = want.empty() ? ctx->persist_idx.end() : ctx->persist_idx.find(want);
+            if (pg != ctx->persist_idx.end() && pg->second.dtype == ORKPACK_DT_I8) {
+                const orkpack_entry & e = pg->second;
+                const char * blob = (const char *) ctx->persist_map + e.blob_off;
+                ork_weight ow;
+                int _dom = ork_weight_domain(ctx, (size_t) e.K * e.N, ork_layer_of(w->name));
+                ork_npu_set_pack_domain(ctx->npu, _dom);
+                for (;;) {
+                    ow.w = ork_i8_mm_load_import(ctx->npu, (int) e.K, (int) e.N, blob, e.blob_size);
+                    if (!ow.w) ow.w = ork_i8_mm_load(ctx->npu, (int) e.K, (int) e.N, blob, e.blob_size);
+                    if (ow.w || (_dom = ork_domain_advance(ctx)) < 0) break;
+                }
+                if (ow.w) {
+                    const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                    ow.bscale.assign(bs, bs + e.bscale_n);
+                    ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+                    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
+                    ctx->wcache.emplace(w->data, std::move(ow));
+                    n_ok++; n_fused++; continue;
+                }
+            }
+            /* Could not preload the fused form: leave the key EMPTY rather than fill it with the
+             * per-tensor weight the group path would have to throw away. */
+            n_skip++; continue;
+        }
         auto pit = ctx->persist_idx.find(w->name);
         if (pit == ctx->persist_idx.end()) { n_fail++; continue; }
         const uint32_t dt = pit->second.dtype;
@@ -8421,8 +8518,10 @@ extern "C" int ggml_backend_ork_preload(void) {
     }
     const double secs = (ork_now_us_e() - t0) / 1e6;
     size_t tot = 0; for (int d = 0; d < (ctx->n_domains > 0 ? ctx->n_domains : 1); d++) tot += ctx->domain_bytes[d];
-    fprintf(stderr, "[ork READY] preloaded %d/%zu pack-owned weights in %.1f s — %.2f GiB across %d domain(s)\n",
-            n_ok, order.size(), secs, tot / (1024.0*1024.0*1024.0), ctx->n_domains > 0 ? ctx->n_domains : 1);
+    fprintf(stderr, "[ork READY] preloaded %d/%zu pack-owned weights in %.1f s — %.2f GiB across %d domain(s)"
+                    " (%d fused-group, %d deferred to the op path)\n",
+            n_ok, order.size(), secs, tot / (1024.0*1024.0*1024.0), ctx->n_domains > 0 ? ctx->n_domains : 1,
+            n_fused, n_skip);
     /* A miss is not cosmetic: that weight loads lazily inside the caller's timed region, which is the whole
      * failure this pass removes. */
     if (n_fail) fprintf(stderr, "[ork READY] WARNING: %d weights did not preload — they will load lazily "
@@ -8520,8 +8619,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // DECODE tg32 7.00->7.02 (neutral). It only pays off with enough work to amortize the wider
     // matmul+scatter: at M=1 decode that cost exceeds the saved submits (prior measurement: decode
     // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
-    // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
-    const bool fuse_force = getenv("ORK_FUSE") != nullptr;
+    // Default-ON for prefill; ORK_NO_FUSE disables entirely. (ORK_FUSE, which forced fusion at ALL M, is
+    // gone: it only bypassed the fuse_minm floor, which ORK_FUSE_MINM=1 already does, and the one thing it
+    // uniquely enabled -- fusing decode M=1 -- is measured WORSE (tg 9.4 -> 6.4). Two knobs for one job,
+    // the redundant one wired to a known-bad config.)
     // orkd: group fusion is daemon-routed — it packs a CONCATENATED weight via ork_i8_mm_pack and runs it as
     // ONE ork_i8_mm_run (host A/C), so it works through the daemon AND amortizes the per-matmul submit floor
     // (q/k/v, gate/up -> 1 submit). Enabled under orkd.
@@ -8664,7 +8765,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // autoregressive tg-decode REGRESSES (prior: 9.4->6.4), so the floor is M>=2 (decode M=1 stays
                     // unfused). Covers all prefill + DFlash's M=block batched-verify. ORK_FUSE_MINM overrides.
                     static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 2;
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= fuse_minm)) {
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] >= fuse_minm) {
                         if (scan_ahead) {
                             // Step 1: scan the WHOLE remaining subgraph for INDEPENDENT same-input matmuls,
                             // skipping past the movable ops (RoPE/reshape/norm) that interleave q/k/v in graph
