@@ -586,18 +586,60 @@ static bool ork_sig_compatible(uint32_t sig) {
     return true;
 }
 
+// Is [p, p+n) inside a FILE-BACKED mapping? This is the safety precondition for evicting it below, and it
+// is a property of the CALLER's mapping, so it is measured rather than declared: llama.cpp mmaps the GGUF
+// by default (file-backed) but --no-mmap allocates anonymous memory, and the two respond to MADV_DONTNEED
+// in opposite ways -- drop-and-refault vs ZERO-FILL.
+//
+// Single-entry range cache: weights are packed sequentially out of one GGUF mapping, so after the first
+// lookup every subsequent weight hits the cached VMA and /proc/self/maps is not re-read. A miss (a second
+// mapping, or a model reload) just re-reads it. Unreadable /proc, or an address in no mapping we can
+// prove is file-backed, answers NO -- the failure mode of a wrong YES is silent data loss, so the
+// unprovable case must not evict.
+static bool ork_src_file_backed(const void * p, size_t n) {
+    static uintptr_t c_lo = 0, c_hi = 0;
+    const uintptr_t a = (uintptr_t) p, e = a + n;
+
+    if (c_hi && a >= c_lo && e <= c_hi) return true;
+
+    FILE * f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    char line[1024];
+    bool ok = false;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo = 0, hi = 0;
+        int poff = 0;
+        // address perms offset dev inode pathname
+        if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %n", &lo, &hi, &poff) < 2) continue;
+        if (a < lo || e > hi) continue;
+        const char * path = (poff > 0) ? line + poff : "";
+        while (*path == ' ') path++;
+        // A pathname that is neither empty nor a pseudo-file ("[heap]", "[stack]", "[vvar]") means the
+        // pages are clean and file-backed, so DONTNEED drops them and a later touch re-faults from disk.
+        if (*path && *path != '\n' && *path != '[') { c_lo = lo; c_hi = hi; ok = true; }
+        break;
+    }
+    fclose(f);
+    return ok;
+}
+
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
 // Evicting those mmap'd pages keeps the source's RSS shrinking as packed RSS grows (peak ~max(src,packed)
-// not src+packed). Page-aligned MADV_DONTNEED drops only clean, file-backed pages (re-faulted on demand);
-// opt-in via ORK_EVICT_SRC because with --no-mmap the mapping is anonymous and DONTNEED would zero data.
+// not src+packed), and a page that is touched again simply re-faults from the file.
+//
+// This used to be opt-in behind ORK_EVICT_SRC, because under --no-mmap the mapping is anonymous and
+// MADV_DONTNEED zero-fills instead of dropping -- i.e. it would silently destroy the weights. That made
+// correctness depend on the operator knowing an interaction between two flags in different layers. The
+// precondition is now MEASURED per range (ork_src_file_backed) and the knob is gone: safe cases get the
+// relief automatically, unsafe ones are skipped whether or not anyone remembered.
 static void ork_evict_src(const void * p, size_t n) {
-    static int on = -1;
-    if (on < 0) on = getenv("ORK_EVICT_SRC") ? 1 : 0;
-    if (!on || !p || !n) return;
+    if (!p || !n) return;
     uintptr_t a = (uintptr_t) p, end = a + n;
     uintptr_t pa = (a + 4095u) & ~(uintptr_t) 4095u;
     uintptr_t pe = end & ~(uintptr_t) 4095u;
-    if (pe > pa) madvise((void *) pa, (size_t) (pe - pa), MADV_DONTNEED);
+    if (pe <= pa) return;
+    if (!ork_src_file_backed(p, n)) return;   // anonymous (--no-mmap): DONTNEED would ZERO it
+    madvise((void *) pa, (size_t) (pe - pa), MADV_DONTNEED);
 }
 
 struct ggml_backend_ork_context;   // fwd
