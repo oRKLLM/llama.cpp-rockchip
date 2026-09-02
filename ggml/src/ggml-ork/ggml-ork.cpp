@@ -135,6 +135,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <map>
 #include <algorithm>
 #include <cstring>
+#include <sys/utsname.h>   // orkpack calibration provenance (kernel identity)
 #include <cstdlib>   // LEVER3: atexit
 #include <cmath>
 #include <ctime>
@@ -206,7 +207,8 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 6u   // v6 = the 2026-08-24 format: dtype-tagged entries (incl. DT_I4_ROT_A8) plus
+#define ORKPACK_VERSION 7u   // v7 = adds the optional M-threshold calibration block (see orkpack_calib)
+                             // v6 = the 2026-08-24 format: dtype-tagged entries (incl. DT_I4_ROT_A8) plus
                              // an embedded GGUF metadata section. v7/v8 were EXPERIMENTAL and never left
                              // this workstation (no remote contains them), so they are collapsed back into
                              // a single public increment rather than publishing two throwaway versions.
@@ -262,7 +264,65 @@ struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_
 //               them, so a stored quant_sig != this run's => wrong precision, file rejected + regenerated. The .q4/.q8
 //               filename is only a convenience so both can coexist on disk; THIS field is the authoritative guard.
 // magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
-struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig; char magic[8]; };
+/* OPTIONAL M-THRESHOLD CALIBRATION (v7). The CPU/NPU routing threshold is where the NPU's fixed submit
+ * floor stops dominating; the built-in default is measured, but on one board with one model.
+ *
+ * It is NOT produced here. A per-shape microbenchmark at pack time was tried and does not predict it: the
+ * dominant cost at small M is graph-level, not per-node -- declining every node yields 1 graph split,
+ * accepting yields 133, and those backend boundaries are invisible to a single-matmul harness (its
+ * thresholds regressed M<=8 by up to 1.52x). Only a real forward pass measures the real quantity, and only
+ * a caller can run one, so the producer is the ork_calibrate tool via ggml_backend_ork_write_calib().
+ *
+ * PROVENANCE IS PART OF THE RECORD. A pack is portable and long-lived while the measurement is only valid
+ * for the machine it was taken on -- raising this board's A76s 2304->2400 MHz silently invalidated every
+ * earlier calibration. On load the stamp is compared against the live machine and a mismatch DISCARDS the
+ * value, making the block a self-invalidating cache rather than an assertion about the world. */
+struct orkpack_calib_hdr {
+    uint32_t cpu_max_khz;    // big-core cpuinfo_max_freq (kHz) -- moves with DTB/OPP changes and governors
+    uint32_t n_big;          // big-core count
+    uint32_t ork_fmt;        // ork-driver pack-format token at calibration time
+    uint32_t flags;          // bit0: all big-core governors were "performance"
+    uint64_t kernel_hash;    // FNV-64 of uname release+version: a kernel change can move the submit floor
+};
+struct orkpack_calib { uint32_t K, N, min_m, _pad; };   // K=N=0 => one global threshold for every shape
+
+// magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
+struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig;
+                        uint64_t calib_off; uint32_t calib_n; uint32_t calib_pad; char magic[8]; };
+
+static void ork_calib_provenance(orkpack_calib_hdr * h) {
+    memset(h, 0, sizeof *h);
+    long best = 0; int nbig = 0, all_perf = 1;
+    for (int c = 0; c < 64; c++) {
+        char pth[128]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE * f = fopen(pth, "r"); if (!f) continue;
+        long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f);
+        if (v > best) { best = v; nbig = 0; }
+        if (v == best && v > 0) {
+            nbig++;
+            snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", c);
+            FILE * g = fopen(pth, "r");
+            if (g) { char buf[32] = {0}; if (fgets(buf, sizeof buf, g) && strncmp(buf, "performance", 11) != 0) all_perf = 0; fclose(g); }
+            else all_perf = 0;
+        }
+    }
+    h->cpu_max_khz = (uint32_t) best; h->n_big = (uint32_t) nbig;
+    h->ork_fmt = ork_pack_format_version(); h->flags = all_perf ? 1u : 0u;
+    struct utsname un; uint64_t k = 1469598103934665603ULL;
+    if (uname(&un) == 0) {
+        for (const char * q = un.release; *q; q++) { k ^= (unsigned char) *q; k *= 1099511628211ULL; }
+        for (const char * q = un.version; *q; q++) { k ^= (unsigned char) *q; k *= 1099511628211ULL; }
+    }
+    h->kernel_hash = k;
+}
+
+/* Field-by-field on purpose: a near-miss is still a miss, because each of these moves the ratio and none
+ * is interpolatable. */
+static bool ork_calib_valid_here(const orkpack_calib_hdr * st) {
+    orkpack_calib_hdr now; ork_calib_provenance(&now);
+    return st->cpu_max_khz == now.cpu_max_khz && st->n_big == now.n_big && st->ork_fmt == now.ork_fmt &&
+           st->flags == now.flags && st->kernel_hash == now.kernel_hash;
+}
 
 // Build-config precision signature stored in the footer (see above). Env-derived so the standalone validity check
 // (pre-init, no ctx) and the write path compute it identically. Encodes the knobs that change PACKED CONTENT:
@@ -354,6 +414,36 @@ static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? at
  * promoting a weight is not worth its bytes. */
 static ggml_backend_ork_pack_config g_pack_cfg = { 0, true, nullptr, nullptr, 8.0f, 0.05f };
 static bool g_pack_cfg_set = false;
+
+/* Caller-forced routing threshold for one measurement pass; <=0 restores normal selection. Exists because
+ * ORK_MINM is read into a static on first use, so an env var cannot be flipped between passes of one run --
+ * which is exactly what a sweep must do. */
+static int g_min_m_override = -1;
+extern "C" void ggml_backend_ork_set_min_m(int m) { g_min_m_override = m; }
+
+/* Store an end-to-end measured threshold into an existing pack as ONE global record (K=N=0), stamped with
+ * this machine's state. Deliberately not per-shape: an end-to-end run cannot attribute its time to a single
+ * (K,N), and recording per-shape values it did not measure would be a lie in the file format. */
+extern "C" bool ggml_backend_ork_write_calib(const char * pack_path, int min_m) {
+    if (!pack_path || min_m <= 0) return false;
+    FILE * f = fopen(pack_path, "r+b");
+    if (!f) { fprintf(stderr, "[ORK CALIB] cannot open %s\n", pack_path); return false; }
+    orkpack_footer ft;
+    if (fseek(f, -(long) sizeof ft, SEEK_END) != 0 || fread(&ft, sizeof ft, 1, f) != 1 ||
+        memcmp(ft.magic, ORKPACK_MAGIC, 8) != 0) {
+        fprintf(stderr, "[ORK CALIB] %s is not a pack\n", pack_path); fclose(f); return false; }
+    if (fseek(f, -(long) sizeof ft, SEEK_END) != 0) { fclose(f); return false; }
+    const long at = ftell(f);                       // overwrite the old footer: block, then new footer
+    orkpack_calib_hdr h; ork_calib_provenance(&h);
+    orkpack_calib r; r.K = 0; r.N = 0; r.min_m = (uint32_t) min_m; r._pad = 0;
+    if (fwrite(&h, sizeof h, 1, f) != 1 || fwrite(&r, sizeof r, 1, f) != 1) { fclose(f); return false; }
+    ft.calib_off = (uint64_t) at; ft.calib_n = 1;
+    if (fwrite(&ft, sizeof ft, 1, f) != 1) { fclose(f); return false; }
+    fclose(f);
+    fprintf(stderr, "[ORK CALIB] wrote global threshold M>=%d into %s (cpu_max=%u kHz, %u big cores)\n",
+            min_m, pack_path, h.cpu_max_khz, h.n_big);
+    return true;
+}
 
 extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pack_config * cfg) {
     if (!cfg) return;
@@ -880,6 +970,8 @@ struct ggml_backend_ork_context {
     // baking it in would mean one artifact per memory configuration. The pack stays portable; the PLAN is
     // derived locally and is a pure function of (index, hardware), so it is identical run to run.
     std::unordered_map<std::string, int> placement;
+    std::unordered_map<uint64_t, uint32_t> calib_minm;   // (K<<32|N) -> measured threshold (unused today)
+    int calib_global = 0;                                // end-to-end measured threshold, 0 = none/stale
     uint64_t pack_meta_off = 0, pack_meta_size = 0;   // v6 embedded GGUF metadata section (0 = absent)
     // The model file's packed tensors are HOLES -> ork must serve them on every path. Set from
     // ORK_SOURCE_IS_STUB (the caller knows: it passed a .orkpack and used the extracted gguf) because
@@ -1396,6 +1488,26 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                     memcpy(&meta_off, idx, 8);  idx += 8;
                     memcpy(&meta_size, idx, 8); idx += 8;
                     ctx->pack_meta_off = meta_off; ctx->pack_meta_size = meta_size;
+                    /* Adopt a stored threshold only if the machine still matches. Discarding is silent-safe:
+                     * dispatch falls back to the built-in default. */
+                    if (f.calib_n && f.calib_off && f.calib_off + sizeof(orkpack_calib_hdr) <= (uint64_t) sz) {
+                        orkpack_calib_hdr ch; memcpy(&ch, (const char *) m + f.calib_off, sizeof ch);
+                        const uint64_t need = f.calib_off + sizeof ch + (uint64_t) f.calib_n * sizeof(orkpack_calib);
+                        if (need <= (uint64_t) sz && ork_calib_valid_here(&ch)) {
+                            const char * cp = (const char *) m + f.calib_off + sizeof ch;
+                            for (uint32_t i = 0; i < f.calib_n; i++) {
+                                orkpack_calib r; memcpy(&r, cp, sizeof r); cp += sizeof r;
+                                if (r.K == 0 && r.N == 0) ctx->calib_global = (int) r.min_m;
+                                else ctx->calib_minm[((uint64_t) r.K << 32) | r.N] = r.min_m;
+                            }
+                            fprintf(stderr, "[ORK CALIB] using measured threshold M>=%d from the pack\n", ctx->calib_global);
+                        } else if (need <= (uint64_t) sz) {
+                            orkpack_calib_hdr now; ork_calib_provenance(&now);
+                            fprintf(stderr, "[ORK CALIB] pack was calibrated on a DIFFERENT machine "
+                                            "(cpu_max %u vs %u kHz, %u vs %u big cores) — ignoring it\n",
+                                    ch.cpu_max_khz, now.cpu_max_khz, ch.n_big, now.n_big);
+                        }
+                    }
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
                         std::string name(idx, nl); idx += nl;
@@ -2447,6 +2559,7 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
         fwrite(&kv.second, sizeof(orkpack_entry), 1, ctx->persist_out);
     }
     orkpack_footer f; memset(&f, 0, sizeof f);
+    f.calib_off = 0; f.calib_n = 0;   // producer is the ork_calibrate tool, written in afterwards
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
     f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
     f.quant_sig = ork_build_sig();           // stamp the build-config precision signature (authoritative on read)
@@ -9780,7 +9893,16 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // opposite: M>1 amortizes the floor over many rows, so NPU wins (39.6 vs 13.6 tok/s).
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
-            static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
+            /* DEFAULT 8, MEASURED end-to-end. The old 32 was inherited and never re-derived; an ork_ppl
+             * sweep puts the crossover between M=4 and M=8 on BOTH tiers (int8 1.22x/1.05x at M=4/8,
+             * int4 1.13x/1.21x), so 32 forced M in [8,31] onto the CPU and gave up 1.05-1.64x there. 32 was
+             * also, unluckily, the single worst M for the NPU in that sweep. Precedence: an explicit
+             * override (a sweep in progress) > ORK_MINM > a pack's measured value > this default. */
+            static const char * minm_env = getenv("ORK_MINM");
+            int min_m = 8;
+            if (g_min_m_override > 0)      min_m = g_min_m_override;
+            else if (minm_env)             min_m = atoi(minm_env);
+            else if (g_ork_ctx && g_ork_ctx->calib_global > 0) min_m = g_ork_ctx->calib_global;
             int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : (ork_forced_qbits() == 4 ? 4 : 8);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
             const char * name_src = src0->name;

@@ -108,5 +108,25 @@ GGML_BACKEND_API void                ggml_backend_ork_graph_compute_async(ggml_b
 GGML_BACKEND_API enum ggml_status    ggml_backend_ork_synchronize(ggml_backend_t backend);
 
 #ifdef  __cplusplus
+
+// ---- M-THRESHOLD CALIBRATION (opt-in) ----------------------------------------------------------
+// The CPU/NPU routing threshold is where the NPU's fixed submit floor stops dominating. The built-in
+// default (8) is MEASURED, but end-to-end and on one board: it moves with the model's shapes, the CPU
+// clocks, and the submit floor.
+//
+// It cannot be calibrated from inside the backend. A per-shape microbenchmark was tried and does NOT
+// predict it: timing one matmul in isolation misses the dominant cost at small M, which is graph-level --
+// declining every node yields 1 graph split, accepting yields 133, and those 132 backend boundaries and
+// their tensor copies are invisible to any single-matmul harness. Measured, that harness regressed M<=8 by
+// up to 1.52x. The only instrument that measures the real quantity is an end-to-end sweep, and only the
+// CALLER can run one, because only the caller controls the batch size.
+//
+// So the backend provides the two affordances a caller needs, and stays out of the policy:
+//   set_min_m()   force the threshold for one measurement pass (-1 restores the default/pack value)
+//   write_calib() store a measured threshold into an existing .orkpack, stamped with the machine state it
+//                 was taken under; it is ignored on load by any machine that no longer matches
+GGML_BACKEND_API void ggml_backend_ork_set_min_m(int m);
+GGML_BACKEND_API bool ggml_backend_ork_write_calib(const char * pack_path, int min_m);
 }
+
 #endif
