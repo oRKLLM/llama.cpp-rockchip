@@ -13,6 +13,15 @@ A clean, understandable history is vital for long-term project maintenance, debu
 * **Diverged History and Main Branch Structure:** All development and feature commits must go to the `diverged-history` branch to preserve granular commit history. The `master` branch must contain exactly two commits on top of the upstream repository: one commit for GitHub Actions changes, and one commit for all other changes. These two commits on `master` are to be squashed from the `diverged-history` branch from GitHub user `mafischer`.
 * **Push and Squash Protocol:** After committing to the `diverged-history` branch, you must always perform the squash activity onto the `master` branch (recreating the two-commit structure), and then push both branches (`diverged-history` and `master`) to the remote repository.
 * **Squash Mechanics (deletion-aware):** When recreating `master`'s two commits, the resulting `master` tree MUST be identical to `diverged-history` — verify with `git diff master diverged-history` (must produce no output) *before* pushing. Build the tree with a **deletion-aware** method: `git read-tree --reset -u diverged-history`, or `rm -rf <path> && git checkout diverged-history -- <path>`. **Never** use a plain `git checkout diverged-history -- <path>` on its own — it only adds/updates files and silently re-introduces files that `diverged-history` deleted (e.g. extraneous upstream `.github/workflows/`), violating the Upstream Workflows Restriction below.
+* **After a squash, you are on `master` — go back before committing anything.** Recreating master's two
+  commits leaves the working branch at `master`, and nothing warns you. Work committed there is orphaned by
+  the next `git checkout -B master-rebuild`, and because the following squash rebuilds master *from
+  `diverged-history`*, the commit vanishes from both branches while `git push origin diverged-history`
+  reports success (it pushes the unchanged ref). This has silently dropped work twice. Always
+  `git checkout diverged-history` before the next commit, and verify with
+  `git log --oneline -1 diverged-history` that your commit is actually on it — not merely that a push
+  succeeded. To recover an orphaned commit: `git log --oneline --all --source` will not show it, but the
+  SHA from your terminal scrollback still resolves — `git checkout diverged-history && git cherry-pick <sha>`.
 * **Upstream Workflows Restriction:** To avoid cluttering the actions UI and consuming redundant runner capacity, do not re-add upstream `.github/workflows/` files. Only our custom workflows (`build-rockchip.yml`, `auto-sync-controller.yml`, `tqp-release.yml`, and `rebuild-on-push.yml`) must exist in the repository on any branch. All other upstream workflow files must remain deleted.
 
 
