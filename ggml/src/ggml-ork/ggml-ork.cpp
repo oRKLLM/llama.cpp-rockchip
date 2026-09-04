@@ -498,7 +498,8 @@ static const ork_recipe ORK_RECIPES_BUILTIN[] = {
     { "rk3588", 28, 1536, 17920,  256, ORK_DECODE_CPU, 0,
       "qwen2.5-1.5b-instruct-q8_0: CPU 11.51 vs route2 11.48 tok/s — tie inside noise, default stands" },
     { "rk3588", 24, 1024,  3584,    0, ORK_DECODE_NPU, 0,
-      "qwen3.5-0.8b-bf16: NPU DECODE WINS — CPU 2.44 vs route1 3.13 tok/s (1.28x), reproducible to 0.4% "
+      "qwen3.5-0.8b-bf16: NPU DECODE WINS — CPU 2.44 vs route1 3.40 tok/s (1.40x after the doorbell "
+      "big-core fix; 1.28x before it), reproducible to 0.4% "
       "over 3 trials. route1 == route2 (3.13 both), so the win is M==1 acceptance alone and the fused FFN "
       "chain adds nothing — hence route 1, not 2. THE FIRST MODEL WHERE DECODE-ON-NPU PAYS: attn_kv=0 marks "
       "the GDN/linear-attention architecture, whose CPU decode baseline is unusually low, leaving headroom "
@@ -7110,6 +7111,14 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
     ok=true;
     if(fprof){ p_n++; if(p_n%64==0){ double T=p_q+p_gu+p_host+p_dn+p_deq; if(T<1)T=1;
         double gub=(double)2*K*Nff, dnb=(double)Nff*Kd;   // resident weight bytes streamed (int8)
+        /* DOORBELL PHASE SPLIT. The GB/s above is NOT pure DMA: a probe at the same shapes shows 62% of
+         * an M=1 call is host-side (regcmd synth + bsync + ioctl) and only 38% is the sentinel poll, i.e.
+         * ~19 GB/s of real hardware bandwidth already. So the handler's shortfall has to show up as
+         * either a bigger `begin` (host) or a bigger `end` (poll) — this prints which. */
+        { double bu=0,eu=0; long bn=0,en=0; ork_npu_db_timing(&bu,&bn,&eu,&en);
+          if(bn) fprintf(stderr,"[ork-ffn-DOORBELL] begin=%.1fus/call (n=%ld)  end(poll+writeback)=%.1fus/call (n=%ld)\n",
+                         bu/bn, bn, en?eu/en:0.0, en);
+          ork_npu_db_reset(); }
         fprintf(stderr,"[ork-ffn-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus(%.1fGB/s) host-silu %.0fus Down %.0fus(%.1fGB/s) deq %.0fus | %.0fus/layer\n",
             p_n, p_q/p_n, p_gu/p_n, gub/(p_gu/p_n*1e3), p_host/p_n, p_dn/p_n, dnb/(p_dn/p_n*1e3), p_deq/p_n, T/p_n); } }
     { static long n=0; if((n++%256)==0) fprintf(stderr,"[ork-ffn-dec] per-channel decode FFN on NPU (call %ld): K=%d Nff=%d Kd=%d\n", n,K,Nff,Kd); }
@@ -9553,6 +9562,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
         // and drags prefill (measured: 136 -> 213 t/s at M=228, i.e. faster than orkd's 168 once unpinned). orkd
         // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
         // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
+        //
+        // REGIME-DEPENDENT, and measured 2026-09-04: this is right for PREFILL and wrong for M=1 DECODE.
+        // The M=1 doorbell runs its host half AND its spin-poll on the calling thread, so leaving it
+        // unpinned cost 1.13x on decode (4.93 -> 5.58 tok/s) and nearly doubled the doorbell's host phase
+        // (655 -> 350us). ork-driver now handles that itself with a SCOPED save/widen/restore around the
+        // doorbell (orki_big_core_mask, which deliberately ignores this flag because a scoped placement
+        // cannot oversubscribe a threadpool the way a lifetime pin does). So this setenv stays as-is — but
+        // do not read it as "affinity never helps"; it means "do not PIN WORKERS for life here".
         setenv("ORK_NO_AFFINITY", "1", 0);
         if (ork_offline()) {
             npu = ork_npu_init_offline(ork_offline_soc());   // pack-only: SoC caps, no device
@@ -10096,7 +10113,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
                 // ORK_FFN_DEC: the fused DECODE FFN chain (ggml_backend_ork_ffn_decode_orkd) needs the SwiGLU
                 // node in the ORK split so the matcher keeps the gate/up/glu/down subgraph whole. The node's
                 // own compute is consumed (skipped) by the chain; it only needs to be scheduled to ORK.
-                if (getenv("ORK_FFN_DEC")) break;
+                if ((ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) break;
                 return false;
             default:
                 return false;
@@ -10255,7 +10272,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // subgraph is ONE contiguous ORK split (a CPU-side up would fragment it and the matcher couldn't
             // span the splits). The gate-anchored matcher fuses all 4 (i=last skips up/GLU/down — up never
             // runs standalone). Scoped by weight name so other decode matmuls (attention proj) stay on CPU.
-            if (getenv("ORK_FFN_DEC") && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
+            if ((ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED) && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
                 op->ne[2] == 1 && op->ne[3] == 1 && src0->name &&
                 (strstr(src0->name, "ffn_gate") || strstr(src0->name, "ffn_up") || strstr(src0->name, "ffn_down"))) {
                 const char * mn = getenv("ORK_FFN_DEC_MIN");   // diagnostic: only fire FFN-dec for layer >= MIN
@@ -10398,7 +10415,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
         case GGML_OP_GLU: {
             // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
             // ORK_FFN_CHAIN also needs GLU on ork so the FFN's 4 nodes land in one ork subgraph (fused there).
-            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !getenv("ORK_FFN_DEC")) return false;
+            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !(ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) return false;
             { const char * mn = getenv("ORK_FFN_DEC_MIN");   // match the FFN-matmul layer gate (src0=gate MM node -> its weight)
               if (mn && src0 && src0->src[0] && ork_layer_of(src0->src[0]->name) < atoi(mn)) return false; }
             if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
@@ -10412,7 +10429,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // FFN's gate/up/GLU/down land in ONE ork subgraph and the chain matcher can fuse them — otherwise
             // the 7B's Nff=18944 GLU is rejected, the scheduler splits the FFN across backends, and the 4
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
-            if (ork_ffn_chain_on() || getenv("ORK_FFN_DEC")) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
+            if (ork_ffn_chain_on() || (ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         case GGML_OP_SSM_SCAN: {
