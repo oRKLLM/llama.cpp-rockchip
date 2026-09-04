@@ -1257,6 +1257,32 @@ struct ggml_backend_ork_context {
         int fused = -1;                       // -1 uninit; 0/1 = this layer's resident scales are per-head/global
     };
     std::unordered_map<const void *, ork_kv_layer> attn_kv;
+    /* PRECOMPILED FFN DECODE CHAINS (ork_pc_*). The M=1 decode wall is per-call HOST cost, not bandwidth
+     * or hardware: kernel-side per-job time is identical between a tight probe and this handler, and the
+     * sentinel poll never waits (see the wiki Optimization Roadmap). ork_pc_compile bakes the regcmd once
+     * and ork_pc_run then only refreshes A and submits — no synth, no validate, no K-slice accumulate.
+     * Measured per call at decode shapes: 0.460 -> 0.321 ms (down), 0.450 -> 0.322 (gate/up), 0.377 ->
+     * 0.108 (q/k/v/o). It submits SINGLE-CORE and needs C in an ork DMA buffer, so it trades hardware
+     * time for host time and only wins where host cost dominates — which at M=1 it does.
+     *
+     * Two contract details that dictate the shape of this cache: ork_pc_compile CAPTURES the A pointer
+     * (ork_pc_run memcpy's from it each call), so A must be a PERSISTENT buffer, not a per-call malloc;
+     * and C must come from ork_dma_alloc. Hence both live here, per layer, keyed on the gate weight. */
+    struct ork_ffn_pc {
+        ork_pc_chain *gu = nullptr, *dn = nullptr;   // [gate,up] as one 2-task chain; down as one task
+        int8_t  *xi = nullptr, *glu8 = nullptr;      // persistent A sources (captured by compile)
+        float   *glf = nullptr;                      // silu scratch (the generic path's is allocated later)
+        /* CACHED MIRRORS of the DMA outputs. ork_pc bakes C's address in, so the outputs must live in
+         * ork_dma_alloc memory — which is uncached/write-combined. Reading it with a scalar loop cost
+         * 6144 uncached accesses and blew host-silu from 45us to 311us, eating most of what the
+         * precompiled submits saved. One burst memcpy into cached memory is ~1us and the loop then runs
+         * at normal speed. */
+        int32_t *gm = nullptr, *um = nullptr, *dm = nullptr;
+        int32_t *gi = nullptr, *ui = nullptr, *di = nullptr;   // DMA outputs
+        int K = 0, Nff = 0, Kd = 0;
+        bool tried = false;                          // compile attempted; false gu/dn => refused, use the generic path
+    };
+    std::unordered_map<const void *, ork_ffn_pc> ffn_pc;
     // Per-layer DECODE FFN calibration cache (ORK_FFN_DEC): route the SwiGLU inner through the fused orkd
     // chain (ork_mm_ffn_orkd — one submit) at decode. Per-tensor int8; the intermediate int8 scales (is/os/
     // us/gs) are calibrated ONCE per layer on the first real decode activation (representative), then reused;
@@ -4977,6 +5003,16 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
       free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
       if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
+    for (auto & e : ctx->ffn_pc) {                               // precompiled FFN decode chains + their pinned buffers
+        if (e.second.gu) ork_pc_free(e.second.gu);
+        if (e.second.dn) ork_pc_free(e.second.dn);
+        free(e.second.xi); free(e.second.glu8); free(e.second.glf);
+        free(e.second.gm); free(e.second.um); free(e.second.dm);
+        if (e.second.gi) ork_dma_free(ctx->npu, e.second.gi);
+        if (e.second.ui) ork_dma_free(ctx->npu, e.second.ui);
+        if (e.second.di) ork_dma_free(ctx->npu, e.second.di);
+    }
+    ctx->ffn_pc.clear();
     for (auto & e : ctx->attn_kv) {                              // resident-KV decode buffers (ORK_ATTN_KV)
         for (ork_kv_resident * r : e.second.kv) if (r) ork_kv_resident_free(ctx->npu, r);
         if (e.second.ones) ork_mm_free(ctx->npu, e.second.ones);   // ORK_ATTN_FUSED resident ones[Lmax,32]
@@ -7096,6 +7132,69 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
     const float * xf = (const float *) x->data;
     float amx=1e-9f; for (int k=0;k<K;k++){ float a=fabsf(xf[k]); if(a>amx)amx=a; }
     const float a_scale=amx/127.0f, ainv=127.0f/amx;
+
+    /* PRECOMPILED FAST PATH. One-time per layer: persistent A buffers, DMA outputs, and two compiled
+     * chains ([gate,up] and [down]). Per call: quantise into the persistent A, run, host-silu, run,
+     * dequant — no regcmd synth, no validate, no K-slice accumulate. Falls through to the generic path
+     * below whenever compile refuses the shape (K%512, K>4096, Sn>1, no DMA output), so an unsupported
+     * model loses nothing. ORK_FFN_NO_PC forces the generic path for A/B. */
+    /* OPT-IN (ORK_FFN_PC=1) until proven safe. The first integration of this HARD-WEDGED the board — no
+     * ping, recovered only by a plug power-cycle — and although the cause was found elsewhere (task
+     * descriptors placed in on-chip SRAM, a kernel-read buffer; ork_pc now keeps its descriptors in DRAM),
+     * a path that has wedged the board once does not get to be the default on the strength of a single
+     * clean run. Flip it after it has survived repeated suite passes. */
+    if (getenv("ORK_FFN_PC")) {
+        auto & pcl = ctx->ffn_pc[(const void *) Wg->data];
+        if (!pcl.tried) {
+            pcl.tried = true; pcl.K = K; pcl.Nff = Nff; pcl.Kd = Kd;
+            pcl.xi   = (int8_t *)  malloc((size_t) K);
+            pcl.glu8 = (int8_t *)  malloc((size_t) Nff);
+            pcl.glf  = (float *)   malloc((size_t) Nff * 4);
+            pcl.gm   = (int32_t *) malloc((size_t) Nff * 4);
+            pcl.um   = (int32_t *) malloc((size_t) Nff * 4);
+            pcl.dm   = (int32_t *) malloc((size_t) Kd  * 4);
+            pcl.gi = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Nff * 4);
+            pcl.ui = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Nff * 4);
+            pcl.di = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Kd  * 4);
+            if (pcl.xi && pcl.glu8 && pcl.glf && pcl.gm && pcl.um && pcl.dm && pcl.gi && pcl.ui && pcl.di) {
+                memset(pcl.xi, 0, (size_t) K); memset(pcl.glu8, 0, (size_t) Nff);
+                ork_mm_task_i8 tgu[2] = { { wg, 1, pcl.xi, pcl.gi }, { wu, 1, pcl.xi, pcl.ui } };
+                ork_mm_task_i8 tdn    = { wd, 1, pcl.glu8, pcl.di };
+                pcl.gu = ork_pc_compile(ctx->npu, 2, tgu);
+                pcl.dn = ork_pc_compile(ctx->npu, 1, &tdn);
+            }
+            static int once = 0;
+            if (!once++) fprintf(stderr, "[ork-ffn-PC] precompiled decode chains %s (K=%d Nff=%d Kd=%d)\n",
+                                 (pcl.gu && pcl.dn) ? "COMPILED" : "REFUSED — using the generic path", K, Nff, Kd);
+        }
+        if (pcl.gu && pcl.dn && pcl.K == K && pcl.Nff == Nff && pcl.Kd == Kd) {
+            _t = fprof ? ork_now_us() : 0;
+            for (int k=0;k<K;k++){ int q=(int)lrintf(xf[k]*ainv); pcl.xi[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+            if (fprof) { p_q += ork_now_us()-_t; _t = ork_now_us(); }
+            if (ork_pc_run(pcl.gu) < 0) goto pc_fail;
+            if (fprof) { p_gu += ork_now_us()-_t; _t = ork_now_us(); }
+            memcpy(pcl.gm, pcl.gi, (size_t) Nff * 4);      /* burst out of uncached DMA, then work cached */
+            memcpy(pcl.um, pcl.ui, (size_t) Nff * 4);
+            { float gmax=1e-9f;
+              for (int n=0;n<Nff;n++){ float g=(float)pcl.gm[n]*a_scale*bsg[n], u=(float)pcl.um[n]*a_scale*bsu[n];
+                  float v=(g/(1.0f+expf(-g)))*u; pcl.glf[n]=v; float av=fabsf(v); if(av>gmax)gmax=av; }
+              const float gs=gmax/127.0f, ginv=127.0f/gmax;
+              for (int n=0;n<Nff;n++){ int q=(int)lrintf(pcl.glf[n]*ginv); pcl.glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
+              if (fprof) { p_host += ork_now_us()-_t; _t = ork_now_us(); }
+              if (ork_pc_run(pcl.dn) < 0) goto pc_fail;
+              if (fprof) { p_dn += ork_now_us()-_t; _t = ork_now_us(); }
+              memcpy(pcl.dm, pcl.di, (size_t) Kd * 4);
+              float * dst=(float*)down_n->data;
+              for (int j=0;j<Kd;j++) dst[j]=(float)((double)pcl.dm[j]*gs*bsd[j]);
+              if (fprof) p_deq += ork_now_us()-_t;
+            }
+            if (fprof) { p_n++; if (p_n%64==0) fprintf(stderr,
+                "[ork-ffn-PC-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus host-silu %.0fus Down %.0fus deq %.0fus | %.0fus/layer\n",
+                p_n, p_q/p_n, p_gu/p_n, p_host/p_n, p_dn/p_n, p_deq/p_n, (p_q+p_gu+p_host+p_dn+p_deq)/p_n); }
+            return true;
+        }
+    }
+    pc_fail:;
     int8_t  *xi  =(int8_t*) malloc((size_t)K);
     int32_t *gi  =(int32_t*)malloc((size_t)Nff*4), *ui=(int32_t*)malloc((size_t)Nff*4);
     int8_t  *glu8=(int8_t*) malloc((size_t)Nff);
