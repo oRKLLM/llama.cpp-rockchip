@@ -8880,7 +8880,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // orkd: the FFN SwiGLU chain stays disabled — it uses fd-local run_i8_silu / run_f16_silu + the GU_CHAIN
     // DMA scratch (not daemon-routed). The generic MUL_MAT chain (below) IS routed and stays on.
     const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;
-    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8 && ctx->via_orkd;   // decode FFN via fused orkd chain
+    // ORK_FFN_DEC: the fused M==1 SwiGLU decode chain. It used to require ctx->via_orkd, which made it
+    // unreachable in the DEFAULT in-process mode — so the one M=1-optimised FFN path existed only under the
+    // multi-process arbitration daemon, which is not a performance mechanism. Nothing in the handler needs a
+    // daemon: it calls ork_i8_mm_run_chain / ork_i8_mm_run against ork_w* the wcache already holds, both
+    // mode-agnostic. (Its name still says _orkd; that is now a misnomer.) Same defect as the fused attention
+    // chain calling the daemon-only ork_mm_attn_rr_orkd unconditionally.
+    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8;
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -8909,7 +8915,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         if (scan_ahead && !sa_done.empty() && sa_done.count(node)) continue;   // computed early by a scan-ahead group
         // ORK_FFN_DEC: DECODE (M==1) SwiGLU inner via the fused orkd chain (one submit against the resident
         // weights). Fires at the gate node; the matcher takes up from glu->src[1] and consumes glu/down.
-        if (ffn_dec && ctx->via_orkd && node->op == GGML_OP_MUL_MAT && node->src[0] &&
+        if (ffn_dec && node->op == GGML_OP_MUL_MAT && node->src[0] &&
             strstr(node->src[0]->name, "ffn_gate") && node->ne[1] == 1) {
             struct ggml_tensor *g,*u,*gl,*dn; int last;
             if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last) &&
