@@ -8116,7 +8116,77 @@ static struct ork_attn_pool * attn_pool_ensure(ggml_backend_ork_context * ctx, i
                 adom, DK, DV, N, nkvp, H, ctx->attnp.size());
     return P;
 }
-// Resident-KV variant of the int8 decode attention (ORK_ATTN_KV): instead of packing K^T/V every call
+// DECODE-ATTENTION GATE.
+//
+// The int8 decode attention path is AUTOMATIC now, not opt-in, but only above a live-KV-length
+// threshold, because below it the CPU genuinely wins. MEASURED on RK3588 (ork-driver
+// attn_decode_bench_probe for timing + chainrr_biased_probe for accuracy; 16 heads, HD=128, per-token
+// attention cost) against an fp32 *vectorisable* CPU reference:
+//
+//     L      CPU fp32   fused chain   ratio
+//     512      1.90        2.38       0.80x   CPU wins
+//     1024     3.72        2.71       1.37x
+//     1536     5.54        3.18       1.74x
+//     2048     7.38        3.52       2.10x
+//     3072    11.04        4.34       2.54x
+//
+// Two things to know before touching the threshold. (a) Compare against the fp32 reference, NOT the
+// naive scalar double loop the probe used to use -- that flatters the NPU about 2x and put the apparent
+// crossover at L~2400 when it is really ~760. (b) L is constrained to MULTIPLES OF 512: the chain's
+// K%512 rule applies to the reduce and e.V weights, whose K *is* L, and 768/1280/1792 all refuse with
+// rc=-3. So 1024 is the first legal winning length.
+//
+// The threshold is 1024 by deliberate choice, and its worst case is THIN. Resident KV runs the matmuls
+// at the ALLOCATED Lmax, not the live length, so just past a 512 boundary (live 1025 -> Lmax 1536) the
+// margin is ~1.17x rather than 1.37x. Gating at 1536 would hold >=1.57x everywhere; 1024 was chosen to
+// capture the 1024-1535 range, where the path still wins, just narrowly. It is one constant.
+//
+// The gate is applied to the LIVE kv length inside the handler, not in supports_op -- supports_op only
+// sees k->ne[1], the PADDED cache width, which stays constant as tokens fill the cache. Gating on that
+// would engage the NPU at a live length of 10 against a 2048-wide cache. When the handler declines,
+// graph_compute falls back to ork_cpu_delegate_node, which is the designed escape.
+static int ork_attn_dec_min_nkv(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ORK_ATTN_DEC_MIN"); v = e ? atoi(e) : 1024; if (v < 1) v = 1; }
+    return v;
+}
+// OPT-IN, and it must stay opt-in until something changes structurally. MEASURED END-TO-END on
+// qwen3-0.6b-f16 (28 layers, H=16, Hkv=8, HD=128), ork_bench decode tok/s, FA enabled both sides:
+//
+//     prompt   path off   path on
+//      1024      11.31      3.57   0.32x
+//      2048       7.69      1.37   0.18x
+//      4096       7.61      1.38   0.18x
+//
+// So this path is a 3-5x DECODE REGRESSION at every length, and it gets worse as context grows -- the
+// exact opposite of what the ork-driver microbenchmark predicted (attn_decode_bench_probe had the fused
+// chain at 1.36-2.84x from L=1024 up). Two reasons the microbenchmark was wrong, both worth knowing
+// before anyone re-derives this:
+//
+//   1. DISPATCH COUNT. The probe timed ONE dispatch of 16 chains and that got compared against one
+//      layer's attention. A real model needs one dispatch PER LAYER -- 28 of them per token here, with
+//      Hkv=8 chains of Nq=2 each -- because layer N's attention depends on layer N-1's output. The
+//      fixed per-dispatch cost is paid 28x per token and cannot be batched away.
+//   2. THE CPU REFERENCE WAS STILL TOO SLOW. Even the "honest" fp32 vectorisable loop in the probe is
+//      much slower than ggml's real attention kernels. The giveaway is in the baseline above: CPU
+//      decode is FLAT from 2048 to 4096 (7.69 -> 7.61), so attention is a small fraction of CPU decode
+//      time at these lengths. There was very little to win and a large dispatch tax to pay.
+//
+// The code is kept, correct, and default-off rather than deleted: the length gate, the resident-KV
+// append and the direct-mode chain route are all sound and independently useful, and the economics
+// could change with far more heads per layer, a much lower submit floor, or a fused path that spans
+// layers. But do NOT enable this expecting a win, and do not trust a single-dispatch microbenchmark
+// for a per-layer op again -- measure with ork_bench.
+//
+// Sense of the knob: ORK_ATTN_DEC=1 ENABLES. An earlier knob in this file got the inverse wrong (=0
+// still enabled it), so compare the value, never just presence.
+static bool ork_attn_dec_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ORK_ATTN_DEC"); v = (e && e[0] != '0') ? 1 : 0; }
+    return v != 0;
+}
+
+// Resident-KV variant of the int8 decode attention (default): instead of packing K^T/V every call
 // (the O(nkv)/token repack tax that makes the default path perf-negative), pack ONCE per (layer, kv-head)
 // via ork_kv_resident_alloc, then append just the new key/value each token (ork_kv_append — one tile write,
 // no repack). Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Per-head int8
@@ -8125,7 +8195,10 @@ static struct ork_attn_pool * attn_pool_ensure(ggml_backend_ork_context * ctx, i
 static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
     const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv_pad=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
-    const int rk2 = H/Hkv, Kp=512, LmaxCap=2048;   // cap matches the supports_op gate (nkv<=2048); RK3588 nmax=8192
+    // Cap is the hardware limit (ork_kv_resident_alloc requires Lmax<=soc->nmax, 8192 on RK3588), NOT
+    // 2048. It used to be 2048 to "match the supports_op gate", but that gate bounded the PADDED cache
+    // width, so any model with n_ctx>2048 could never reach this path at all.
+    const int rk2 = H/Hkv, Kp=512, LmaxCap=8192;
     if (DK!=DV || DK>Kp || nkv_pad>LmaxCap || nkv_pad<1) return false;   // API bundles ONE HD for K^T & V; single N-tile
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
@@ -8144,12 +8217,20 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
         nkv = 0; for (int j=0;j<nkv_pad;j++) if (mval(j) > -1e30f) nkv = j+1;
     }
     if (nkv < 1 || nkv > LmaxCap) return false;
+    // THE GATE. Below this the CPU is faster (see the table above); decline and let
+    // ork_cpu_delegate_node handle the node. This is the live length, so it engages mid-generation as
+    // the context grows and stops being used if the sequence is reset to something shorter.
+    if (nkv < ork_attn_dec_min_nkv()) return false;
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-kv] resident decode: live_nkv=%d (pad=%d) H=%d Hkv=%d DK=%d\n", nkv, nkv_pad, H, Hkv, DK); }
     auto & LY = ctx->attn_kv[(const void*)k->data];
     // ORK_ATTN_FUSED: run the whole attention core as Hkv fused chains fanned RR across cores in ONE orkd
     // round-trip (vs the 2-submit QK^T + host-softmax + e.V path). Needs GLOBAL K/Q scales (the RR dispatch
     // shares one exp LUT) + a resident ones[Lmax,32] reduce weight.
-    static int fused_env=-1; if(fused_env<0) fused_env=getenv("ORK_ATTN_FUSED")?1:0;
+    // Fused chain is the DEFAULT: measured 2.09-2.54x faster than the 2-submit host-softmax path,
+    // because it removes the host round-trip (read [1,L] scores back, softmax in fp, requantise,
+    // resubmit) rather than any FLOP saving. ORK_ATTN_FUSED=0 forces the 2-submit path for A/B.
+    static int fused_env=-1;
+    if(fused_env<0){ const char*e=getenv("ORK_ATTN_FUSED"); fused_env=(e&&e[0]=='0')?0:1; }
     // (re)alloc on first touch, a sequence reset (cache shrank), a head-count change, OR growth past the
     // current resident width. Lmax is sized to the live nkv rounded to a 512-chunk (NOT the 2048 cap) so the
     // QK^T/e.V matmuls stream only ~nkv-wide weights (weight-DMA-bound) instead of always 2048 — growth
@@ -8219,8 +8300,16 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
             for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; int8_t *dq=Qall+((size_t)hkv*rk2+qh)*Kp2;
                 for(int e=0;e<DK;e++) dq[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*(float)qs); }
             _pt=aprof?ork_now_us():0;
-            int rc=ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
-                                       r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
+            // Pick the entrypoint that matches how we own the NPU. ork_mm_attn_rr_orkd is a transport
+            // shim: it REQUIRES ctx->npu->daemon and returns -3 without one. Calling it unconditionally
+            // meant in-process (direct) runs fell back to the 2-submit host-softmax path on every decode
+            // step — measured ~2.4x slower than the fused chain, which turned this whole path into a
+            // 3.3x end-to-end decode regression (11.31 -> 3.42 tok/s) while looking like it "worked".
+            int rc = ctx->via_orkd
+                   ? ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                         r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall)
+                   : ork_i8_attn_run_rr (c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                         r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
             if(aprof) a_qk+=ork_now_us()-_pt;
             if(rc==0){
                 double epad=exp((0.0-biasv)*insc)/out_scale; long ep=lround(epad); if(ep<0)ep=0; if(ep>127)ep=127;
@@ -8297,7 +8386,10 @@ static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, s
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-dec] NPU decode attention engaged (call %ld): H=%d Hkv=%d DK=%d DV=%d nkv=%d\n", n, H, Hkv, DK, DV, nkv); }
     // ORK_ATTN_KV: resident-KV (pack-once + append/token) — the perf path. ORK_ATTN_KV_REPACK forces the
     // per-call repack below (default) for A/B. Resident needs DK==DV (the ork_kv_* API bundles one HD).
-    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : (getenv("ORK_ATTN_KV") ? 1 : 0);
+    // Resident KV is the DEFAULT. The per-call repack below is kept only for A/B
+    // (ORK_ATTN_KV_REPACK=1) and is PERF-NEGATIVE: measured 169-308x the cost of an append, and
+    // 68-96% of the whole per-step cost, which is what made on-NPU decode attention lose outright.
+    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : 1;
     if (kv_res && DK==DV) return ggml_backend_ork_flash_attn_decode_kv(ctx, dst);
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
@@ -9794,7 +9886,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
                 // other fd-local primitives this gate declines. Let it through ONLY under ORK_ATTN_DEC so
                 // the real FLASH_ATTN_EXT case below applies the full decode gate (N==1 + shape). Off by
                 // default: without ORK_ATTN_DEC this still declines to CPU, preserving orkd safety.
-                if (getenv("ORK_ATTN_DEC")) break;
+                if (ork_attn_dec_enabled()) break;
                 return false;
             case GGML_OP_GLU:
                 // ORK_FFN_DEC: the fused DECODE FFN chain (ggml_backend_ork_ffn_decode_orkd) needs the SwiGLU
@@ -10148,9 +10240,17 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             const int nkv=(int)k->ne[1];
             { static int nq=0; if (getenv("ORK_ATTN_DEC") && nq++ < 8) fprintf(stderr,"[ork-fa-supp] FLASH_ATTN_EXT queried: N=%d nkv=%d DK=%d DV=%d Hkv=%d\n", N, nkv, DK, DV, Hkv); }
             if (Hkv<1 || H%Hkv || DK%32 || DV%16) return false;
-            if (N == 1) {                                            // DECODE -> int8 orkd path (ggml_backend_ork_flash_attn_decode)
-                if (getenv("ORK_ATTN_DEC") == nullptr) return false;
-                if (DK > 512 || nkv < 256 || ((nkv+511)&~511) > 2048) return false;  // sched floor .. single-N-tile
+            if (N == 1) {                                            // DECODE -> int8 path (ggml_backend_ork_flash_attn_decode)
+                if (!ork_attn_dec_enabled()) return false;
+                // DK==DV because the resident-KV bundle carries ONE head dim for both K^T and V. Without
+                // this the handler would fall through to the per-call repack, which is perf-negative --
+                // better to leave those shapes on the CPU than to "support" them into a regression.
+                if (DK != DV) return false;
+                if (DK > 512) return false;                          // K^T is packed [512, Lmax]
+                // Bound the PADDED width by the hardware limit only. The live-length threshold is
+                // applied in the handler (see ork_attn_dec_min_nkv) because nkv here is the padded
+                // cache width, which does not tell us how many tokens are actually live.
+                if (((nkv+511)&~511) > 8192) return false;
                 return true;
             }
             if (getenv("ORK_ATTN") == nullptr) return false;
