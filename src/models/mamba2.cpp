@@ -39,7 +39,10 @@ void llama_model_mamba2::load_arch_tensors(llama_model_loader &) {
     const int64_t d_inner = hparams.ssm_d_inner;
     const int64_t d_state = hparams.ssm_d_state;
     const int64_t n_group = hparams.ssm_n_group;
-    const int64_t d_in_proj = 2*d_inner + 2*n_group*d_state + n_head;
+    // mamba2 writes head_count=0 in the GGUF, so LLAMA_LOAD_LOCALS' n_head is 0 here; the SSM head
+    // count is ssm_dt_rank (= d_inner/head_dim), matching build_mamba2_layer in mamba-base.cpp.
+    const int64_t n_head_ssm = hparams.ssm_dt_rank;
+    const int64_t d_in_proj = 2*d_inner + 2*n_group*d_state + n_head_ssm;
 
     // only an expansion factor of 2 is supported for now
     GGML_ASSERT(2 * n_embd == d_inner);
@@ -68,11 +71,11 @@ void llama_model_mamba2::load_arch_tensors(llama_model_loader &) {
         layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {d_conv, d_inner + 2*n_group*d_state}, 0);
         layer.ssm_conv1d_b = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "bias", i), {d_inner + 2*n_group*d_state}, 0);
 
-        layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {n_head}, 0);
+        layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {n_head_ssm}, 0);
 
         // no "weight" suffix for these
-        layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
-        layer.ssm_d = create_tensor(tn(LLM_TENSOR_SSM_D, i), {1, n_head}, 0);
+        layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head_ssm}, 0);
+        layer.ssm_d = create_tensor(tn(LLM_TENSOR_SSM_D, i), {1, n_head_ssm}, 0);
 
         layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {d_inner / n_group, n_group}, 0);
 

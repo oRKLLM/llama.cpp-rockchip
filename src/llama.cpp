@@ -22,9 +22,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>     // getenv/setenv — ork .orkpack sidecar default
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>  // stat — ork .orkpack sidecar existence check
+#include <strings.h>   // strcasecmp — ork .orkpack sidecar suffix match
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -363,6 +368,29 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
     ggml_time_init();
+
+#if !defined(_WIN32)
+    // ork-driver coupling: the `.orkpack` path is DERIVED from the loaded model (`<model>.gguf` ->
+    // `<model>.orkpack`) so EVERY entry point (llama-cli / llama-bench / llama-completion / server) loads
+    // the pre-tiled weights ZERO-COPY instead of re-doing the slow Q8_0->int8-tile conversion every run
+    // (measured ~25x the resolve cost: 16.7s vs 0.66s on a 1.7B). We publish the resolved path to the
+    // backend as ORK_ORKPACK_PATH, which is ALSO the user-facing DEVELOPMENT override — an explicit value
+    // wins (setenv overwrite=0). Done only when the sidecar EXISTS; if it is absent the ggml-ork backend
+    // derives the same name itself and BUILDS it once (self-populating cache).
+    // (The old name ORK_PERSIST is retired: ggml-ork aborts with guidance if it is set.)
+    if (!path_model.empty() && getenv("ORK_ORKPACK_PATH") == nullptr) {
+        static const char sfx[] = ".gguf";
+        const size_t ns = sizeof(sfx) - 1;
+        if (path_model.size() > ns && strcasecmp(path_model.c_str() + path_model.size() - ns, sfx) == 0) {
+            std::string pack = path_model.substr(0, path_model.size() - ns) + ".orkpack";
+            struct stat st;
+            if (stat(pack.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                setenv("ORK_ORKPACK_PATH", pack.c_str(), 0);
+                LLAMA_LOG_INFO("%s: ork: orkpack derived from model: %s\n", __func__, pack.c_str());
+            }
+        }
+    }
+#endif
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);

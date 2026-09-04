@@ -90,6 +90,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// The draft/embedding-extraction APIs below are consumed by C dlsym clients (the oRKLLM napi addon's
+// run_dflash), so they must export with unmangled C names — keep this block extern "C".
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
@@ -105,6 +111,10 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// dflash: set the target-context buffer injected into every draft layer's K/V for the next decode.
+// ctx_buf = [n_embd, ctx_len] fused encoder output (g_embd), ctx_pos = [ctx_len] RoPE positions.
+LLAMA_API void llama_set_dflash_context(struct llama_context * ctx, const float * ctx_buf, int32_t ctx_len, const int32_t * ctx_pos);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
@@ -119,3 +129,7 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+#ifdef __cplusplus
+}
+#endif
