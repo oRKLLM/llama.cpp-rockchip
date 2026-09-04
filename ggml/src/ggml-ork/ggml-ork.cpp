@@ -437,27 +437,134 @@ static bool g_pack_cfg_set = false;
 /* THE one place the decode route is resolved. Precedence mirrors min_m's: an explicit override wins, then
  * the pack's measured decision, then the default.
  *
- * ORK_M1_NPU and ORK_FFN_DEC are kept as deprecated aliases, and they can only RAISE the route. That is
- * deliberate: it makes the old dead combination impossible to express. Setting ORK_FFN_DEC alone used to
- * do nothing at all (supports_op declined M==1 upstream, so the FFN nodes never reached graph_compute);
- * now it resolves to ORK_DECODE_NPU_FUSED, which includes the M==1 acceptance it always needed. */
+ * There are deliberately NO per-mechanism env knobs. ORK_M1_NPU and ORK_FFN_DEC are removed: as
+ * independent switches most of their combinations were silent no-ops (ORK_FFN_DEC did nothing at all for
+ * its entire existence -- supports_op declined M==1 upstream, so the FFN nodes never reached
+ * graph_compute, and nothing said so). The value comes from a published recipe keyed on (model
+ * fingerprint x SoC); ORK_DECODE_ROUTE remains only as a development override for A/B. */
+/* MODEL SHAPE FINGERPRINT — the recipe key, together with the SoC id.
+ *
+ * A SHAPE tuple, not a name. What decides whether a routing choice pays is the model's geometry measured
+ * against what the hardware achieves (layer count x weight sizes vs GB/s), so two fine-tunes of one
+ * architecture should inherit the same recipe and a name-keyed table would not give that. Derived from the
+ * pack's own index, which ggml-ork already parses -- no GGUF KV parser needed, and it is the artifact the
+ * consumer actually loaded. Zero means "not determined" (an unpacked run), and an unmatched fingerprint
+ * falls back to the safe default rather than guessing. */
+struct ork_model_fp { uint32_t n_layer, n_embd, n_ff, attn_kv; };
+static ork_model_fp g_model_fp = {0,0,0,0};
+/* The detected SoC, cached by the pack loader. A static rather than a reach into g_ork_ctx because the
+ * resolver is defined above the context type; NULL simply means "no key yet", which falls back to the
+ * safe default instead of guessing. */
+static const char * g_soc_id = nullptr;
+
+static void ork_fp_note(const std::string & name, const orkpack_entry & e) {
+    const char * b = strstr(name.c_str(), "blk.");
+    if (b) { int li = atoi(b + 4); if ((uint32_t)(li + 1) > g_model_fp.n_layer) g_model_fp.n_layer = li + 1; }
+    if (strstr(name.c_str(), "blk.0.")) {
+        if (strstr(name.c_str(), "attn_q"))   { g_model_fp.n_embd  = e.K; }
+        if (strstr(name.c_str(), "attn_k"))   { g_model_fp.attn_kv = e.N; }
+        if (strstr(name.c_str(), "ffn_gate")) { g_model_fp.n_ff    = e.N; }
+    }
+}
+
 static int g_pack_decode_route = -1;   // set by the pack loader; -1 = no valid decision in the pack
+
+/* PUBLISHED RECIPES, keyed by (model fingerprint x SoC id).
+ *
+ * Tuning is DATA, not knobs. The right routing for a model cannot be guessed -- this project has repeatedly
+ * had microbenchmarks predict wins that measured as 3-5x regressions -- and making every user sweep for it
+ * is worse than measuring once and publishing. So the table below carries what we measured, and an external
+ * file can override or extend it WITHOUT a recompile or a repack, which is how a tuning update ships.
+ *
+ * SoC is part of the key because the answer moves with the part, and rows are only applied on a match: a
+ * recipe measured on our board (A76 unlocked to 2400 MHz, custom kernel) must not be applied blind to a
+ * stock board. Anything unmatched falls back to the safe default, which is also the measured-best config on
+ * every model so far -- so an unknown model loses nothing by being absent from the table.
+ *
+ * External format, one row per line, '#' comments (deliberately not JSON -- no dependency, hand-editable):
+ *     soc  n_layer  n_embd  n_ff  attn_kv  decode_route  min_m
+ * Searched: $ORK_RECIPES, ./ork-recipes.txt, ~/.config/ork/recipes.txt, /etc/ork/recipes.txt. min_m 0 =
+ * leave to the existing default/calibration. */
+struct ork_recipe { const char * soc; uint32_t n_layer, n_embd, n_ff, attn_kv; int decode_route; int min_m; const char * note; };
+
+static const ork_recipe ORK_RECIPES_BUILTIN[] = {
+    { "rk3588", 28, 1024,  3072, 1024, ORK_DECODE_CPU, 0,
+      "qwen3-0.6b-f16: every decode-on-NPU route measured 2.8-3x slower than CPU (2026-09-04)" },
+    { "rk3588", 28, 2048, 12288, 1024, ORK_DECODE_CPU, 0,
+      "qwen3-1.7b-f16: decode on CPU; the prefill FFN chain costs +0.35% PPL and +42% wall (2026-09-04)" },
+};
+
+static bool ork_recipe_match(const ork_recipe & r, const char * soc) {
+    return soc && r.soc && strcmp(r.soc, soc) == 0 &&
+           r.n_layer == g_model_fp.n_layer && r.n_embd == g_model_fp.n_embd &&
+           r.n_ff    == g_model_fp.n_ff    && r.attn_kv == g_model_fp.attn_kv;
+}
+
+/* Look up this (fingerprint, soc). External file first so a published update beats the compiled-in row.
+ * Returns false when nothing matches -- the caller then keeps the safe default. */
+static bool ork_recipe_lookup(const char * soc, ork_recipe * out) {
+    if (!soc || !g_model_fp.n_layer) return false;          // no pack / no SoC => no key, do not guess
+    const char * paths[4]; int np = 0;
+    if (const char * e = getenv("ORK_RECIPES")) paths[np++] = e;
+    paths[np++] = "ork-recipes.txt";
+    static std::string home_p;
+    if (const char * h = getenv("HOME")) { home_p = std::string(h) + "/.config/ork/recipes.txt"; paths[np++] = home_p.c_str(); }
+    paths[np++] = "/etc/ork/recipes.txt";
+    for (int i = 0; i < np; i++) {
+        FILE * f = fopen(paths[i], "r"); if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char soc_s[64]; unsigned nl, ne, nf, akv; int rt, mm;
+            if (line[0] == '#' || line[0] == '\n') continue;
+            if (sscanf(line, "%63s %u %u %u %u %d %d", soc_s, &nl, &ne, &nf, &akv, &rt, &mm) != 7) continue;
+            ork_recipe r = { soc_s, nl, ne, nf, akv, rt, mm, "external recipe file" };
+            if (ork_recipe_match(r, soc) && rt >= ORK_DECODE_CPU && rt <= ORK_DECODE_NPU_FUSED) {
+                *out = r; out->soc = soc; fclose(f);
+                fprintf(stderr, "[ORK RECIPE] matched %s -> decode route %d\n", paths[i], rt);
+                return true;
+            }
+        }
+        fclose(f);
+    }
+    for (const ork_recipe & r : ORK_RECIPES_BUILTIN)
+        if (ork_recipe_match(r, soc)) {
+            *out = r;
+            fprintf(stderr, "[ORK RECIPE] built-in: %s\n", r.note);
+            return true;
+        }
+    fprintf(stderr, "[ORK RECIPE] no recipe for this model on %s (n_layer=%u n_embd=%u n_ff=%u attn_kv=%u) "
+                    "— using safe defaults; publish one in ork-recipes.txt\n",
+            soc, g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv);
+    return false;
+}
 
 static int ork_decode_route_resolved(void) {
     static int v = -1;
     if (v >= 0) return v;
-    v = ORK_DECODE_CPU;
-    if (g_pack_decode_route > v) v = g_pack_decode_route;                        // the pack's measured decision
-    if (getenv("ORK_M1_NPU")  && v < ORK_DECODE_NPU)       v = ORK_DECODE_NPU;         // deprecated alias
-    if (getenv("ORK_FFN_DEC") && v < ORK_DECODE_NPU_FUSED) v = ORK_DECODE_NPU_FUSED;   // deprecated alias
-    if (const char * e = getenv("ORK_DECODE_ROUTE")) {                                 // explicit override wins
+    /* An explicit override needs no key and can be decided immediately. */
+    if (const char * e = getenv("ORK_DECODE_ROUTE")) {
         int r = atoi(e);
-        if (r >= ORK_DECODE_CPU && r <= ORK_DECODE_NPU_FUSED) v = r;
+        if (r >= ORK_DECODE_CPU && r <= ORK_DECODE_NPU_FUSED) {
+            v = r;
+            if (v != ORK_DECODE_CPU) fprintf(stderr, "[ORK ROUTE] decode route %d from ORK_DECODE_ROUTE (dev override)\n", v);
+            return v;
+        }
     }
-    if (v != ORK_DECODE_CPU)
-        fprintf(stderr, "[ORK ROUTE] decode route %d (%s) — NOT the measured-best default on any model "
-                        "yet; see the wiki Model-Recipes page\n", v,
-                v == ORK_DECODE_NPU ? "dense M=1 on NPU" : "dense M=1 + fused FFN chain");
+    /* DO NOT MEMOIZE BEFORE THE KEY EXISTS. supports_op runs during graph_reserve, and on some paths the
+     * first call lands before ork_persist_init has read the pack — caching then would freeze the default
+     * in and the recipe would never be consulted, which is exactly the bug this guard fixes (the external
+     * override silently did nothing). Return the safe default uncached until the fingerprint is known. */
+    if (!g_soc_id || !g_model_fp.n_layer) return ORK_DECODE_CPU;
+    v = ORK_DECODE_CPU;
+    const char * src = "default";
+    ork_recipe rc;
+    if (ork_recipe_lookup(g_soc_id, &rc)) {
+        v = rc.decode_route; src = "recipe";
+    }
+    /* A pack calibration outranks a published recipe: it is a measurement taken on THIS machine and
+     * ork_calib_valid_here() has already confirmed the machine still matches. */
+    if (g_pack_decode_route >= 0) { v = g_pack_decode_route; src = "pack calibration"; }
+    if (v != ORK_DECODE_CPU) fprintf(stderr, "[ORK ROUTE] decode route %d from %s\n", v, src);
     return v;
 }
 
@@ -1567,10 +1674,15 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
                         std::string name(idx, nl); idx += nl;
                         orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+                        ork_fp_note(name, e);                     // build the recipe key as we go
                         ctx->persist_idx.emplace(std::move(name), e);
                     }
                     // ADOPT the pack's tier. ork_persist_init runs BEFORE ctx->qbits is set, so this is the
                     // value the ctx init picks up when ORK_QUANT is unset: loading an int4 pack selects int4.
+                    g_soc_id = ork_npu_soc_id(ctx->npu);
+                    fprintf(stderr, "[ORK RECIPE] model fingerprint: n_layer=%u n_embd=%u n_ff=%u attn_kv=%u soc=%s\n",
+                            g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv,
+                            g_soc_id ? g_soc_id : "?");
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
@@ -6117,8 +6229,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // to the NON-BLOCKING async doorbell (ork_submit_async, which overlaps run_cold) instead of all-CPU. The
     // blocking #14 rendezvous lost net (profiled); the thread-free doorbell should overlap for free. Knob:
     //   ORK_SPLIT_FRAC (default 0.0) = CPU-only baseline;  0.5 = half the experts to the NPU async share.
-    // Prefill (max_Me >= batch_minM) admits all as before; ORK_M1_NPU forces all-decode-on-NPU (old A/B).
-    static const bool  m1_npu     = env_enabled("ORK_M1_NPU");
+    // Prefill (max_Me >= batch_minM) admits all as before; ORK_MOE_M1_NPU forces all-decode-on-NPU (old A/B).
+    // RENAMED from ORK_M1_NPU: that name used to ALSO gate dense-backbone M==1 routing, one env driving two
+    // unrelated decisions. Dense routing is now a published per-model recipe (see ork_recipe_lookup), and
+    // MoE expert admission is a separate question with its own closed verdict — so they get separate names.
+    static const bool  m1_npu     = env_enabled("ORK_MOE_M1_NPU");
     // ORK_MOE_CPU (task #54, NF4 route): force ALL experts to the CPU cold path (the batched int4/NF4 NEON
     // GEMM) instead of the NPU — the "prefill using only int4 from orkpack on CPU" A/B. The int4 weights stay
     // resident once (the mmap'd orkpack blob the ork-native cold path reads); the NPU IOVA copy is unused.
