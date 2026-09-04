@@ -3,6 +3,10 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "ggml-ork.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -44,6 +48,12 @@
 #include <string.h>
 #include <fcntl.h>
 #include <io.h>
+#ifndef fileno
+#define fileno _fileno
+#endif
+#ifndef isatty
+#define isatty _isatty
+#endif
 #else
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -1311,7 +1321,47 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
+// Apply the .orkpack build configuration, if the ork backend is present and the user asked for anything.
+//
+// Resolved with dlsym rather than linked: ggml-ork is a dynamically loaded backend, so a build or a host
+// without it must ignore these flags rather than fail to link. Must run BEFORE the model loads — the
+// config affects pack WRITING, which happens during load.
+static void common_apply_ork_pack_config(const common_params & params) {
+#ifdef _WIN32
+    (void) params;   // ork is a Rockchip/Linux backend
+#else
+    const bool asked = params.ork_pack_bits != 0 || params.ork_pack_mixed_set ||
+                       params.ork_pack_budget_mb >= 0.0f || params.ork_pack_qerr_min >= 0.0f ||
+                       !params.ork_pack_qerr_src.empty() || !params.ork_pack_promote.empty();
+    if (!asked) return;
+
+    using defaults_fn = void (*)(struct ggml_backend_ork_pack_config *);
+    using set_fn      = void (*)(const struct ggml_backend_ork_pack_config *);
+    auto d = (defaults_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_pack_config_defaults");
+    auto f = (set_fn)      dlsym(RTLD_DEFAULT, "ggml_backend_ork_set_pack_config");
+    if (!d || !f) {
+        LOG_WRN("%s: --pack-* given but this build has no ork backend — ignoring\n", __func__);
+        return;
+    }
+
+    // Always start from the backend's defaults, so adding a field there cannot silently change what
+    // happens here.
+    struct ggml_backend_ork_pack_config cfg;
+    d(&cfg);
+    if (params.ork_pack_bits != 0)          cfg.weight_bits       = params.ork_pack_bits;
+    if (params.ork_pack_mixed_set)          cfg.mixed             = params.ork_pack_mixed;
+    if (params.ork_pack_budget_mb >= 0.0f)  cfg.promote_budget_mb = params.ork_pack_budget_mb;
+    if (params.ork_pack_qerr_min  >= 0.0f)  cfg.promote_qerr_min  = params.ork_pack_qerr_min;
+    if (!params.ork_pack_qerr_src.empty())  cfg.qerr_source_pack  = params.ork_pack_qerr_src.c_str();
+    if (!params.ork_pack_promote.empty())   cfg.promote_list      = params.ork_pack_promote.c_str();
+    // cfg borrows those two strings; params outlives the load, so they stay valid.
+    f(&cfg);
+#endif
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_apply_ork_pack_config(params);
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1559,6 +1609,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;
