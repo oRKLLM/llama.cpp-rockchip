@@ -284,7 +284,26 @@ struct orkpack_calib_hdr {
     uint32_t flags;          // bit0: all big-core governors were "performance"
     uint64_t kernel_hash;    // FNV-64 of uname release+version: a kernel change can move the submit floor
 };
-struct orkpack_calib { uint32_t K, N, min_m, _pad; };   // K=N=0 => one global threshold for every shape
+// WHERE DOES DECODE RUN. A DECISION, not a set of mechanisms -- deliberately.
+//
+// The mechanisms (M==1 acceptance in supports_op, the fused FFN decode chain, group fusion at M=1) have
+// preconditions on each other, and as independent switches most combinations are silent no-ops.
+// ORK_FFN_DEC was dead for its entire existence in exactly that way: gated on ctx->via_orkd AND declined
+// upstream by supports_op at M==1, so setting it did nothing and nothing said so. An ordered route cannot
+// express a contradiction: each level implies the ones below it.
+enum ork_decode_route {
+    ORK_DECODE_CPU       = 0,   // supports_op declines dense MUL_MAT at M==1 (the measured-best default)
+    ORK_DECODE_NPU       = 1,   // dense M==1 matmuls on the NPU, per node
+    ORK_DECODE_NPU_FUSED = 2,   // + fused FFN decode chain + q,k,v/gate-up group fusion at M==1
+};
+// Row encoding. Sentinel keys are skipped by any reader that only matches its own keys, so new rows can be
+// added without a format bump -- which matters because a stale pack is refused rather than regenerated
+// (rebuilding a multi-GB pack costs hours).
+//   K=0, N=0                     -> global min_m threshold      (min_m = the threshold)
+//   K=ORK_CALIB_KEY_ROUTE, N=0   -> the resolved decode route   (min_m = enum ork_decode_route)
+//   K,N != 0                     -> per-shape min_m             (expressible, unpopulated today)
+#define ORK_CALIB_KEY_ROUTE 0xFFFFFFFFu
+struct orkpack_calib { uint32_t K, N, min_m, _pad; };
 
 // magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
 struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig;
@@ -415,6 +434,33 @@ static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? at
 static ggml_backend_ork_pack_config g_pack_cfg = { 0, true, nullptr, nullptr, 8.0f, 0.05f };
 static bool g_pack_cfg_set = false;
 
+/* THE one place the decode route is resolved. Precedence mirrors min_m's: an explicit override wins, then
+ * the pack's measured decision, then the default.
+ *
+ * ORK_M1_NPU and ORK_FFN_DEC are kept as deprecated aliases, and they can only RAISE the route. That is
+ * deliberate: it makes the old dead combination impossible to express. Setting ORK_FFN_DEC alone used to
+ * do nothing at all (supports_op declined M==1 upstream, so the FFN nodes never reached graph_compute);
+ * now it resolves to ORK_DECODE_NPU_FUSED, which includes the M==1 acceptance it always needed. */
+static int g_pack_decode_route = -1;   // set by the pack loader; -1 = no valid decision in the pack
+
+static int ork_decode_route_resolved(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    v = ORK_DECODE_CPU;
+    if (g_pack_decode_route > v) v = g_pack_decode_route;                        // the pack's measured decision
+    if (getenv("ORK_M1_NPU")  && v < ORK_DECODE_NPU)       v = ORK_DECODE_NPU;         // deprecated alias
+    if (getenv("ORK_FFN_DEC") && v < ORK_DECODE_NPU_FUSED) v = ORK_DECODE_NPU_FUSED;   // deprecated alias
+    if (const char * e = getenv("ORK_DECODE_ROUTE")) {                                 // explicit override wins
+        int r = atoi(e);
+        if (r >= ORK_DECODE_CPU && r <= ORK_DECODE_NPU_FUSED) v = r;
+    }
+    if (v != ORK_DECODE_CPU)
+        fprintf(stderr, "[ORK ROUTE] decode route %d (%s) — NOT the measured-best default on any model "
+                        "yet; see the wiki Model-Recipes page\n", v,
+                v == ORK_DECODE_NPU ? "dense M=1 on NPU" : "dense M=1 + fused FFN chain");
+    return v;
+}
+
 /* Caller-forced routing threshold for one measurement pass; <=0 restores normal selection. Exists because
  * ORK_MINM is read into a static on first use, so an env var cannot be flipped between passes of one run --
  * which is exactly what a sweep must do. */
@@ -436,12 +482,15 @@ extern "C" bool ggml_backend_ork_write_calib(const char * pack_path, int min_m) 
     const long at = ftell(f);                       // overwrite the old footer: block, then new footer
     orkpack_calib_hdr h; ork_calib_provenance(&h);
     orkpack_calib r; r.K = 0; r.N = 0; r.min_m = (uint32_t) min_m; r._pad = 0;
-    if (fwrite(&h, sizeof h, 1, f) != 1 || fwrite(&r, sizeof r, 1, f) != 1) { fclose(f); return false; }
-    ft.calib_off = (uint64_t) at; ft.calib_n = 1;
+    orkpack_calib rr; rr.K = ORK_CALIB_KEY_ROUTE; rr.N = 0; rr._pad = 0;
+    rr.min_m = (uint32_t) ork_decode_route_resolved();
+    if (fwrite(&h, sizeof h, 1, f) != 1 || fwrite(&r, sizeof r, 1, f) != 1 ||
+        fwrite(&rr, sizeof rr, 1, f) != 1) { fclose(f); return false; }
+    ft.calib_off = (uint64_t) at; ft.calib_n = 2;
     if (fwrite(&ft, sizeof ft, 1, f) != 1) { fclose(f); return false; }
     fclose(f);
-    fprintf(stderr, "[ORK CALIB] wrote global threshold M>=%d into %s (cpu_max=%u kHz, %u big cores)\n",
-            min_m, pack_path, h.cpu_max_khz, h.n_big);
+    fprintf(stderr, "[ORK CALIB] wrote global threshold M>=%d + decode route %u into %s (cpu_max=%u kHz, %u big cores)\n",
+            min_m, rr.min_m, pack_path, h.cpu_max_khz, h.n_big);
     return true;
 }
 
@@ -972,6 +1021,7 @@ struct ggml_backend_ork_context {
     std::unordered_map<std::string, int> placement;
     std::unordered_map<uint64_t, uint32_t> calib_minm;   // (K<<32|N) -> measured threshold (unused today)
     int calib_global = 0;                                // end-to-end measured threshold, 0 = none/stale
+    int decode_route = ORK_DECODE_CPU;                   // resolved once at load; see enum ork_decode_route
     uint64_t pack_meta_off = 0, pack_meta_size = 0;   // v6 embedded GGUF metadata section (0 = absent)
     // The model file's packed tensors are HOLES -> ork must serve them on every path. Set from
     // ORK_SOURCE_IS_STUB (the caller knows: it passed a .orkpack and used the extracted gguf) because
@@ -1497,7 +1547,12 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             const char * cp = (const char *) m + f.calib_off + sizeof ch;
                             for (uint32_t i = 0; i < f.calib_n; i++) {
                                 orkpack_calib r; memcpy(&r, cp, sizeof r); cp += sizeof r;
-                                if (r.K == 0 && r.N == 0) ctx->calib_global = (int) r.min_m;
+                                if (r.K == ORK_CALIB_KEY_ROUTE && r.N == 0) {
+                                    int rt = (int) r.min_m;
+                                    if (rt >= ORK_DECODE_CPU && rt <= ORK_DECODE_NPU_FUSED) {
+                                        ctx->decode_route = rt; g_pack_decode_route = rt;
+                                    }
+                                } else if (r.K == 0 && r.N == 0) ctx->calib_global = (int) r.min_m;
                                 else ctx->calib_minm[((uint64_t) r.K << 32) | r.N] = r.min_m;
                             }
                             fprintf(stderr, "[ORK CALIB] using measured threshold M>=%d from the pack\n", ctx->calib_global);
@@ -8886,7 +8941,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // daemon: it calls ork_i8_mm_run_chain / ork_i8_mm_run against ork_w* the wcache already holds, both
     // mode-agnostic. (Its name still says _orkd; that is now a misnomer.) Same defect as the fused attention
     // chain calling the daemon-only ork_mm_attn_rr_orkd unconditionally.
-    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8;
+    const bool ffn_dec = ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED && ctx->qbits == 8;
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -9017,7 +9072,11 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // at EVERY M>=2 — pp2 +10.8%, pp4 +10.5%, pp8 +8-9%, pp64 +12-17%. At M=1: pp1 is +1% but
                     // autoregressive tg-decode REGRESSES (prior: 9.4->6.4), so the floor is M>=2 (decode M=1 stays
                     // unfused). Covers all prefill + DFlash's M=block batched-verify. ORK_FUSE_MINM overrides.
-                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 2;
+                    // Default floor 2 keeps decode out; the FUSED route lowers it to 1 so q,k,v and
+                    // gate/up batch at M==1 too (measured +2.8% there). ORK_FUSE_MINM still overrides
+                    // explicitly, for prefill sweeps that have nothing to do with the decode route.
+                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM"))
+                                               : (ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED ? 1 : 2);
                     if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] >= fuse_minm) {
                         if (scan_ahead) {
                             // Step 1: scan the WHOLE remaining subgraph for INDEPENDENT same-input matmuls,
@@ -10039,7 +10098,8 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
             // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
             if (g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;   // WRITE/convert: force M>=1 on NPU for EVERY dtype (int8 AND int4) so every weight packs — else int4 FFN falls to CPU and packs ZERO
-            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) && env_enabled("ORK_M1_NPU")) threshold = 1;
+            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) &&
+                     ork_decode_route_resolved() >= ORK_DECODE_NPU) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
             // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
