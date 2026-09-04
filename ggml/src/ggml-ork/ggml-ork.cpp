@@ -7081,6 +7081,18 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
     // suboptimally (K-slice re-reads, socket copies). run() time = socket + submit(5us) + HW + return.
     static int fprof=-1; if(fprof<0) fprof=getenv("ORK_FFN_PROF")?1:0;
     static double p_q=0,p_gu=0,p_host=0,p_dn=0,p_deq=0; static long p_n=0; double _t;
+    /* DOWN-ONLY doorbell split. The shared counters average q,k,v,o and down (5 calls/layer at route 2),
+     * so they cannot be compared with a single-shape probe run — which is exactly the trap noted in the
+     * roadmap. Reset immediately before the down call and read immediately after, isolating one shape. */
+    static double d_beg=0, d_end=0; static long d_bn=0, d_en=0;
+    /* Kernel-side per-job HARDWARE time (#patch74) around the SAME isolated down call. Userspace only
+     * sees hardware time plus detection latency; this separates them. */
+    static unsigned long long d_hw=0; static unsigned long d_hn=0; static double d_poll=0;
+    auto hw_zero = [](){ FILE*f; if((f=fopen("/sys/module/rknpu/parameters/hw_ns_sum","w"))){fputs("0",f);fclose(f);}
+                         if((f=fopen("/sys/module/rknpu/parameters/hw_n","w"))){fputs("0",f);fclose(f);} };
+    auto hw_read = [](unsigned long long*sum,unsigned long*n){ FILE*f; *sum=0; *n=0;
+        if((f=fopen("/sys/module/rknpu/parameters/hw_ns_sum","r"))){ if(fscanf(f,"%llu",sum)!=1)*sum=0; fclose(f);}
+        if((f=fopen("/sys/module/rknpu/parameters/hw_n","r"))){ if(fscanf(f,"%lu",n)!=1)*n=0; fclose(f);} };
     const float * xf = (const float *) x->data;
     float amx=1e-9f; for (int k=0;k<K;k++){ float a=fabsf(xf[k]); if(a>amx)amx=a; }
     const float a_scale=amx/127.0f, ainv=127.0f/amx;
@@ -7102,8 +7114,13 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
       const float gs=gmax/127.0f, ginv=127.0f/gmax;
       for (int n=0;n<Nff;n++){ int q=(int)lrintf(glf[n]*ginv); glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
       if(fprof){ p_host+=ork_now_us()-_t; _t=ork_now_us(); }
+      if(fprof){ ork_npu_db_reset(); hw_zero(); }
       if (ork_i8_mm_run(ctx->npu, wd, 1, glu8, di)) goto done;                                            // down: ONE submit (wide-K)
-      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us(); }
+      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us();
+                 double _b=0,_e=0; long _bn=0,_en=0; ork_npu_db_timing(&_b,&_bn,&_e,&_en);
+                 d_beg+=_b; d_bn+=_bn; d_end+=_e; d_en+=_en;
+                 unsigned long long _hs=0; unsigned long _hn=0; hw_read(&_hs,&_hn); d_hw+=_hs; d_hn+=_hn;
+                 d_poll += ork_npu_db_poll(); }
       float * dst=(float*)down_n->data;
       for (int j=0;j<Kd;j++) dst[j]=(float)((double)di[j]*gs*bsd[j]);
       if(fprof) p_deq+=ork_now_us()-_t;
@@ -7115,10 +7132,11 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
          * an M=1 call is host-side (regcmd synth + bsync + ioctl) and only 38% is the sentinel poll, i.e.
          * ~19 GB/s of real hardware bandwidth already. So the handler's shortfall has to show up as
          * either a bigger `begin` (host) or a bigger `end` (poll) — this prints which. */
-        { double bu=0,eu=0; long bn=0,en=0; ork_npu_db_timing(&bu,&bn,&eu,&en);
-          if(bn) fprintf(stderr,"[ork-ffn-DOORBELL] begin=%.1fus/call (n=%ld)  end(poll+writeback)=%.1fus/call (n=%ld)\n",
-                         bu/bn, bn, en?eu/en:0.0, en);
-          ork_npu_db_reset(); }
+        if(d_bn) fprintf(stderr,"[ork-ffn-DOWN-ONLY] begin=%.1f  end(poll)=%.1f us/call | KERNEL hw=%.1f us/job over %lu jobs (%.1f jobs/call, hw/call=%.1f) | end split: WAIT=%.1f  post(drain+accum+writeback)=%.1f\n",
+                         d_beg/d_bn, d_en?d_end/d_en:0.0, d_hn?(double)d_hw/d_hn/1000.0:0.0, d_hn,
+                         (double)d_hn/d_bn, (double)d_hw/d_bn/1000.0,
+                         d_poll/d_bn, (d_end - d_poll)/d_bn);
+        d_beg=d_end=d_poll=0; d_bn=d_en=0; d_hw=0; d_hn=0;
         fprintf(stderr,"[ork-ffn-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus(%.1fGB/s) host-silu %.0fus Down %.0fus(%.1fGB/s) deq %.0fus | %.0fus/layer\n",
             p_n, p_q/p_n, p_gu/p_n, gub/(p_gu/p_n*1e3), p_host/p_n, p_dn/p_n, dnb/(p_dn/p_n*1e3), p_deq/p_n, T/p_n); } }
     { static long n=0; if((n++%256)==0) fprintf(stderr,"[ork-ffn-dec] per-channel decode FFN on NPU (call %ld): K=%d Nff=%d Kd=%d\n", n,K,Nff,Kd); }
