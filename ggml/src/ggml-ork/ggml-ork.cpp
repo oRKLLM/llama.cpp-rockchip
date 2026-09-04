@@ -488,11 +488,30 @@ static int g_pack_decode_route = -1;   // set by the pack loader; -1 = no valid 
 struct ork_recipe { const char * soc; uint32_t n_layer, n_embd, n_ff, attn_kv; int decode_route; int min_m; const char * note; };
 
 static const ork_recipe ORK_RECIPES_BUILTIN[] = {
+    /* All rows measured 2026-09-04 on rk3588 (A76 @2400MHz, kernel 6.1.115 #70, governors performance),
+     * ork_bench P=512 G=32, route 0 vs route 2 (and route 1 where it mattered). */
     { "rk3588", 28, 1024,  3072, 1024, ORK_DECODE_CPU, 0,
-      "qwen3-0.6b-f16: every decode-on-NPU route measured 2.8-3x slower than CPU (2026-09-04)" },
+      "qwen3-0.6b-f16: CPU 15.70 vs route2 5.12-5.58 tok/s — NPU decode 2.8-3x slower" },
     { "rk3588", 28, 2048, 12288, 1024, ORK_DECODE_CPU, 0,
-      "qwen3-1.7b-f16: decode on CPU; the prefill FFN chain costs +0.35% PPL and +42% wall (2026-09-04)" },
+      "qwen3-1.7b (f16 AND q8_0 — same shape, one row): CPU 10.21 vs route2 10.36 tok/s, a tie inside "
+      "noise, so the default stands. Prefill FFN chain costs +0.35% PPL and +42% wall" },
+    { "rk3588", 28, 1536, 17920,  256, ORK_DECODE_CPU, 0,
+      "qwen2.5-1.5b-instruct-q8_0: CPU 11.51 vs route2 11.48 tok/s — tie inside noise, default stands" },
+    { "rk3588", 24, 1024,  3584,    0, ORK_DECODE_NPU, 0,
+      "qwen3.5-0.8b-bf16: NPU DECODE WINS — CPU 2.44 vs route1 3.13 tok/s (1.28x), reproducible to 0.4% "
+      "over 3 trials. route1 == route2 (3.13 both), so the win is M==1 acceptance alone and the fused FFN "
+      "chain adds nothing — hence route 1, not 2. THE FIRST MODEL WHERE DECODE-ON-NPU PAYS: attn_kv=0 marks "
+      "the GDN/linear-attention architecture, whose CPU decode baseline is unusually low, leaving headroom "
+      "the dense models do not have" },
 };
+
+/* A fingerprint is only a usable KEY if it actually discriminates. SSM/Mamba models have no attn_q /
+ * ffn_gate / attn_k tensors, so their fingerprint collapses to n_layer alone (measured: mamba2-130m
+ * 24/0/0/0, mamba2-2.7b 64/0/0/0) — which would happily collide with any future model of the same depth
+ * and apply the wrong recipe. Require n_embd, and let a degenerate key fall through to the safe default.
+ * Costs nothing today: both Mamba models measured CPU-decode-best anyway (130m 64.88 vs 36.30 route2;
+ * 2.7b 6.47 vs 6.09), which IS the default. Giving them real rows needs SSM-specific fields in the key. */
+static bool ork_fp_usable(void) { return g_model_fp.n_layer != 0 && g_model_fp.n_embd != 0; }
 
 static bool ork_recipe_match(const ork_recipe & r, const char * soc) {
     return soc && r.soc && strcmp(r.soc, soc) == 0 &&
@@ -504,6 +523,11 @@ static bool ork_recipe_match(const ork_recipe & r, const char * soc) {
  * Returns false when nothing matches -- the caller then keeps the safe default. */
 static bool ork_recipe_lookup(const char * soc, ork_recipe * out) {
     if (!soc || !g_model_fp.n_layer) return false;          // no pack / no SoC => no key, do not guess
+    if (!ork_fp_usable()) {
+        fprintf(stderr, "[ORK RECIPE] fingerprint too weak to key on (n_layer=%u, no attn/ffn shapes — "
+                        "an SSM model?) — using safe defaults\n", g_model_fp.n_layer);
+        return false;
+    }
     const char * paths[4]; int np = 0;
     if (const char * e = getenv("ORK_RECIPES")) paths[np++] = e;
     paths[np++] = "ork-recipes.txt";
