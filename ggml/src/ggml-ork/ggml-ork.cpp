@@ -2866,8 +2866,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
      * concatenation under this same pointer, and the unfused path (decode) must not run against it.
      * Rebuild rather than trust the key. See ork_wcache_shape_ok. */
     if (it != ctx->wcache.end() && expert < 0 && !ork_wcache_shape_ok(it->second, K, N)) {
+        // ork_mm_free, NOT ork_w_free: ork_w_free releases host memory only ("device buffers freed at ctx
+        // teardown"), and this collision fires TWICE PER REQUEST (prefill packs the fused group weight,
+        // decode the per-tensor one), so the dropped weight's NPU buffers and IOVA were never returned.
+        // Measured on Qwen3.5-4B: +100 bcreates / +675 MiB IOVA per request, 0 bdestroys, until the 3900
+        // MiB per-domain guard refused a bcreate (orki_pack Bb[4]) on the 9th request and llama_decode
+        // failed. Same release the LRU eviction uses.
+        ork_slice_ws_drop(ctx, it->second.w);
+        ork_mm_free(ctx->npu, it->second.w);
         ctx->wcache_bytes -= it->second.bytes;
-        ork_w_free(it->second.w);
         ctx->wcache.erase(it);
         it = ctx->wcache.end();
     }
@@ -4612,8 +4619,10 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
     /* A hit under this key may be the PER-TENSOR weight (preload, or an earlier unfused decode), which is
      * not what this path is about to run. Drop it and rebuild the concatenation. See ork_wcache_shape_ok. */
     if (it != ctx->wcache.end() && !ork_wcache_shape_ok(it->second, K, Ntot)) {
+        // Free the NPU buffers too (ork_mm_free), see the per-tensor site: ork_w_free leaked them per request.
+        ork_slice_ws_drop(ctx, it->second.w);
+        ork_mm_free(ctx->npu, it->second.w);
         ctx->wcache_bytes -= it->second.bytes;
-        ork_w_free(it->second.w);
         ctx->wcache.erase(it);
         it = ctx->wcache.end();
     }
