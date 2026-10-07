@@ -411,11 +411,18 @@ static uint32_t ork_build_sig(void) {
 #define ORK_PROV_GPTQ    0x1u
 #define ORK_PROV_IMATRIX 0x2u
 /* LOCKED: this pack must never be regenerated over. Unlike the size guard and the provenance guard,
- * ORK_ORKPACK_CLOBBER does NOT override it -- if it did, the lock would add nothing, since CLOBBER
- * already overrides both of those. Clearing it is a deliberate, separate act on the file itself
- * (tools/orkpack_lock --unlock), which is the point: an irreplaceable pack should take two decisions
- * to destroy, not one environment variable set by a script that meant to do something else. */
+ * It is the ONLY override in this file: ORK_ORKPACK_CLOBBER was removed, because an environment
+ * variable that waves past every guard is exactly the thing a script sets by accident. Clearing a
+ * lock is a deliberate, separate act on the file itself (rm <pack>.lock), which is the point: an
+ * irreplaceable pack should take two decisions to destroy, not one env var. */
 #define ORK_PROV_LOCKED  0x4u
+/* PARTIAL: this pack is a CHECKPOINT of a build that has not finished. It is a fully valid pack --
+ * real index, real footer, loadable -- it simply contains fewer weights than the model has. The
+ * build writes one of these periodically so that a crash leaves a usable artifact instead of a dead
+ * .tmp, and so the next run can carry on from it instead of starting the (GGUF-load-bound) pack
+ * from zero. Readers MUST NOT treat a PARTIAL pack as the finished article: it is missing weights
+ * by construction, so anything benchmarking or shipping it is measuring the wrong thing. */
+#define ORK_PROV_PARTIAL 0x8u
 
 static uint64_t ork_file_hash(const char * p) {
     FILE * f = fopen(p, "rb");
@@ -1211,6 +1218,9 @@ struct ggml_backend_ork_context {
     size_t   spool_ram_bytes = 0;          // RAM bytes held across all stream entries (RAM-LRU budget)
     long     spool_remaps = 0, spool_ram_evicts = 0, spool_iova_unmaps = 0;  // diagnostics
     // .orkpack persist (path derived from the model; ORK_ORKPACK_PATH overrides): 0 off, 1 read (mmap'd), 2 write
+    /* 0 = none, 1 = reading a pack, 2 = building one, 3 = RESUMING: reading the weights a previous
+     * run already packed AND appending the rest to the same file. Mode 3 is both, which is why the
+     * tests below go through the two predicates rather than comparing the int. */
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
     std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
@@ -1410,6 +1420,15 @@ struct ggml_backend_ork_context {
     // packed as an IMPORT (like every other weight) so it doesn't fragment the domain's 32-bit IOVA with a
     // native-alloc outlier. No dedicated fc.wg domains, no extra volume, no per-layer domain-switch thrashing.
 };
+
+/* Does this mode serve already-packed bytes from the mapped pack? (read or resume) */
+static inline bool ork_persist_reads(const ggml_backend_ork_context * ctx) {
+    return ctx->persist_mode == 1 || ctx->persist_mode == 3;
+}
+/* Does this mode append newly-packed bytes to an open pack file? (build or resume) */
+static inline bool ork_persist_writes(const ggml_backend_ork_context * ctx) {
+    return ctx->persist_mode == 2 || ctx->persist_mode == 3;
+}
 static ggml_backend_ork_context * g_ork_ctx = nullptr;
 static bool g_ork_hybrid_loading = false;
 // ---- MoE AUTO-PROFILE (no env knobs: the MODEL TYPE selects the quantization/placement scheme) ----
@@ -1543,7 +1562,7 @@ static inline void ork_slice_ws_drop(ggml_backend_ork_context * ctx, ork_w * w) 
 static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
     // Convert mode (building .orkpack): keep ~0 resident — pack→dump→free each weight (evicted by the next
     // pack). This makes conversion fit ANY model size (≤1 weight in the 4 GiB window) and avoids thrash.
-    const size_t budget = ctx->persist_mode == 2 ? 0 : ork_wcache_budget();
+    const size_t budget = ork_persist_writes(ctx) ? 0 : ork_wcache_budget();   /* resume builds too */
     while (ctx->wcache_bytes + need > budget && !ctx->wcache.empty()) {
         auto lru = ctx->wcache.end();
         for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
@@ -1861,13 +1880,14 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     /* REFUSE to overwrite a pack we should have been able to read. See pack_well_formed above: reaching
      * the writer with a well-formed, non-stale pack on disk means an adopt gate rejected what the
      * staleness gate accepted, and rebuilding would silently replace hours of GPTQ work with RTN
-     * weights AND make the run report a bogus number. Fail loudly instead; ORK_ORKPACK_CLOBBER=1 is
-     * the deliberate override for the case where the operator really does want it rebuilt in place. */
-    if (pack_well_formed && !stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+     * weights AND make the run report a bogus number. Fail loudly instead. There is no env override:
+     * this condition is a BUG, not a policy decision, and the escape is to delete the pack, which is
+     * explicit and leaves no doubt about what was discarded. */
+    if (pack_well_formed && !stale) {
         fprintf(stderr,
             "[ORK PERSIST] FATAL: %s is well-formed and NOT stale, but was not adopted — refusing to\n"
             "              overwrite it. This is a loader bug, not a stale pack. Re-run with\n"
-            "              ORK_ORKPACK_CLOBBER=1 only if you intend to discard and rebuild this pack.\n", p);
+            "              Delete the pack if you genuinely intend to discard and rebuild it.\n", p);
         abort();
     }
     /* The size threshold that used to live here (ORK_ORKPACK_MAX_REGEN_MB, default 2048) is GONE.
@@ -1888,7 +1908,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
      * ("this run differs"). Both are overridable because both can be wrong. A lock is neither: it is a
      * human saying "this specific artifact is not reproducible, do not touch it", and the only thing
      * that should clear it is the same human clearing it on the file. So this check runs FIRST, ignores
-     * ORK_ORKPACK_CLOBBER, and is NOT gated on `stale` -- reaching the writer at all means something is
+     * every other guard, and is NOT gated on `stale` -- reaching the writer at all means something is
      * about to replace this file, and whether that was triggered by staleness, by CLOBBER or by a loader
      * bug is irrelevant to a pack that said do not touch me. */
     /* SIDECAR LOCK: <pack>.lock, checked INDEPENDENTLY of the footer flag.
@@ -1909,8 +1929,8 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         if (stat(lockp.c_str(), &lst) == 0) {
             fprintf(stderr,
                 "[ORK PERSIST] FATAL: %s is LOCKED by %s — refusing to write over it.\n"
-                "              A locked pack is one someone marked as not reproducible. ORK_ORKPACK_CLOBBER\n"
-                "              does NOT override this. To proceed, remove the lock deliberately:\n"
+                "              A locked pack is one someone marked as not reproducible. Nothing overrides\n"
+                "              this. To proceed, remove the lock deliberately:\n"
                 "                  rm %s\n"
                 "              Or point this run at a different pack path and leave this one alone.\n",
                 p, lockp.c_str(), lockp.c_str());
@@ -1921,8 +1941,8 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (prov_have && (prov_flags & ORK_PROV_LOCKED)) {
         fprintf(stderr,
             "[ORK PERSIST] FATAL: %s is LOCKED — refusing to write over it%s.\n"
-            "              A locked pack is one someone marked as not reproducible. ORK_ORKPACK_CLOBBER does\n"
-            "              NOT override this. To proceed you must unlock it deliberately:\n"
+            "              A locked pack is one someone marked as not reproducible. Nothing overrides this.\n"
+            "              To proceed you must unlock it deliberately:\n"
             "                  orkpack_lock --unlock %s\n"
             "              Or point this run at a different pack path and leave this one alone.\n",
             p, stale ? " (this build considers it stale)" : "", p);
@@ -1938,7 +1958,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
      *
      * Only the regeneration path cares. Reading such a pack without those inputs is correct and normal:
      * they were consumed at pack time and their effect is already in the bytes. */
-    if (stale && prov_have && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+    if (stale && prov_have) {
         uint32_t now_flags = 0; uint64_t now_imhash = 0;
         ork_pack_provenance(&now_flags, &now_imhash);
         if (prov_flags != now_flags || prov_imhash != now_imhash) {
@@ -1948,7 +1968,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 "                built with : GPTQ=%s imatrix=%s (content %016llx)\n"
                 "                this run   : GPTQ=%s imatrix=%s (content %016llx)\n"
                 "              Re-run with the same ORK_GPTQ / ORK_IMATRIX=<file> to rebuild it faithfully,\n"
-                "              or set ORK_ORKPACK_CLOBBER=1 to accept a plain rebuild from the GGUF.\n",
+                "              or delete the pack to accept a plain rebuild from the GGUF.\n",
                 p,
                 (prov_flags & ORK_PROV_GPTQ)    ? "yes" : "no",
                 (prov_flags & ORK_PROV_IMATRIX) ? "yes" : "no", (unsigned long long) prov_imhash,
@@ -2214,7 +2234,7 @@ static bool ork_orkpack_cpu_only() { static const int v = getenv("ORK_ORKPACK_CP
 static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name, int K, int N,
                               const ork_weight & ow, const float * f32_plane, enum ggml_type src_type,
                               const int8_t * bi_i8 = nullptr) {
-    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    if (!ork_persist_writes(ctx) || !ctx->persist_out) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped — a convert-decode re-pack, don't duplicate
     // Quality NOTE (once per build): quantizing an ALREADY-QUANTIZED source compounds error, and the NF4
     // codebook can't recover it (it fits the ORIGINAL weight distribution). We route the codebook by the SOURCE,
@@ -2311,7 +2331,7 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
 // group_i4 cold pack (dequant->FWHT-rotate->int4->tile) is done ONCE at convert and reloaded as a plain DMA
 // copy (ork_i4_mm_load). The twin of the int8-tier dump above, for the W4A4 COMPUTE path.
 static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
-    if (ctx->persist_mode != 2 || !ctx->persist_out || !ow.w) return;
+    if (!ork_persist_writes(ctx) || !ctx->persist_out || !ow.w) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped (convert-decode re-pack)
     size_t tb = ork_w_dump(ow.w, nullptr, 0);   // offline: ork_w_dump CPU-tiles, same bytes
     if (!tb) return;
@@ -2354,7 +2374,7 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
  * ORK_ALLOW_PACK_MISS=1 downgrades the abort to a warning for deliberate experiments. */
 static void ork_pack_miss_check(ggml_backend_ork_context * ctx, const char * name, int K, int N,
                                 const uint32_t * serves, int n_serves) {
-    if (!ctx || ctx->persist_mode != 1) return;
+    if (!ctx || !ork_persist_reads(ctx)) return;
     auto pit = ctx->persist_idx.find(name);
     if (pit == ctx->persist_idx.end()) return;                  /* genuine cold weight -- pack it inline */
     const orkpack_entry & e = pit->second;
@@ -2389,7 +2409,7 @@ static void ork_pack_miss_check(ggml_backend_ork_context * ctx, const char * nam
 }
 
 static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, ork_weight & ow) {
-    if (ctx->persist_mode != 1 || !ctx->persist_map) return false;
+    if (!ork_persist_reads(ctx) || !ctx->persist_map) return false;
     auto pit = ctx->persist_idx.find(name);
     if (pit == ctx->persist_idx.end() || pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N ||
         (pit->second.dtype != ORKPACK_DT_I4_NATIVE && pit->second.dtype != ORKPACK_DT_I8_ROT &&
@@ -2525,7 +2545,7 @@ static void ork_expert_dequant_quant(const struct ggml_tensor * src0, int e, int
 
 static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
                                       int K, int N, enum ggml_type type, ggml_to_float_t to_float) {
-    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    if (!ork_persist_writes(ctx) || !ctx->persist_out) return;
     const int n_expert = (int) src0->ne[2];
 
     // Experts still needing a (re)build this run — skip any already dumped.
@@ -2732,7 +2752,7 @@ static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
  * signature of a stub run without (or with the wrong) pack; refuse rather than emit confident garbage.
  * Only tensors ork would claim are checked: a genuinely zero norm/bias in a real model is not our business. */
 static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, const void * data, size_t nbytes) {
-    if (ctx->persist_mode != 1) return;                 /* only meaningful when a pack is being read */
+    if (!ork_persist_reads(ctx)) return;                /* only meaningful when a pack is being read */
     if (!data || nbytes < 4096) return;
     const unsigned char * p = (const unsigned char *) data;   /* sample, don't scan gigabytes */
     bool zero = true;
@@ -2888,7 +2908,7 @@ extern "C" bool ggml_backend_ork_extract_gguf(const char * pack_path, const char
 
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
 static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
-    if (ctx->persist_mode != 2 || !ctx->persist_out) return;
+    if (!ork_persist_writes(ctx) || !ctx->persist_out) return;
     if (ctx->persist_built.empty()) {
         fclose(ctx->persist_out); ctx->persist_out = nullptr; unlink(ctx->persist_tmp.c_str()); return;
     }
@@ -3033,7 +3053,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         return it;
     }
 
-    if (ctx->persist_mode == 1) {
+    if (ork_persist_reads(ctx)) {
         // .orkpack hit: load pre-tiled bytes straight into DMA (no dequant/quant/tile). Per-weight
         // (K,N,dtype) is re-checked so a stale file can't feed wrong weights — mismatch → pack below.
         auto pit = ctx->persist_idx.find(expert >= 0 ? ork_expert_key(src0->name, expert) : std::string(src0->name));   // MoE: per-expert orkpack entry
@@ -3127,7 +3147,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
      * lookup finds nothing for them and this stays silent -- deliberately conservative. */
     { static const uint32_t serves[] = { ORKPACK_DT_I8, ORKPACK_DT_I4 };
       ork_pack_miss_check(ctx, src0->name, K, N, serves, 2); }
-    if (ctx->persist_mode == 1) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
+    if (ork_persist_reads(ctx)) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
         // weight (name/shape/dtype mismatch or incomplete pack) so we fall back to live Q8_0->int8-tile
         // conversion (~25x the orkpack load — measured 16.7s vs 0.66s resolve on the 1.7B). Make it LOUD
         // (bounded) so "it's using Q8_0 not the orkpack" can never hide behind a silent fallback again.
@@ -4170,7 +4190,7 @@ static bool ork_cpu_decode_m1(ggml_backend_ork_context * ctx, struct ggml_tensor
     const struct ggml_tensor * src1 = dst->src[1];
     if (!src0 || !src1 || dst->ne[1] != 1) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
-    if (ctx->persist_mode != 1 || !ctx->persist_map || !src0->name[0]) return false;
+    if (!ork_persist_reads(ctx) || !ctx->persist_map || !src0->name[0]) return false;
     const int K = (int) src0->ne[0], N = (int) src0->ne[1];
     if (K % 32 || N % 64) return false;                     /* un-tiler's shape constraint */
     auto pit = ctx->persist_idx.find(src0->name);
@@ -4249,7 +4269,7 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                 /* ROTATED tier WIDTH. Promotion keeps the rotation and widens the quantiser instead of
                  * leaving the rotated path — measurement said losing rotation costs ~7x what the extra
                  * precision buys. QMAX is the only thing that differs downstream. */
-                const bool promo = (ctx->persist_mode == 2 && ork_i4_force_i8(src0->name));
+                const bool promo = (ork_persist_writes(ctx) && ork_i4_force_i8(src0->name));
                 ow.wbits = (promo && ork_promote_tier() == 0) ? 8 : 4;          /* rot8 widens the weight */
                 ow.abits = (promo && (ork_promote_tier() == 0 || ork_promote_tier() == 3)) ? 8 : 4;
                 const int QMAX = ow.wbits == 8 ? 127 : 7;
@@ -4776,7 +4796,7 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
         snprintf(gname, sizeof gname, "%s#grp%dx%d", g[0]->src[0]->name, ng, Ntot);
         int _dom = 0;
         bool loaded = false;
-        if (ctx->persist_mode == 1) {                    // READ: load the fused weight from the .orkpack if present
+        if (ork_persist_reads(ctx)) {                    // READ: load the fused weight from the .orkpack if present
             auto pit = ctx->persist_idx.find(gname);
             if (pit != ctx->persist_idx.end() && pit->second.K == (uint32_t) K &&
                 pit->second.N == (uint32_t) Ntot && pit->second.dtype == ORKPACK_DT_I8) {
@@ -5714,7 +5734,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // .orkpack convert (write mode): persist ALL n_expert slices of this `_exps` tensor (not just the
     // routed ones — a complete pack needs every expert). Deduped per synthetic key so re-visits in a
     // multi-token / multi-step convert don't re-dump. Inference (mode 1/0) skips this entirely.
-    if (ctx->persist_mode == 2) {
+    if (ork_persist_writes(ctx)) {
         ork_persist_write_experts(ctx, src0, K, N, type, to_float);
         // Convert is a one-time pack pass: the actual MoE forward doesn't need the NPU here (the
         // per-expert submit floor makes MoE-on-NPU very slow and it can soft-reset the device on this
@@ -5807,7 +5827,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 // Prefer the orkpack's native-int4 expert bytes (these carry the GPTQ codes when the pack was
                 // GPTQ-built); on a miss (no orkpack / not-yet-dumped) cold-pack from src0 (FWHT + int4 RTN).
                 const orkpack_entry * pe = nullptr;
-                if (ctx->persist_mode == 1 && ctx->persist_map) {
+                if (ork_persist_reads(ctx) && ctx->persist_map) {
                     auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
                     if (pit != ctx->persist_idx.end() && pit->second.dtype == ORKPACK_DT_I4_NATIVE &&
                         pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N) pe = &pit->second;
@@ -6016,7 +6036,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     static int8_t ork_nf4_lut[16]; static int ork_lut_done = 0;
     if (!ork_lut_done) { for (int i=0;i<16;i++) ork_nf4_lut[i]=(int8_t)lrintf(ORK_NF4_LVL[i]*127.0f); ork_lut_done=1; }
     int8x16_t ork_lutv = vld1q_s8(ork_nf4_lut);
-    if (ctx->persist_mode == 1 && ctx->persist_map) {
+    if (ork_persist_reads(ctx) && ctx->persist_map) {
         auto p0 = ctx->persist_idx.find(ork_expert_key(src0->name, 0));
         if (p0 != ctx->persist_idx.end() && p0->second.dtype == ORKPACK_DT_I4) {
             ork_native = true;
@@ -6083,7 +6103,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         // #2 precision gate (BEFORE any eviction/budget commit): if int8-only mode and this expert is
         // stored sub-int8 in the orkpack, refuse residency (caller -> CPU). No-op in live-pack mode (no
         // orkpack: everything packs to int8) and in greedy mode (int8_only off).
-        if (int8_only && ctx->persist_mode == 1) {
+        if (int8_only && ork_persist_reads(ctx)) {
             auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
             if (pit != ctx->persist_idx.end() && pit->second.dtype != ORKPACK_DT_I8)
                 return (ggml_backend_ork_context::ork_hot_slot *) nullptr;
@@ -6108,7 +6128,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         ggml_backend_ork_context::ork_hot_slot slot;
         // .orkpack hit (persist_mode==1): load pre-tiled bytes; else pack live from the dequantized plane.
         const orkpack_entry * pe = nullptr;
-        if (ctx->persist_mode == 1) {
+        if (ork_persist_reads(ctx)) {
             auto pit = ctx->persist_idx.find(ork_expert_key(src0->name, e));
             if (pit != ctx->persist_idx.end() && pit->second.K==(uint32_t)K && pit->second.N==(uint32_t)N &&
                 (pit->second.dtype==ORKPACK_DT_I8 || pit->second.dtype==ORKPACK_DT_I4)) pe = &pit->second;
@@ -9133,6 +9153,10 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
 extern "C" int ggml_backend_ork_preload(void) {
     ggml_backend_ork_context * ctx = g_ork_ctx;
     if (!ctx || ctx->preload_done) return 0;
+    /* Deliberately mode 1 ONLY, not ork_persist_reads(): a RESUMING run (mode 3) does have a pack to
+     * preload from, but it is also about to append to that same file, and bulk-preloading weights it is
+     * concurrently writing is an interaction nobody has measured. Resume therefore skips preload and
+     * loads on demand -- correct, just not optimal. Revisit with a measurement, not a guess. */
     if (ctx->persist_mode != 1) return 0;   /* read mode only: nothing to preload while BUILDING a pack */
     ctx->preload_done = 1;                       /* stop the registry growing while we walk it */
     if (ctx->preload_reg.empty()) return 0;
@@ -9523,7 +9547,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // not catch it. The members ARE in the pack individually, so decline the fusion and let each
                     // node take the single mul_mat path, which resolves from the pack. Non-stub sources and packs
                     // that do contain the fused entry are untouched, so this costs nothing in the normal case.
-                    if (ng >= 2 && ctx->source_is_stub && ctx->persist_mode == 1) {
+                    if (ng >= 2 && ctx->source_is_stub && ork_persist_reads(ctx)) {
                         int _Ntot = 0; for (int z = 0; z < ng; z++) _Ntot += (int) grp[z]->src[0]->ne[1];
                         char _gname[256];
                         snprintf(_gname, sizeof _gname, "%s#grp%dx%d", grp[0]->src[0]->name, ng, _Ntot);
@@ -9577,7 +9601,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         bool native_w4a4 = (target_qbits == 4) && ctx->hadamard;
                         /* UNROTATED promotion: leave the rotated path entirely so the weight is written
                          * as plain DT_I8 (mul_mat_i8 quantises from source per-channel, no Hadamard). */
-                        if (native_w4a4 && ctx->persist_mode == 2 && !ork_promote_rotated() && ork_i4_force_i8(name))
+                        if (native_w4a4 && ork_persist_writes(ctx) && !ork_promote_rotated() && ork_i4_force_i8(name))
                             native_w4a4 = false;
 
                         /* BUILD side only (persist_mode 2 = convert). A promoted weight STAYS on the
@@ -9600,7 +9624,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                          * This is what makes a MIXED-tier pack work: per-layer precision becomes a build
                          * decision recorded in the file, and scoring needs no env at all. A homogeneous pack
                          * is unaffected — every entry maps to the route it already took. */
-                        if (ctx->persist_mode == 1) {
+                        if (ork_persist_reads(ctx)) {
                             auto pit = ctx->persist_idx.find(name);
                             /* A MISS is the dangerous case: routing silently does nothing and the env decides
                              * after all, which looks identical to "routing agreed" on a homogeneous pack.
@@ -10517,7 +10541,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
             // LFM2.5/Qwen3.6-35B: ~1440 M=1 run_i8 submits/decode = 82% of run time, decode 14/6.16 vs ggml
             // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
             // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
-            if (g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;   // WRITE/convert: force M>=1 on NPU for EVERY dtype (int8 AND int4) so every weight packs — else int4 FFN falls to CPU and packs ZERO
+            if (g_ork_ctx && ork_persist_writes(g_ork_ctx)) threshold = 1;   // WRITE/convert: force M>=1 on NPU for EVERY dtype (int8 AND int4) so every weight packs — else int4 FFN falls to CPU and packs ZERO
             else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) &&
                      ork_decode_route_resolved() >= ORK_DECODE_NPU) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
@@ -10529,7 +10553,7 @@ static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tens
                 static const int pe = env_enabled("ORK_MOE_PHASE_EVICT");
                 // NEVER decline M==1 in WRITE/convert mode: the .orkpack is built by a single 1-token forward,
                 // so declining M==1 there would pack ZERO dense weights (and leave a useless pack behind).
-                const bool writing = g_ork_ctx && g_ork_ctx->persist_mode == 2;
+                const bool writing = g_ork_ctx && ork_persist_writes(g_ork_ctx);
                 if ((pe || ork_moe_auto()) && !writing && M == 1 && op->ne[2] == 1 && op->ne[3] == 1) return false;
             }
             // ORK_FFN_DEC: admit the DECODE (M==1) FFN gate/up/down to the NPU so the whole gate/up/GLU/down
