@@ -251,7 +251,7 @@ static bool env_enabled(const char * name) {
  * not as "your pack was dropped". Keep all version comparisons going through this function. */
 // EXACTLY 6. The old range accepted 6..8, which was right while 7 and 8 were live formats; now that they
 // are collapsed, a v7/v8 file on disk is a DIFFERENT layout wearing a number we reuse, so it must be
-// rejected, not read. It reports as STALE and (over ORK_ORKPACK_MAX_REGEN_MB) refuses to regenerate.
+// rejected, not read. It reports as STALE and is regenerated, unless a <pack>.lock sidecar says otherwise.
 static inline bool ork_pack_version_ok(uint32_t v) { return v == ORKPACK_VERSION; }
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
@@ -1870,30 +1870,18 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             "              ORK_ORKPACK_CLOBBER=1 only if you intend to discard and rebuild this pack.\n", p);
         abort();
     }
-    /* REGENERATING A LARGE PACK IS DESTRUCTIVE, AND "STALE" DOES NOT MEAN "DISPOSABLE".
+    /* The size threshold that used to live here (ORK_ORKPACK_MAX_REGEN_MB, default 2048) is GONE.
      *
-     * The no-clobber guard above only fires for a pack that is well-formed AND not stale. A pack from an
-     * older format version IS legitimately stale, so the guard stands aside and this writer rebuilds over
-     * it -- correct for a 155 MiB pack that takes two minutes, catastrophic for a 17 GiB one that takes
-     * hours and whose source GGUF or build config may no longer exist. Measured 2026-08-24: 53 packs
-     * totalling 220 GiB on the board were pre-v6, every one of which this path would have overwritten on
-     * first read, including several 15-17 GiB packs. A run was seconds from doing exactly that.
+     * It was a proxy: big file => probably expensive => probably irreplaceable => do not auto-rebuild.
+     * Proxies misfire in both directions, and it misfired constantly in one of them -- every stale pack
+     * over 2 GiB aborted the run, including ones that were trivially reproducible from a GGUF sitting
+     * next to them. The thing it was actually guessing at now has a direct expression: a <pack>.lock
+     * sidecar (or ORK_PROV_LOCKED in the footer) says "this one is not reproducible" explicitly, from
+     * someone who knows, instead of being inferred from a byte count.
      *
-     * So above a size threshold, regeneration requires saying so. ORK_ORKPACK_MAX_REGEN_MB tunes it
-     * (default 2048); ORK_ORKPACK_CLOBBER=1 overrides entirely, same escape hatch the no-clobber guard uses. */
-    if (stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
-        struct stat pst;
-        const long long capmb = getenv("ORK_ORKPACK_MAX_REGEN_MB") ? atoll(getenv("ORK_ORKPACK_MAX_REGEN_MB")) : 2048;
-        if (stat(p, &pst) == 0 && (long long) pst.st_size > capmb * 1024 * 1024) {
-            fprintf(stderr,
-                "[ORK PERSIST] FATAL: %s is %.2f GiB and STALE (older format) - refusing to regenerate over it.\n"
-                "              Rebuilding a pack this size costs hours and its source may no longer exist, so\n"
-                "              staleness alone is not authority to destroy it. Archive or delete it first, or\n"
-                "              set ORK_ORKPACK_CLOBBER=1 (or raise ORK_ORKPACK_MAX_REGEN_MB=%lld) to proceed.\n",
-                p, pst.st_size / (1024.0*1024*1024), capmb);
-            abort();
-        }
-    }
+     * So a stale pack is now rebuilt, which is what "stale" always meant. Protection is opt-in and
+     * precise rather than automatic and approximate. The trade is deliberate: an unlocked pack is
+     * treated as a derived cache, because that is what an unlocked pack is. */
     /* LOCKED PACKS ARE NOT REGENERATED, FULL STOP.
      *
      * The size guard is a heuristic ("this looks expensive") and the provenance guard is a comparison
