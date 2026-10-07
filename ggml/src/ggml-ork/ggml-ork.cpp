@@ -2018,13 +2018,33 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         std::string lockp = std::string(p) + ".lock";
         struct stat lst;
         if (stat(lockp.c_str(), &lst) == 0) {
+            /* ECHO THE SIDECAR'S BODY. "Not reproducible" is only half an instruction -- the operator
+             * still has to know WHAT would reproduce it. A locked pack is typically one built with GPTQ
+             * or an imatrix, inputs that quant_sig does NOT record, so a plain run regenerating it comes
+             * back as RTN: the silent downgrade this abort exists to prevent. Those inputs predate the
+             * provenance fields on every pack currently on disk (all measured ork_fmt=0), so the sidecar
+             * is the only place that record can live, and printing it is what makes the lock actionable
+             * rather than merely obstructive. */
+            std::string body;
+            if (FILE * lf = fopen(lockp.c_str(), "r")) {
+                char line[512];
+                while (fgets(line, sizeof line, lf)) { body += "                  "; body += line; }
+                fclose(lf);
+                if (!body.empty() && body[body.size() - 1] != '\n') body += "\n";
+            }
             fprintf(stderr,
                 "[ORK PERSIST] FATAL: %s is LOCKED by %s — refusing to write over it.\n"
-                "              A locked pack is one someone marked as not reproducible. Nothing overrides\n"
-                "              this. To proceed, remove the lock deliberately:\n"
+                "              A locked pack is one someone marked as not reproducible — typically built\n"
+                "              with GPTQ or an imatrix, which quant_sig does NOT record, so regenerating\n"
+                "              it from an ordinary run would silently come back as plain RTN.\n"
+                "%s%s"
+                "              Nothing overrides this. To proceed, rebuild it with the methodology the\n"
+                "              lock names, or remove the lock deliberately:\n"
                 "                  rm %s\n"
                 "              Or point this run at a different pack path and leave this one alone.\n",
-                p, lockp.c_str(), lockp.c_str());
+                p, lockp.c_str(),
+                body.empty() ? "" : "              the lock records:\n", body.c_str(),
+                lockp.c_str());
             abort();
         }
     }
