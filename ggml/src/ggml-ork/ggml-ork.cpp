@@ -456,6 +456,82 @@ struct orkpack_hdr {
     uint64_t prov_imhash;      /* resume gate: imatrix content hash */
 };                             /* zero-padded to ORKPACK_HDR_BYTES */
 
+/* ---- PACK PROVENANCE RECORD -------------------------------------------------------------------
+ *
+ * WHAT THIS IS FOR. Eight packs on the validated board are locked as research artifacts and NOT ONE of
+ * them can say what built it: measured 2026-10-07, all 88 .orkpacks there carry ork_fmt=0 and none has
+ * the provenance footer fields, so the methodology (GPTQ? imatrix? plain RTN?) exists only in whoever
+ * remembers. The filenames do not help -- q27_rtn_v6 is locked PRECISELY because it was not plain RTN.
+ * This records, at pack time, what a future reader would need to identify the source again.
+ *
+ * WHERE IT LIVES, and why not the footer. The footer is fixed-size and read at `sz - sizeof(footer)`,
+ * so every growth is a compatibility event -- and the packs on that board prove the hazard is real:
+ * they span footer sizes 24, 32 and 64, and some have their magic NOT in the final 8 bytes, against the
+ * invariant the footer comment states. A path is variable-length, which in a fixed struct is a char[N]
+ * that is either too short for a real path or mostly padding. So this goes at the END of the v6
+ * metadata section, which exists for exactly this reason ("deliberately here and not in the footer, so
+ * the footer stays binary-stable"). ggml_backend_ork_extract_gguf parses that section positionally and
+ * STOPS after n_kept entries, so a trailing record is invisible to every existing reader.
+ *
+ * It is found by its TRAILER, not by an offset, so no index or footer field has to learn about it:
+ *     <utf-8 text> | u64 text_len | char magic[8]
+ * at the last 16 bytes of the metadata section.
+ *
+ * THE HASH IS SAMPLED, NOT WHOLE-FILE. ork_file_hash below walks every byte, which is fine for an
+ * imatrix at tens of MB and ruinous for a 15 GiB GGUF -- a build that is already GGUF-load-bound would
+ * pay tens of seconds of pure CPU for it. Sampling size + three 1 MiB windows is O(1) in file size and
+ * still answers the question actually being asked: "is THIS candidate file the one that built the
+ * pack?" It is an identity check against a named candidate, not a defence against forgery. */
+#define ORK_PROV_REC_MAGIC "ORKPROV1"      /* 8 bytes, the trailer */
+#define ORK_PROV_SAMPLE    (1u << 20)      /* 1 MiB per window */
+
+static uint64_t ork_sample_hash(const char * p) {
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return 0;
+    const uint64_t sz = (uint64_t) lseek(fd, 0, SEEK_END);
+    uint64_t h = 1469598103934665603ULL;
+    /* Mix the SIZE first: two files that happen to share all three sampled windows (a truncation, a
+     * zero-padded copy) still differ here, and it costs nothing. */
+    for (int b = 0; b < 8; b++) { h ^= (sz >> (b * 8)) & 0xffu; h *= 1099511628211ULL; }
+    const uint64_t win = sz < ORK_PROV_SAMPLE ? sz : ORK_PROV_SAMPLE;
+    const uint64_t at[3] = { 0, sz > win ? (sz - win) / 2 : 0, sz > win ? sz - win : 0 };
+    std::vector<unsigned char> buf(win ? (size_t) win : 1);
+    for (int w = 0; w < 3 && win; w++) {
+        ssize_t r = pread(fd, buf.data(), (size_t) win, (off_t) at[w]);
+        for (ssize_t i = 0; i < r; i++) { h ^= buf[(size_t) i]; h *= 1099511628211ULL; }
+    }
+    close(fd);
+    return h ? h : 1ULL;
+}
+
+/* Read a pack's provenance record, if it has one. Returns false for any pack that predates this (the
+ * overwhelming majority today), which callers must treat as "unknown", never as "none was used". */
+static bool ork_read_prov_record(const char * pack_path, std::string & out) {
+    int fd = open(pack_path, O_RDONLY);
+    if (fd < 0) return false;
+    const off_t psz = lseek(fd, 0, SEEK_END);
+    bool ok = false;
+    orkpack_footer f;
+    uint64_t meta_off = 0, meta_size = 0, tlen = 0;
+    char magic[8];
+    if (psz < (off_t) sizeof f) { close(fd); return false; }
+    if (pread(fd, &f, sizeof f, psz - (off_t) sizeof f) == (ssize_t) sizeof f &&
+        memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.index_off < (uint64_t) psz &&
+        pread(fd, &meta_off,  8, (off_t) f.index_off)     == 8 &&
+        pread(fd, &meta_size, 8, (off_t) f.index_off + 8) == 8 &&
+        meta_size > 16 && meta_off + meta_size <= (uint64_t) psz) {
+        const off_t tr = (off_t) (meta_off + meta_size - 16);
+        if (pread(fd, &tlen, 8, tr) == 8 && pread(fd, magic, 8, tr + 8) == 8 &&
+            memcmp(magic, ORK_PROV_REC_MAGIC, 8) == 0 &&
+            tlen > 0 && tlen < (1u << 20) && (uint64_t) tr >= tlen) {
+            out.assign((size_t) tlen, '\0');
+            ok = pread(fd, &out[0], (size_t) tlen, tr - (off_t) tlen) == (ssize_t) tlen;
+        }
+    }
+    close(fd);
+    return ok;
+}
+
 static uint64_t ork_file_hash(const char * p) {
     FILE * f = fopen(p, "rb");
     if (!f) return 0;
@@ -1812,6 +1888,19 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     }
     const char * p = (env_p && *env_p) ? env_p : derived.c_str();
     if (!p || !*p) return;
+    /* ORK_SHOW_PROV=1: print what built this pack. Placed HERE, immediately after the path resolves and
+     * before any read, validation or adoption, because this must answer for EVERY pack -- the one that
+     * loads cleanly, the one this build refuses, and the one it cannot even parse. An earlier revision
+     * sat further down and printed nothing for a pack that loaded, which is backwards: a pack you can
+     * read is the one you are most likely to be asking about. */
+    if (getenv("ORK_SHOW_PROV")) {
+        std::string prov;
+        if (ork_read_prov_record(p, prov))
+            fprintf(stderr, "[ORK PROV] %s was built by:\n%s", p, prov.c_str());
+        else
+            fprintf(stderr, "[ORK PROV] %s carries NO provenance record — it predates them. That is "
+                            "UNKNOWN, which is not the same as 'none was used'.\n", p);
+    }
     ctx->persist_final = p;    // resolved pack path, valid in BOTH read and write mode (sidecars key off it)
     bool stale = false;   // present-but-incompatible pack seen -> regenerate + delete the old sidecar
     /* Provenance of the pack ON DISK, carried out of the read block for the regeneration guard below.
@@ -2031,6 +2120,19 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 while (fgets(line, sizeof line, lf)) { body += "                  "; body += line; }
                 fclose(lf);
                 if (!body.empty() && body[body.size() - 1] != '\n') body += "\n";
+            }
+            /* If the pack carries a provenance record, it names the source weights and the environment
+             * that built it -- which is precisely what the sidecar cannot say for a pack predating it. */
+            std::string prov;
+            if (ork_read_prov_record(p, prov)) {
+                body += "              the pack records:\n";
+                std::string cur;
+                for (size_t i = 0; i <= prov.size(); i++) {
+                    if (i == prov.size() || prov[i] == '\n') {
+                        if (!cur.empty()) { body += "                  "; body += cur; body += "\n"; }
+                        cur.clear();
+                    } else cur += prov[i];
+                }
             }
             fprintf(stderr,
                 "[ORK PERSIST] FATAL: %s is LOCKED by %s — refusing to write over it.\n"
@@ -3003,6 +3105,70 @@ static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, c
  * Layout:  u64 gguf_total | u64 data_off | data_off bytes (header+KV+tensor-info)
  *          u32 n_kept | n_kept x { u64 abs_off, u64 size, size bytes }
  */
+/* Append the provenance record. `src_path` may be empty when the source model could not be located --
+ * the record is still written, because host/user/time/env are exactly as useful then.
+ *
+ * THE `env:` LINE IS THE POINT. A source path answers "which weights", which is the question that was
+ * asked; the eight locked packs show the question that actually bites is "which METHODOLOGY", and that
+ * lives in the environment a run was launched with. prov_flags already covers the two inputs someone
+ * thought to flag (GPTQ, imatrix); recording the ORK_* environment verbatim also covers the ones nobody
+ * thought to flag yet, which is the category that stranded those packs. */
+extern char ** environ;   /* glibc declares it only under some feature-test macros; be explicit */
+
+static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * bytes_written) {
+    char host[256] = "unknown", when[64] = "unknown";
+    if (gethostname(host, sizeof host - 1) != 0) snprintf(host, sizeof host, "unknown");
+    host[sizeof host - 1] = 0;
+    const time_t now = time(nullptr);
+    struct tm tmv;
+    if (gmtime_r(&now, &tmv)) strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    const char * user = getenv("USER"); if (!user || !*user) user = getenv("LOGNAME");
+
+    std::string t;
+    char ln[1200];
+    if (src_path && *src_path) {
+        struct stat ss;
+        const bool have = stat(src_path, &ss) == 0;
+        const char * base = strrchr(src_path, '/');
+        char mt[64] = "unknown";
+        if (have && gmtime_r(&ss.st_mtime, &tmv)) strftime(mt, sizeof mt, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+        snprintf(ln, sizeof ln, "source: %s\n", src_path);                                    t += ln;
+        snprintf(ln, sizeof ln, "source_name: %s\n", base ? base + 1 : src_path);             t += ln;
+        snprintf(ln, sizeof ln, "source_size: %lld\n", have ? (long long) ss.st_size : -1LL); t += ln;
+        snprintf(ln, sizeof ln, "source_mtime: %s\n", mt);                                    t += ln;
+        snprintf(ln, sizeof ln, "source_hash: %016llx (sampled: size + 3x1MiB windows)\n",
+                 (unsigned long long) ork_sample_hash(src_path));                             t += ln;
+    } else {
+        t += "source: UNKNOWN - the source model path could not be determined at pack time\n";
+    }
+    snprintf(ln, sizeof ln, "host: %s\n", host);                                   t += ln;
+    snprintf(ln, sizeof ln, "user: %s\n", user && *user ? user : "unknown");       t += ln;
+    snprintf(ln, sizeof ln, "packed_at: %s\n", when);                              t += ln;
+    snprintf(ln, sizeof ln, "ork_driver: %s\n", ork_npu_version());                t += ln;
+    snprintf(ln, sizeof ln, "pack_format: %u\n", ork_pack_format_version());       t += ln;
+    snprintf(ln, sizeof ln, "quant_sig: %08x\n", ork_build_sig());                 t += ln;
+    { uint32_t fl = 0; uint64_t ih = 0; ork_pack_provenance(&fl, &ih);
+      snprintf(ln, sizeof ln, "prov_flags: %08x%s%s\n", fl,
+               (fl & ORK_PROV_GPTQ) ? " GPTQ" : "", (fl & ORK_PROV_IMATRIX) ? " IMATRIX" : ""); t += ln; }
+
+    /* Every ORK_* variable set for this run, so a method nobody thought to flag is still recorded. */
+    t += "env:";
+    int n_env = 0;
+    for (char ** e = environ; e && *e; e++) {
+        if (strncmp(*e, "ORK_", 4) != 0) continue;
+        snprintf(ln, sizeof ln, " %s", *e); t += ln; n_env++;
+    }
+    if (!n_env) t += " (no ORK_* variables set)";
+    t += "\n";
+
+    const uint64_t tlen = (uint64_t) t.size();
+    bool ok = fwrite(t.data(), 1, t.size(), out) == t.size();
+    ok = ok && fwrite(&tlen, 8, 1, out) == 1;
+    ok = ok && fwrite(ORK_PROV_REC_MAGIC, 1, 8, out) == 8;
+    if (ok) *bytes_written = tlen + 16;
+    return ok;
+}
+
 static bool ork_write_pack_meta(FILE * out, const char * src_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed,
                                 uint64_t * bytes_written) {
@@ -3082,6 +3248,11 @@ extern "C" bool ggml_backend_ork_extract_gguf(const char * pack_path, const char
     uint64_t total = 0, data_off = 0; off_t at = (off_t) meta_off;
     if (pread(pfd, &total, 8, at) != 8) { close(pfd); return false; } at += 8;
     if (pread(pfd, &data_off, 8, at) != 8) { close(pfd); return false; } at += 8;
+    /* A section can now hold the provenance record ALONE, when the GGUF metadata was skipped or could
+     * not be read. gguf_total == 0 identifies that case; without this guard the loop below would
+     * ftruncate a 0-byte output and return success, handing the caller an empty file that reads as a
+     * valid extraction. */
+    if (total == 0) { close(pfd); return false; }
     int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ofd < 0) { close(pfd); return false; }
     bool ok = ftruncate(ofd, (off_t) total) == 0;     /* full length first: untouched ranges become holes */
@@ -3122,8 +3293,8 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     }
     /* v6: embed the GGUF metadata BEFORE the index, so the pack is a complete artifact. */
     uint64_t meta_off = 0, meta_size = 0;
+    const std::string msrc = ork_find_model_path();
     if (!getenv("ORK_NO_META")) {
-        const std::string msrc = ork_find_model_path();
         if (!msrc.empty()) {
             const uint64_t at = ctx->persist_off;
             uint64_t w = 0;
@@ -3131,6 +3302,20 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
                 meta_off = at; meta_size = w; ctx->persist_off += w;
             }
         } else fprintf(stderr, "[ORK META] source model path unknown — pack will carry no metadata\n");
+    }
+    /* PROVENANCE: appended to the metadata section, found by its trailer. Written even when the GGUF
+     * metadata was skipped or failed -- host/user/time/env are exactly as useful then, and a record
+     * that only appears on the happy path is not a record you can rely on. In that case the section
+     * holds the provenance alone, which is why ggml_backend_ork_extract_gguf now refuses a section
+     * whose gguf_total is 0 rather than cheerfully writing an empty file. */
+    {
+        const uint64_t at = ctx->persist_off;
+        uint64_t w = 0;
+        if (ork_write_prov_record(ctx->persist_out, msrc.c_str(), &w)) {
+            if (!meta_size) { meta_off = at; meta_size = w; }   /* provenance-only section */
+            else            { meta_size += w; }                 /* appended after the kept tensors */
+            ctx->persist_off += w;
+        }
     }
     ork_persist_emit(ctx, meta_off, meta_size, /*partial=*/false);
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
