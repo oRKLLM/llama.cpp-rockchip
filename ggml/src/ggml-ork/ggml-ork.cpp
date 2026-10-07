@@ -424,6 +424,38 @@ static uint32_t ork_build_sig(void) {
  * by construction, so anything benchmarking or shipping it is measuring the wrong thing. */
 #define ORK_PROV_PARTIAL 0x8u
 
+/* ---- FIXED RECOVERY HEADER (offset 0) --------------------------------------------------------
+ *
+ * The footer tells you about a FINISHED pack, and it only works because it is the last 64 bytes of
+ * the file. That is useless for recovery: a build that dies mid-blob has its newest footer buried
+ * somewhere before EOF, and nothing at the end of the file to find it by.
+ *
+ * So the writer also keeps a fixed-size header at offset 0 whose job is exactly one thing -- say
+ * where the last COMPLETE footer is, and whether the build finished. It is rewritten (one seek, one
+ * page, one fdatasync) after every checkpoint, so it is always current to within one checkpoint.
+ *
+ * One page, for the same reason the ork-driver weight header is: the blobs that follow stay
+ * page-aligned. It costs 4 KB per pack.
+ *
+ * Old packs do not have it, and that is fine -- every offset in this format is ABSOLUTE, so a
+ * leading header is invisible to a reader walking the index. Nothing consults the header except
+ * recovery, which checks the magic first and falls back to the footer-at-EOF path when absent. */
+#define ORKPACK_HDR_MAGIC  "ORKPKH1"      /* 7 chars + NUL = 8 bytes */
+#define ORKPACK_HDR_BYTES  4096u
+#define ORKPACK_ST_BUILDING 1u
+#define ORKPACK_ST_COMPLETE 2u
+struct orkpack_hdr {
+    char     magic[8];
+    uint32_t version;          /* ORKPACK_VERSION at write */
+    uint32_t state;            /* ORKPACK_ST_* */
+    uint64_t last_footer_off;  /* byte offset of the newest COMPLETE footer; 0 = none yet */
+    uint32_t n_entries;        /* weights covered by that footer -- for the resume log line */
+    uint32_t ork_fmt;          /* resume gate: ork-driver pack-compat token */
+    uint32_t quant_sig;        /* resume gate: build-config precision signature */
+    uint32_t prov_flags;       /* resume gate: ORK_GPTQ / ORK_IMATRIX */
+    uint64_t prov_imhash;      /* resume gate: imatrix content hash */
+};                             /* zero-padded to ORKPACK_HDR_BYTES */
+
 static uint64_t ork_file_hash(const char * p) {
     FILE * f = fopen(p, "rb");
     if (!f) return 0;
@@ -1249,6 +1281,11 @@ struct ggml_backend_ork_context {
     int preload_done = 0;
     FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
+    size_t   persist_ckpt_at = 0;      // persist_built.size() when we last wrote a checkpoint
+    std::string persist_resume_path;   // a checkpointed, unfinished pack we could carry on from
+    uint64_t persist_resume_off = 0;   // byte offset of its last complete footer
+    uint32_t persist_resume_n   = 0;   // weights it already holds
+    bool     persist_inplace = false;  // writing straight to the final path (no .tmp to rename)
     std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
     long persist_hits = 0, persist_misses = 0;   // weights loaded from .orkpack vs packed (diagnostic)
     int  dom_advance_fails = 0;   // capped: every failed alloc leaks kernel IOVA (see ork_domain_advance)
@@ -1690,6 +1727,60 @@ static std::string ork_default_orkpack_path() {
 }
 static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed);
+/* Rewrite the fixed header at offset 0. `footer_at` is where the footer just written begins; pass
+ * 0 while opening, before any footer exists. Leaves the stream positioned back at the end. */
+static void ork_persist_hdr(ggml_backend_ork_context * ctx, uint64_t footer_at, uint32_t state) {
+    if (!ctx->persist_out) return;
+    const off_t keep = ftello(ctx->persist_out);
+    orkpack_hdr h; memset(&h, 0, sizeof h);
+    memcpy(h.magic, ORKPACK_HDR_MAGIC, 8);
+    h.version = ORKPACK_VERSION; h.state = state;
+    h.last_footer_off = footer_at; h.n_entries = (uint32_t) ctx->persist_built.size();
+    h.ork_fmt = ork_pack_format_version(); h.quant_sig = ork_build_sig();
+    ork_pack_provenance(&h.prov_flags, &h.prov_imhash);
+    std::vector<char> pad(ORKPACK_HDR_BYTES, 0);
+    memcpy(pad.data(), &h, sizeof h);
+    fseeko(ctx->persist_out, 0, SEEK_SET);
+    fwrite(pad.data(), 1, ORKPACK_HDR_BYTES, ctx->persist_out);
+    fflush(ctx->persist_out);
+    { int fd = fileno(ctx->persist_out); if (fd >= 0) fdatasync(fd); }
+    if (keep > 0) fseeko(ctx->persist_out, keep, SEEK_SET);
+}
+
+static void ork_persist_emit(ggml_backend_ork_context *, uint64_t, uint64_t, bool);
+static void ork_persist_checkpoint(ggml_backend_ork_context *);
+static void ork_persist_after_write(ggml_backend_ork_context *);
+
+/* Can `path` be RESUMED -- i.e. did a previous run leave a checkpointed, unfinished pack whose
+ * build inputs match this run's? On success returns true and fills *footer_at / *n_done.
+ *
+ * Resume is only sound if the SAME inputs would produce the SAME packing decisions, which is exactly
+ * what the provenance fields record. A mismatch means the half-built pack was made by a different
+ * recipe, so continuing it would splice two models together; we refuse and rebuild instead. */
+static bool ork_persist_resumable(const char * path, uint64_t * footer_at, uint32_t * n_done) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    orkpack_hdr h;
+    bool ok = pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
+    close(fd);
+    if (!ok || memcmp(h.magic, ORKPACK_HDR_MAGIC, 8) != 0) return false;   /* no header: old pack */
+    if (h.version != ORKPACK_VERSION || h.state != ORKPACK_ST_BUILDING)  return false;
+    if (h.last_footer_off == 0 || h.n_entries == 0)                      return false;
+    if (h.ork_fmt != ork_pack_format_version() || h.quant_sig != ork_build_sig()) {
+        fprintf(stderr, "[ORK PERSIST] %s is an unfinished pack from a different build config — rebuilding\n", path);
+        return false;
+    }
+    uint32_t nf = 0; uint64_t nh = 0;
+    ork_pack_provenance(&nf, &nh);
+    if (h.prov_flags != nf || h.prov_imhash != nh) {
+        fprintf(stderr, "[ORK PERSIST] %s is an unfinished pack built with different inputs "
+                        "(GPTQ/imatrix) — rebuilding rather than splicing two recipes\n", path);
+        return false;
+    }
+    *footer_at = h.last_footer_off; *n_done = h.n_entries;
+    return true;
+}
+
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_i8_mm_import),
@@ -1977,13 +2068,104 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             abort();
         }
     }
+    {   /* Did a previous run leave a checkpointed build we can carry on from? Look at the final path
+         * first (that is where an interrupted first build lives), then the .tmp used when replacing an
+         * existing pack. */
+        uint64_t fat = 0; uint32_t nd = 0;
+        const std::string cand[2] = { std::string(p), std::string(p) + ".tmp" };
+        for (int i = 0; i < 2; i++) {
+            if (!ork_persist_resumable(cand[i].c_str(), &fat, &nd)) continue;
+            fprintf(stderr,
+                "[ORK PERSIST] RESUMABLE: %s holds %u weights from an unfinished build "
+                "(last checkpoint at byte %llu).\n",
+                cand[i].c_str(), nd, (unsigned long long) fat);
+            ctx->persist_resume_path = cand[i];
+            ctx->persist_resume_off  = fat;
+            ctx->persist_resume_n    = nd;
+            break;
+        }
+    }
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     // Stale pack: the fresh one is written to <p>.tmp and atomically rename()'d over the old <p> at finalize
     // (create-new-then-replace-old, crash-safe). The <p>.gmax sidecar is NOT covered by that rename, so delete
     // the stale one now — it belongs to the old pack and will be rewritten at free.
     if (stale) { std::string sc = std::string(p) + ".gmax"; unlink(sc.c_str()); }
+    if (!ctx->persist_resume_path.empty()) {
+        /* RESUME. The file already holds `persist_resume_n` weights and a complete index at
+         * `persist_resume_off`. Parse that index into BOTH maps -- persist_idx so the already-packed
+         * weights are served from the file instead of re-packed, and persist_built so the final index
+         * covers them -- then append new blobs OVER the stale index, which the next checkpoint
+         * rewrites further along. Mode 3 = reads and writes, which is why every persist decision now
+         * goes through ork_persist_reads()/ork_persist_writes(). */
+        const std::string & rp = ctx->persist_resume_path;
+        FILE * rf = fopen(rp.c_str(), "r+b");
+        int    rfd = rf ? open(rp.c_str(), O_RDONLY) : -1;
+        off_t  rsz = rfd >= 0 ? lseek(rfd, 0, SEEK_END) : -1;
+        void * rm  = (rsz > 0) ? mmap(nullptr, (size_t) rsz, PROT_READ, MAP_SHARED, rfd, 0) : MAP_FAILED;
+        bool   ok  = rf && rm != MAP_FAILED;
+        /* persist_resume_off is where the FOOTER starts, not the index -- read the footer there and
+         * take its index_off. (Conflating the two is what made the first version refuse every
+         * resume: it parsed the footer's bytes as an index and bailed on the first bogus name.) */
+        uint64_t idx_off = 0;
+        if (ok) {
+            if ((off_t) (ctx->persist_resume_off + sizeof(orkpack_footer)) > rsz) ok = false;
+            else {
+                orkpack_footer rfoot;
+                memcpy(&rfoot, (const char *) rm + ctx->persist_resume_off, sizeof rfoot);
+                if (memcmp(rfoot.magic, ORKPACK_MAGIC, 8) != 0 ||
+                    rfoot.index_off == 0 || (off_t) rfoot.index_off >= rsz) ok = false;
+                else idx_off = rfoot.index_off;
+            }
+        }
+        if (ok) {
+            const char * idx = (const char *) rm + idx_off;
+            const char * end = (const char *) rm + rsz;
+            uint64_t mo = 0, ms = 0;
+            memcpy(&mo, idx, 8); idx += 8; memcpy(&ms, idx, 8); idx += 8;
+            for (uint32_t i = 0; i < ctx->persist_resume_n && ok; i++) {
+                uint32_t nl = 0;
+                if (idx + 4 > end) { ok = false; break; }
+                memcpy(&nl, idx, 4); idx += 4;
+                if (nl == 0 || nl > 4096 || idx + nl + sizeof(orkpack_entry) > end) { ok = false; break; }
+                std::string nm(idx, nl); idx += nl;
+                orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+                ctx->persist_idx[nm] = e;
+                ctx->persist_built.emplace_back(nm, e);
+            }
+        }
+        if (ok) {
+            ctx->persist_map = rm; ctx->persist_map_sz = (size_t) rsz; close(rfd);
+            ctx->persist_out = rf;
+            ctx->persist_off = idx_off;                      /* new blobs overwrite the stale index */
+            ctx->persist_ckpt_at = ctx->persist_built.size();
+            ctx->persist_inplace = (rp == std::string(p));   /* resuming <p> itself: no rename at the end */
+            ctx->persist_tmp = rp;
+            fseeko(ctx->persist_out, (off_t) ctx->persist_off, SEEK_SET);
+            ctx->persist_mode = 3;
+            fprintf(stderr,
+                "[ORK PERSIST] RESUMING %s: %zu weights already packed, continuing from byte %llu "
+                "(a full rebuild is GGUF-load-bound and would redo all of them).\n",
+                rp.c_str(), ctx->persist_built.size(), (unsigned long long) ctx->persist_off);
+            return;
+        }
+        /* Anything unexpected in the partial index: drop the resume and build clean. A half-adopted
+         * index is far worse than a slow rebuild. */
+        if (rm != MAP_FAILED && rsz > 0) munmap(rm, (size_t) rsz);
+        if (rfd >= 0) close(rfd);
+        if (rf) fclose(rf);
+        ctx->persist_idx.clear(); ctx->persist_built.clear();
+        fprintf(stderr, "[ORK PERSIST] %s could not be parsed as a resumable build — rebuilding clean\n",
+                rp.c_str());
+    }
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
+        /* Reserve the recovery header; blobs start after it. Every offset in the format is absolute,
+         * so this is invisible to readers. */
+        ctx->persist_off = ORKPACK_HDR_BYTES;
+        { std::vector<char> z(ORKPACK_HDR_BYTES, 0);
+          fwrite(z.data(), 1, ORKPACK_HDR_BYTES, ctx->persist_out); }
+        ork_persist_hdr(ctx, 0, ORKPACK_ST_BUILDING);
+        fseeko(ctx->persist_out, (off_t) ORKPACK_HDR_BYTES, SEEK_SET);
         // Unconditional (not ORK_VERBOSE-gated): building the pack packs weights INLINE this run, so this run's
         // speed is unrepresentative. Applies to every frontend that hits a missing/stale pack (llama-cli/server/
         // oRKLLM build it at load-time warmup; ork_bench builds it in a dedicated untimed pass). Warn + advise rerun.
@@ -2289,6 +2471,7 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
             e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
             fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
             ctx->persist_built.emplace_back(std::string(name), e);
+    ork_persist_checkpoint(ctx);
             if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B) qerr=%.4f%s\n",
                                                name, K, N, tb, (double) qerr, im ? "" : " (unweighted: no imatrix)");
             return;
@@ -2324,6 +2507,7 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
     ctx->persist_built.emplace_back(std::string(name), e);
+    ork_persist_checkpoint(ctx);
 }
 
 // Native-W4A4 persist (ORKPACK_DT_I4_NATIVE): dump the already-ROTATED, per-channel-int4-quantized, int4-
@@ -2348,6 +2532,7 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
     ctx->persist_built.emplace_back(std::string(name), e);
+    ork_persist_checkpoint(ctx);
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native %s K=%d N=%d (%zu B + %u scales)\n", name, K, N, tb, e.bscale_n);
 }
 // Read a native-W4A4 weight by name (read mode): fills `ow` and returns true on a matching hit (skip the
@@ -2590,6 +2775,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
                 ent.bscale_off = ctx->persist_off;
                 fwrite(bs.data(), sizeof(float), N, ctx->persist_out); ctx->persist_off += (size_t) N * sizeof(float);
                 ctx->persist_built.emplace_back(key, ent);
+                ork_persist_checkpoint(ctx);
             }
         }
         return;
@@ -2640,6 +2826,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
                     ent.blob_off = ctx->persist_off;
                     fwrite(blob.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
                     ctx->persist_built.emplace_back(key, ent);
+                ork_persist_checkpoint(ctx);
                 }
             } else {
                 bi.resize((size_t) K * N); bs.resize(N);
@@ -2668,6 +2855,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
                     ent.bscale_off = ctx->persist_off;
                     fwrite(bs.data(), sizeof(float), N, ctx->persist_out); ctx->persist_off += (size_t) N * sizeof(float);
                     ctx->persist_built.emplace_back(key, ent);
+                ork_persist_checkpoint(ctx);
                 }
             }
         }
@@ -2924,6 +3112,22 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
             }
         } else fprintf(stderr, "[ORK META] source model path unknown — pack will carry no metadata\n");
     }
+    ork_persist_emit(ctx, meta_off, meta_size, /*partial=*/false);
+    fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
+    if (!ctx->persist_inplace) rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
+    ork_persist_after_write(ctx);
+}
+
+/* Write the index + footer at the CURRENT offset, making the file on disk a valid, loadable pack.
+ *
+ * Called at finalize (partial=false) and periodically during a build (partial=true). On a checkpoint
+ * it seeks back afterwards so the next weight's blob overwrites the index it just wrote -- the index
+ * and footer always live at the tail and are re-emitted, so the file is a complete pack AT REST
+ * between weights, and a crash leaves a usable artifact instead of a dead .tmp.
+ *
+ * ftruncate matters: a later index may be SHORTER than the one it replaces, and stale bytes after
+ * the footer would break "magic is the final 8 bytes of the file", which every reader relies on. */
+static void ork_persist_emit(ggml_backend_ork_context * ctx, uint64_t meta_off, uint64_t meta_size, bool partial) {
     uint64_t index_off = ctx->persist_off;
     fwrite(&meta_off, 8, 1, ctx->persist_out);
     fwrite(&meta_size, 8, 1, ctx->persist_out);
@@ -2933,16 +3137,54 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
         fwrite(kv.first.data(), 1, nl, ctx->persist_out);
         fwrite(&kv.second, sizeof(orkpack_entry), 1, ctx->persist_out);
     }
+    const uint64_t footer_at = (uint64_t) ftello(ctx->persist_out);
     orkpack_footer f; memset(&f, 0, sizeof f);
     f.calib_off = 0; f.calib_n = 0;   // producer is the ork_calibrate tool, written in afterwards
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
     f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
     f.quant_sig = ork_build_sig();           // stamp the build-config precision signature (authoritative on read)
     ork_pack_provenance(&f.prov_flags, &f.prov_imhash);   // what INPUTS built it (ORK_GPTQ / ORK_IMATRIX content)
+    if (partial) f.prov_flags |= ORK_PROV_PARTIAL;
     memcpy(f.magic, ORKPACK_MAGIC, 8);
     fwrite(&f, sizeof f, 1, ctx->persist_out);
-    fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
-    rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
+    fflush(ctx->persist_out);
+    { int fd = fileno(ctx->persist_out);
+      if (fd >= 0) { off_t end = ftello(ctx->persist_out); if (end > 0) { if (ftruncate(fd, end)) {} fdatasync(fd); } } }
+    if (partial) {
+        /* Do NOT rewind over this footer. The first version did, so the next blob overwrote the index
+         * and the file was a valid pack only in the sliver between a checkpoint and the next weight --
+         * a crash mid-blob left no footer anywhere, which is precisely the case a checkpoint exists
+         * for (measured: a sample 6 s later read "mid-blob, no footer yet"). Instead the index+footer
+         * STAY and the next blob appends after them, so every checkpoint is durable and the newest one
+         * is always at EOF when the writer is between weights. The superseded index/footer regions
+         * become unreferenced bytes inside the finished pack -- readers address blobs by absolute
+         * offset and never see them -- costing ~80 B per entry per checkpoint, a few hundred KB.
+         *
+         * STILL OPEN: after a crash MID-BLOB the newest footer is no longer at EOF, so a reader that
+         * only looks at the last 64 bytes will not find it. Recovering that case needs either a
+         * backward scan for the magic or a fixed header at offset 0 recording the last good footer
+         * offset. Until then a checkpoint is durable but not automatically discoverable post-crash. */
+        ctx->persist_off = (uint64_t) ftello(ctx->persist_out);
+        ctx->persist_ckpt_at = ctx->persist_built.size();
+        ork_persist_hdr(ctx, footer_at, ORKPACK_ST_BUILDING);   /* now discoverable after a crash */
+    } else {
+        ork_persist_hdr(ctx, footer_at, ORKPACK_ST_COMPLETE);
+    }
+}
+
+/* Make the in-progress pack a valid checkpoint every ORK_ORKPACK_CKPT weights (default 24). The cost
+ * is one index+footer rewrite -- ~80 bytes per entry, so tens of KB -- against a rebuild that is
+ * GGUF-load-bound and runs into minutes or hours. ORK_ORKPACK_CKPT=0 disables. */
+static void ork_persist_checkpoint(ggml_backend_ork_context * ctx) {
+    if (!ork_persist_writes(ctx) || !ctx->persist_out) return;
+    static int every = -1;
+    if (every < 0) { const char * e = getenv("ORK_ORKPACK_CKPT"); every = e ? atoi(e) : 24; }
+    if (every <= 0) return;
+    if (ctx->persist_built.size() < ctx->persist_ckpt_at + (size_t) every) return;
+    ork_persist_emit(ctx, 0, 0, /*partial=*/true);   // no metadata embed: that is a finalize-only cost
+}
+
+static void ork_persist_after_write(ggml_backend_ork_context * ctx) {
     /* Companion stub GGUF, so the next run does not have to carry the source model as well as the pack.
      * Written AFTER the rename so a stub never exists without the pack it depends on. ORK_NO_STUB=1 skips. */
     if (!getenv("ORK_NO_STUB")) {
@@ -2959,7 +3201,8 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
         std::string file = slash == std::string::npos ? fp : fp.substr(slash + 1);
         fprintf(stderr, "[ORK PERSIST] SUCCESS: orkpack written (%u weights, %.1f MiB) -> %s\n"
                         "              dir: %s  file: %s\n",
-                f.n_entries, (double) ctx->persist_off / (1024.0 * 1024.0), fp.c_str(), dir.c_str(), file.c_str());
+                (unsigned) ctx->persist_built.size(), (double) ctx->persist_off / (1024.0 * 1024.0),
+                fp.c_str(), dir.c_str(), file.c_str());
     }
 }
 
