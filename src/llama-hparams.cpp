@@ -37,6 +37,8 @@ void llama_hparams::set_recr_pattern(uint32_t n_pattern, bool dense_first) {
     }
 }
 
+
+
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         if (is_swa_impl[il]) {
@@ -271,6 +273,16 @@ bool llama_hparams::has_kv(uint32_t il) const {
 
 uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
+}
+
+uint32_t llama_hparams::n_layer_kv() const {
+    uint32_t res = 0;
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        if (has_kv(il)) {
+            res++;
+        }
+    }
+    return res;
 }
 
 bool llama_hparams::use_mrope() const {

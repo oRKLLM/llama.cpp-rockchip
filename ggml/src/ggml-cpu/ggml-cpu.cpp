@@ -62,7 +62,10 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #endif
 
 #ifdef GGML_USE_CPU_REPACK
-        if (ggml_backend_cpu_repack_buffer_type()) {
+        // GGML_NO_REPACK=1 disables the CPU weight-repack buffer type. It repacks quantized weights
+        // (incl. MoE experts) into a non-host layout, which prevents host-only accelerator backends
+        // (ork) from claiming those weights. Disabling it keeps weights in the standard host buffer.
+        if (!getenv("GGML_NO_REPACK") && ggml_backend_cpu_repack_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
         }
 #endif

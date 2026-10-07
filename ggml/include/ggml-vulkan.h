@@ -22,6 +22,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t d
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
+enum ggml_vk_mode {
+    GGML_VK_MODE_ALL        = 0,
+    GGML_VK_MODE_TURBOQUANT = 1,
+    GGML_VK_MODE_PREFILL    = 2,
+};
+GGML_BACKEND_API void ggml_vk_set_mode(enum ggml_vk_mode mode);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus
