@@ -410,6 +410,12 @@ static uint32_t ork_build_sig(void) {
  * size guard remains the only protection. We cannot retroactively learn what built them. */
 #define ORK_PROV_GPTQ    0x1u
 #define ORK_PROV_IMATRIX 0x2u
+/* LOCKED: this pack must never be regenerated over. Unlike the size guard and the provenance guard,
+ * ORK_ORKPACK_CLOBBER does NOT override it -- if it did, the lock would add nothing, since CLOBBER
+ * already overrides both of those. Clearing it is a deliberate, separate act on the file itself
+ * (tools/orkpack_lock --unlock), which is the point: an irreplaceable pack should take two decisions
+ * to destroy, not one environment variable set by a script that meant to do something else. */
+#define ORK_PROV_LOCKED  0x4u
 
 static uint64_t ork_file_hash(const char * p) {
     FILE * f = fopen(p, "rb");
@@ -1888,6 +1894,53 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             abort();
         }
     }
+    /* LOCKED PACKS ARE NOT REGENERATED, FULL STOP.
+     *
+     * The size guard is a heuristic ("this looks expensive") and the provenance guard is a comparison
+     * ("this run differs"). Both are overridable because both can be wrong. A lock is neither: it is a
+     * human saying "this specific artifact is not reproducible, do not touch it", and the only thing
+     * that should clear it is the same human clearing it on the file. So this check runs FIRST, ignores
+     * ORK_ORKPACK_CLOBBER, and is NOT gated on `stale` -- reaching the writer at all means something is
+     * about to replace this file, and whether that was triggered by staleness, by CLOBBER or by a loader
+     * bug is irrelevant to a pack that said do not touch me. */
+    /* SIDECAR LOCK: <pack>.lock, checked INDEPENDENTLY of the footer flag.
+     *
+     * The footer bit only reaches packs this build writes. Every pack already on disk predates the
+     * provenance fields -- measured 2026-10-07: the ones on the board carry v5 and v6 footers of 32
+     * bytes, against the 48 this build expects, so they cannot even be read as v7, let alone stamped.
+     * Growing an old footer in place would mean inventing the calib_* fields it never had, i.e.
+     * claiming a layout the file does not have; and a mistake there writes into the index region of a
+     * multi-GiB artifact and destroys it. A sidecar locks those files with zero bytes written to them,
+     * works at any footer version including ones that predate this code, and is undone with rm.
+     *
+     * Checked FIRST, before reading anything, so a lock holds even for a pack this build cannot
+     * parse -- which is exactly the population that needs it most. */
+    {
+        std::string lockp = std::string(p) + ".lock";
+        struct stat lst;
+        if (stat(lockp.c_str(), &lst) == 0) {
+            fprintf(stderr,
+                "[ORK PERSIST] FATAL: %s is LOCKED by %s — refusing to write over it.\n"
+                "              A locked pack is one someone marked as not reproducible. ORK_ORKPACK_CLOBBER\n"
+                "              does NOT override this. To proceed, remove the lock deliberately:\n"
+                "                  rm %s\n"
+                "              Or point this run at a different pack path and leave this one alone.\n",
+                p, lockp.c_str(), lockp.c_str());
+            abort();
+        }
+    }
+
+    if (prov_have && (prov_flags & ORK_PROV_LOCKED)) {
+        fprintf(stderr,
+            "[ORK PERSIST] FATAL: %s is LOCKED — refusing to write over it%s.\n"
+            "              A locked pack is one someone marked as not reproducible. ORK_ORKPACK_CLOBBER does\n"
+            "              NOT override this. To proceed you must unlock it deliberately:\n"
+            "                  orkpack_lock --unlock %s\n"
+            "              Or point this run at a different pack path and leave this one alone.\n",
+            p, stale ? " (this build considers it stale)" : "", p);
+        abort();
+    }
+
     /* REGENERATING WITHOUT THE INPUTS THAT BUILT IT IS A SILENT DOWNGRADE.
      *
      * The size guard above asks "is this expensive to rebuild". This asks the sharper question: would
