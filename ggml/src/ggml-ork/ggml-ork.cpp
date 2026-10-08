@@ -4255,6 +4255,15 @@ static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
  * take the true minimum — the rotation makes rows approximately Gaussian but not exactly, and the search
  * costs one pass per candidate. alpha=1.0 (plain absmax) is always in the grid, so this can never be worse
  * than the previous behaviour on any row. */
+/* Clip-grid shape. Both the activation and weight MSE clips scan alpha down from 1.0 and keep the
+ * scale with least squared error. The original 8 points at 0.0625 (floor 0.5625) were a guess, never
+ * swept — and the grid only costs PACK time (weights) or one pass over a row (activations), so a
+ * finer/deeper grid is nearly free to try. ORK_I4_CLIP_N / ORK_I4_CLIP_STEP make it measurable. */
+static inline int ork_clip_n(void)  { static const int v = getenv("ORK_I4_CLIP_N")
+                                        ? atoi(getenv("ORK_I4_CLIP_N")) : 8;    return v > 0 ? v : 8; }
+static inline float ork_clip_step(void) { static const float v = getenv("ORK_I4_CLIP_STEP")
+                                        ? (float) atof(getenv("ORK_I4_CLIP_STEP")) : 0.0625f;
+                                      return v > 0.0f ? v : 0.0625f; }
 #define ORK_I4_CLIP_N 8
 static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") == nullptr; return e; }
 
@@ -4276,14 +4285,81 @@ static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") 
  * and run unrotated (or vice versa) is not a degraded result, it is noise. The flag is also folded into
  * ork_build_sig so a mismatched pack is REFUSED rather than silently scored. */
 static bool ork_i4_norot(void) { static const int e = env_enabled("ORK_I4_NOROT"); return e; }
-static inline void ork_w4a4_rot(float * v, int n) { if (!ork_i4_norot()) ork_fwht_norm(v, n); }
+/* RANDOMIZED HADAMARD (ORK_I4_RHT=1).
+ *
+ * The plain FWHT is a FIXED transform, so how well it spreads a block's outliers depends on how those
+ * outliers happen to sit relative to its basis — nothing adapts. A random sign flip diag(±1) applied
+ * before the transform breaks that alignment, which is why NVIDIA's NVFP4 pretraining work uses a
+ * Random Hadamard Transform "to bound block-level outliers" (arXiv 2509.25149) rather than a bare one.
+ * Measured here, rotation is by far the largest single lever (no rotation = PPL 1737 vs 113), so the
+ * transform's quality is the highest-leverage thing to improve.
+ *
+ * IT STAYS EXACT. R = H·S with S = diag(±1) is still orthogonal (SᵀS = I, so RᵀR = I), hence
+ * (R·a)ᵀ(R·W) = aᵀW: the rotation cancels between the activation and weight sides exactly as the plain
+ * Hadamard does. No inverse to apply, no extra runtime cost beyond n sign flips.
+ *
+ * NOTHING IS STORED. The pattern is DERIVED from the index, so pack time (weights) and runtime
+ * (activations) generate the identical sequence without the pack carrying it. That matters because
+ * every call site blocks identically (`for off in 0..K step b: rot(ptr+off, b)`), so keying on the
+ * within-block index is sufficient and the two sides cannot drift. A stored pattern would have to be
+ * versioned into the pack format for no benefit. */
+static inline bool ork_i4_rht_on(void) { static const int e = getenv("ORK_I4_RHT") != nullptr; return e; }
+static inline void ork_rht_signs(float * v, int n) {
+    for (int i = 0; i < n; i++) {                       /* fixed hash, not rand(): must be reproducible */
+        uint32_t h = (uint32_t) i * 2654435761u + 0x9E3779B9u;
+        h ^= h >> 15; h *= 0x85EBCA6Bu; h ^= h >> 13;
+        if (h & 1u) v[i] = -v[i];
+    }
+}
+static inline void ork_w4a4_rot(float * v, int n) {
+    if (ork_i4_norot()) return;
+    if (ork_i4_rht_on()) ork_rht_signs(v, n);
+    ork_fwht_norm(v, n);
+}
+
+/* WEIGHT-side MSE clip. The activation version below hardcodes the int4 grid (7.0f, clamp [-8,7]), so it
+ * cannot serve a promoted int8 weight — this takes the quantiser's range as parameters.
+ *
+ * WHY THIS EXISTS AT ALL: the weight scale in the native-W4A4 pack path was plain absmax, so a single
+ * outlier anywhere in a row set the step size for all K values and every other weight lost resolution to
+ * it. Activations have had an MSE-optimal clip since the clipping work; weights never did, although
+ * Exp-2026-08-23 measured the weight clip as worth a further -3.3% PPL on top of the activation clip
+ * (18.053 -> 17.332). It costs ZERO bytes and ZERO runtime: the scale is chosen once, at pack time.
+ *
+ * Same search as the activation version — scan alpha down from 1.0, keep the scale minimising squared
+ * reconstruction error — because trading a little clipping of the extremes for finer steps across the
+ * bulk is usually a net win on Gaussian-ish weights. ORK_I4_NOWCLIP restores absmax for A/B. */
+static inline float ork_w_scale_mse(const float * a, int K, int qmax, int qmin) {
+    float mx = 1e-9f;
+    for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
+    float best_s = mx / (float) qmax; double best_e = -1.0;
+    const int    NT = ork_clip_n(); const float ST = ork_clip_step();
+    for (int t = 0; t < NT; t++) {
+        const float alpha = 1.0f - ST * (float) t;
+        if (alpha <= 0.0f) break;
+        const float s = alpha * mx / (float) qmax;
+        if (s <= 0.0f) continue;
+        const float inv = 1.0f / s;
+        double e = 0.0;
+        for (int k = 0; k < K; k++) {
+            int q = (int) lrintf(a[k] * inv); q = q > qmax ? qmax : (q < qmin ? qmin : q);
+            const double d = (double) a[k] - (double) q * s;
+            e += d * d;
+        }
+        if (best_e < 0.0 || e < best_e) { best_e = e; best_s = s; }
+    }
+    return best_s;
+}
+static bool ork_i4_wclip_on(void) { static const int e = getenv("ORK_I4_NOWCLIP") == nullptr; return e; }
 
 static inline float ork_i4_scale_mse(const float * a, int K) {
     float mx = 1e-9f;
     for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
     float best_s = mx / 7.0f; double best_e = -1.0;
-    for (int t = 0; t < ORK_I4_CLIP_N; t++) {
-        const float alpha = 1.0f - 0.0625f * (float) t;        /* 1.000 .. 0.5625 */
+    const int    NT = ork_clip_n(); const float ST = ork_clip_step();
+    for (int t = 0; t < NT; t++) {
+        const float alpha = 1.0f - ST * (float) t;             /* default 1.000 .. 0.5625 */
+        if (alpha <= 0.0f) break;
         const float s = alpha * mx / 7.0f;
         if (s <= 0.0f) continue;
         const float inv = 1.0f / s;
@@ -4738,7 +4814,9 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                             const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
                             float mx = 1e-9f;
                             for (int k = k0; k < k1; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                            const float s = mx / (float) QMAX;
+                            /* Same MSE clip as the per-row branch, over this group's span. */
+                            const float s = ork_i4_wclip_on() ? ork_w_scale_mse(col + k0, k1 - k0, QMAX, QMIN)
+                                                              : mx / (float) QMAX;
                             ow.bscale[(size_t) g*N + n] = s;
                             for (int k = k0; k < k1; k++) {
                                 int q = (int) lrintf(col[k] / s);
@@ -4748,7 +4826,10 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                     } else {
                     float mx = 1e-9f;
                     for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                    float s = mx / (float) QMAX; ow.bscale[n] = s;
+                    /* MSE-optimal clip instead of bare absmax — see ork_w_scale_mse. Zero bytes, zero
+                     * runtime; the scale is chosen once here, at pack time. */
+                    float s = ork_i4_wclip_on() ? ork_w_scale_mse(col, K, QMAX, QMIN) : mx / (float) QMAX;
+                    ow.bscale[n] = s;
                     for (int k = 0; k < K; k++) {
                         int q = (int) lrintf(col[k] / s);
                         bi[(size_t) k*N + n] = (int8_t) (q > QMAX ? QMAX : q < QMIN ? QMIN : q);
@@ -5049,7 +5130,10 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
      * entry is what makes the NEXT window calibrate against already-quantised upstream layers (sequential
      * GPTQ). Dropping it would let convert-mode eviction reclaim the entry, the next pass would re-pack it
      * RTN, and every window would calibrate against the unquantised model — the one-shot variant, silently.
-     * Cost is the finalized weights staying resident (11.6 GiB for 27B); ORK_GPTQ_SEQ=0 opts out.
+     * Cost is the finalized weights staying resident (11.6 GiB for 27B); ORK_GPTQ_SEQ=0 opts out, by
+     * EVICTING each finalized entry at the end of finalize rather than merely unpinning it here —
+     * unpinning alone left the quantised weight in the cache for the next window to read, which made the
+     * knob a no-op and both arms sequential. See the eviction block at the end of this function.
      * UNWINDOWED: release, as before — finalize is the last reader and convert mode wants zero residency. */
     const bool gptq_seq = !(getenv("ORK_GPTQ_SEQ") && atoi(getenv("ORK_GPTQ_SEQ")) == 0);
     struct GptqPinRelease { ggml_backend_ork_context * c; bool keep; ~GptqPinRelease() {
@@ -5203,8 +5287,40 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
     /* WINDOWED: keep the metadata (later windows need K/N/src to claim their own weights) and free only
      * this window's Hessians -- that release is the entire point of windowing. UNWINDOWED: clear, as before. */
     for (const void * k : keys) { g_gptq_done.insert(k); std::vector<double>().swap(g_gptq_cal[k].H); }
-    fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min\n",
-            done, failed, (ork_now_us()-all0)/6e7);
+
+    /* NON-SEQUENTIAL ARM: actually make the next window calibrate against the ORIGINAL weights.
+     *
+     * ORK_GPTQ_SEQ=0 used to release the wcache PIN and nothing else, which does not do what its name
+     * says: unpinning only makes an entry EVICTABLE, and with the pack build holding everything, nothing
+     * evicted it. The loop above has already replaced ow.w IN PLACE with the GPTQ-quantised weight, so
+     * the next window read that either way and BOTH arms were sequential. The measured consequence is
+     * still open: three windows cost +9.7% PPL over one (17.4465 vs 15.9011, 0.8B / 256-tok screen), and
+     * the knob written to attribute that could not, because it did nothing.
+     *
+     * Evicting the entry is what expresses the counterfactual. The next window's forward pass then finds
+     * no cache entry, re-packs from the source tensor, and so calibrates against UNQUANTISED upstream
+     * layers. The quantised weight is already PERSISTED by the loop above, so dropping it costs a re-pack,
+     * never the result.
+     *
+     * Mirrors the eviction in the shape-mismatch path (ork_wcache_shape_ok): slices first, then the NPU
+     * buffer, then the byte accounting, then the entry — ork_w_free alone leaks the NPU allocation. */
+    if (!gptq_seq) {
+        size_t evicted = 0;
+        for (const void * k : keys) {
+            auto it = ctx->wcache.find(k);
+            if (it == ctx->wcache.end()) continue;
+            ork_slice_ws_drop(ctx, it->second.w);
+            ork_mm_free(ctx->npu, it->second.w);
+            ctx->wcache_bytes -= it->second.bytes;
+            ctx->wcache.erase(it);
+            evicted++;
+        }
+        fprintf(stderr, "[ORK GPTQ] ORK_GPTQ_SEQ=0: evicted %zu finalized weights from the wcache — the "
+                        "next window calibrates against UNQUANTISED upstream layers\n", evicted);
+    }
+
+    fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min%s\n",
+            done, failed, (ork_now_us()-all0)/6e7, gptq_seq ? " (sequential)" : " (NON-sequential)");
 }
 
 // Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V
