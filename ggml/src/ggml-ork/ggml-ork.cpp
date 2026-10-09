@@ -263,7 +263,11 @@ static inline bool ork_pack_version_ok(uint32_t v) { return v == ORKPACK_VERSION
  * previously computed at build time, printed to stderr, ranked BY HAND, and re-applied as an env list —
  * which is not a mechanism, it is a person with sed. With qerr stored, re-tiering under a memory budget is
  * a pure function of the pack: rank by qerr, promote until the byte budget is spent. 0 = not measured. */
-struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; float qerr; uint32_t _pad; };
+/* `smooth_n` was the struct's unused `_pad`. Repurposing it keeps the entry the SAME SIZE, so a pack
+ * carrying a smoothing vector still parses byte-for-byte in an older build: that build ignores the
+ * field (it never read _pad) and reads exactly bscale_n scales at bscale_off, which is still correct —
+ * the smoothing vector is appended AFTER them. 0 = absent, which is what every existing pack has. */
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; float qerr; uint32_t smooth_n; };
 // The footer is the pack's self-describing header metadata (EXIF-style): validation keys on it, NOT the filename.
 //   ork_fmt   = ork_pack_format_version() at write — a tile-layout/quant MAJOR change bumps it => tiled bytes incompatible.
 //   quant_sig = ork_build_sig() at write — the build-config PRECISION signature (forced ORK_QUANT + hybrid + hadamard).
@@ -1146,6 +1150,10 @@ struct ork_weight {
                              // with int8 activations, which is the whole point of that tier.
     ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
+    /* SMOOTHQUANT / SINQ per-INPUT-channel scale, length K. The weight was packed as W[n][j]*smooth[j],
+     * so the activation must be divided by the same vector before the rotation for the product to be
+     * unchanged. Empty = not smoothed (every pack built before this). See ork_smooth_build. */
+    std::vector<float> smooth;
     // CPU-layout nibble plane (ork_native_cpu.h ORK_CPU_I4), built lazily from the device-tiled blob the
     // first time M=1 decode touches this weight. The two engines want opposite majorness, so one of them
     // has to convert; doing it here keeps the pack single-layout at the cost of N*K/2 RAM per weight.
@@ -1389,6 +1397,22 @@ struct ggml_backend_ork_context {
     // (Q/K/V off the normed hidden state; FFN gate/up off the same x) — skips redundant per-matmul
     // activation int8-quant. Holds for the data in ctx->ai/as while last_* matches.
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
+    /* ACTIVATION-CACHE KEY, SMOOTHING COMPONENT.
+     *
+     * The cache holds the rotated + quantized activation block for `last_src1`, and several weights
+     * legitimately share one input (attn_q/k/v off the same norm; ffn_gate/up off another), so reusing
+     * it is a real win. That was SOUND for every transform this backend had: the Hadamard rotation
+     * depends only on K and the MSE clip only on the row's own values -- both WEIGHT-INDEPENDENT.
+     *
+     * SmoothQuant is the first transform that is weight-DEPENDENT: each weight divides the activation by
+     * its own per-input-channel vector. Without this field attn_k reuses the block attn_q smoothed with
+     * s_Q, then multiplies it against weights smoothed with s_K -- mismatched vectors on 5 of every 7
+     * weights per layer. The packed weights, the persisted vector and the divide are all individually
+     * correct, which is what made it so hard to find (measured: PPL 3e8 vs 57 unsmoothed).
+     *
+     * The vector's ADDRESS identifies it: each weight owns its own std::vector, pinned in the wcache for
+     * the life of the run, so pointer equality is exactly "same weight's smoothing". */
+    const void * last_smooth = nullptr;
     /* ACTIVATION WIDTH is part of the reuse key. The hadamard path quantises activations to the tier's
      * width (4 for W4A4, 8 for the rotated int8 / rotated-i4a8 tiers), and a MIXED pack has both sharing
      * one activation row at the same (y, M, K). Without this, whichever weight ran first won: int4
@@ -2653,6 +2677,13 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     e.bscale_off = ctx->persist_off;
     fwrite(ow.bscale.data(), sizeof(float), ow.bscale.size(), ctx->persist_out);
     ctx->persist_off += ow.bscale.size() * sizeof(float);
+    /* Smoothing vector APPENDED after the scales, so an older reader -- which reads exactly bscale_n
+     * floats from bscale_off and never looks at this field -- is unaffected. */
+    e.smooth_n = (uint32_t) ow.smooth.size();
+    if (e.smooth_n) {
+        fwrite(ow.smooth.data(), sizeof(float), ow.smooth.size(), ctx->persist_out);
+        ctx->persist_off += ow.smooth.size() * sizeof(float);
+    }
     ctx->persist_built.emplace_back(std::string(name), e);
     ork_persist_checkpoint(ctx);
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native %s K=%d N=%d (%zu B + %u scales)\n", name, K, N, tb, e.bscale_n);
@@ -2788,6 +2819,19 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
              ? (int) (K / (e.bscale_n / (uint32_t) N)) : 0;
     ow.bscale.resize(e.bscale_n);
     if (e.bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + e.bscale_off, (size_t) e.bscale_n * sizeof(float));
+    /* SMOOTHQUANT vector, appended after the scales. 0 on every pack built before this, and on any pack
+     * built without ORK_I4_SMOOTH — in which case the activation side does nothing, as it must, since
+     * the weights in that pack were never scaled. The pack decides, not the env. */
+    if (getenv("ORK_SMOOTH_DEBUG"))
+        fprintf(stderr, "[SQ-DBG] load %s: smooth_n=%u K=%d\n", name, e.smooth_n, K);
+    if (e.smooth_n == (uint32_t) K && !getenv("ORK_I4_SMOOTH_IGNORE")) {
+        ow.smooth.resize((size_t) K);
+        memcpy(ow.smooth.data(), (const char *) ctx->persist_map + e.bscale_off
+                                 + (size_t) e.bscale_n * sizeof(float), (size_t) K * sizeof(float));
+    } else if (e.smooth_n) {
+        fprintf(stderr, "[ORK PERSIST] %s: smooth_n=%u but K=%d — ignoring a smoothing vector that "
+                        "cannot be right rather than scaling activations by garbage\n", name, e.smooth_n, K);
+    }
     ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
     if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
     ctx->persist_hits++;
@@ -3971,6 +4015,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 ctx->last_M = M;
                 ctx->last_K = K;
                 ctx->last_type = 1;
+                ctx->last_smooth = nullptr;   /* int8 path does not smooth: invalidate */
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i8: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
@@ -4159,7 +4204,8 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
             }
             const ork_weight & ow = it->second;
 
-            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 && !ctx->no_reuse);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 2 &&
+                          ctx->last_smooth == (const void *) ow.smooth.data() && !ctx->no_reuse);
             if (!reuse) {
                 // activations: per-row, per-group int4 quant with shape padding
                 #pragma omp parallel for if (M_padded >= 16)
@@ -4185,6 +4231,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                 ctx->last_M = M;
                 ctx->last_K = K;
                 ctx->last_type = 2;
+                ctx->last_smooth = (const void *) ow.smooth.data();
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 grouped: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
@@ -4227,6 +4274,10 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
  * rank-deficient, damping dominates the null space and GPTQ degenerates toward RTN there — not wrong, just
  * weak. Use a calibration prompt with M >= K for the full benefit; we warn when it is not.
  * Cost: O(M*K^2) here plus ork_i4_gptq's three O(K^3) factorisations — a heavy ONE-TIME pack step. */
+/* DEAD CODE as of 2026-10-08: ork_gptq_accum (below) is the live accumulator -- it blocks the work and
+ * uses ork_w4a4_rot, where this one calls ork_fwht_norm directly and so would silently ignore RHT and
+ * SmoothQuant. Kept only because it is the readable reference for what accum computes; do not "fix"
+ * this one and expect a measurement to change. */
 static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
     memset(H, 0, (size_t)K*K*sizeof(float));
     std::vector<float> a((size_t)K);
@@ -4303,6 +4354,122 @@ static bool ork_i4_norot(void) { static const int e = env_enabled("ORK_I4_NOROT"
  * every call site blocks identically (`for off in 0..K step b: rot(ptr+off, b)`), so keying on the
  * within-block index is sufficient and the two sides cannot drift. A stored pattern would have to be
  * versioned into the pack format for no benefit. */
+/* ---- SMOOTHQUANT: migrate quantization difficulty from activations to weights ----------------------
+ *
+ * WHY THIS AND NOT ANOTHER TRANSFORM. Measured here, every weight-side refinement (act-order, RHT)
+ * HELPED the RTN baseline and COST once GPTQ was present: the transform and GPTQ are substitutes, both
+ * conditioning the weight side. Smoothing is different in kind — it moves error OFF the activation half
+ * (which only clipping touches) and ONTO the weight half, where GPTQ is already absorbing error. That
+ * makes it complementary by construction rather than competing, which is the whole reason to try it.
+ *
+ * THE IDENTITY.  out[n] = sum_j W[n][j]*a[j] = sum_j (W[n][j]*c_j) * (a[j]/c_j)
+ * so scaling weight column j UP by c_j and activation channel j DOWN by the same c_j is exact. Choose
+ * c_j > 1 where activations are large and weights are small, and the activation outlier shrinks into
+ * range at the cost of a slightly wider weight column.
+ *
+ * c_j = act_j^alpha / wmax_j^(1-alpha)   (SmoothQuant, alpha default 0.5)
+ *
+ * act_j comes from diag(H) = sum over calibration of a_j^2, i.e. the per-channel activation ENERGY --
+ * already accumulated by the GPTQ pass, so smoothing costs no extra calibration. sqrt() makes it an RMS
+ * rather than a max; proportional to what SmoothQuant wants and far more robust to a single sample.
+ *
+ * ORDER MATTERS: smoothing is PER-CHANNEL and the Hadamard rotation MIXES channels, so it must be
+ * applied BEFORE the rotation on both sides. Applying it after would scale rotated coordinates that no
+ * longer correspond to input channels at all.
+ *
+ * NORMALISED to geometric mean 1 so the weights' overall dynamic range is unchanged — otherwise a
+ * uniformly large c would just rescale every weight and waste quantizer range. */
+static inline bool ork_smooth_on(void) { static const int e = getenv("ORK_I4_SMOOTH") != nullptr; return e; }
+static inline float ork_smooth_alpha(void) {
+    static const float a = getenv("ORK_I4_SMOOTH_ALPHA") ? (float) atof(getenv("ORK_I4_SMOOTH_ALPHA")) : 0.5f;
+    return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+}
+/* act_rms[K] (may be null -> no smoothing), wmax[K] = max_n |W[n][j]|. Fills c[K]. */
+static void ork_smooth_build(int K, const float * act_rms, const float * wmax, std::vector<float> & c, int qmax) {
+    c.assign((size_t) K, 1.0f);
+    if (!act_rms || !wmax) { c.clear(); return; }
+    const float al = ork_smooth_alpha();
+
+    /* DEAD AND NEAR-DEAD INPUT CHANNELS MUST NOT BE SMOOTHED.
+     *
+     * c_j = act_j^a / wmax_j^(1-a) collapses toward zero when a channel carries (almost) no activation
+     * energy, and a tiny c_j is catastrophic on BOTH sides: the weight column is multiplied by it and
+     * quantises to zero, while the activation is DIVIDED by it and explodes, taking over the per-row
+     * absmax and crushing every other channel in the row to zero.
+     *
+     * Measured: blk.27.ffn_down of qwen3-0.6b has such channels. One calibration batch produced an RMS
+     * near 1e-18, giving c_j = 2.1e-09 against a vector max of 34 -- a dynamic range of 1.6e10, where
+     * every healthy weight sits around 12-17. That single weight drove the whole model to PPL 3e8 while
+     * the other 139 measured normally (per-matmul rel error 0.016-0.157 vs 456980 for this one).
+     *
+     * A floor of 1e-12 inside the pow() is NOT sufficient -- it prevents a division by zero and still
+     * yields sqrt(1e-12) = 1e-6. The channel has to be excluded from smoothing entirely (c_j = 1), and
+     * the surviving scales bounded, because the quantiser cannot represent an unbounded spread anyway.
+     * ork_i4_gptq already guards the same condition on its side ("dead input channel -> unit diag"). */
+    double amean = 0.0; int an = 0;
+    for (int j = 0; j < K; j++) if (act_rms[j] > 0.0f) { amean += (double) act_rms[j]; an++; }
+    amean = an ? amean / (double) an : 0.0;
+    const double adead = amean * 1e-4;        /* <1e-4 of the mean: no energy worth migrating */
+
+    double logsum = 0.0; int nz = 0, ndead = 0;
+    for (int j = 0; j < K; j++) {
+        const double a = (double) act_rms[j];
+        const double w = (double) wmax[j];
+        if (!(a > adead) || !(w > 0.0)) {     /* dead channel: leave it alone */
+            c[(size_t) j] = 1.0f; ndead++; logsum += 0.0; nz++; continue;
+        }
+        const double v = pow(a, (double) al) / pow(w, 1.0 - (double) al);
+        c[(size_t) j] = (float) v;
+        if (v > 0.0) { logsum += log(v); nz++; }
+    }
+    if (ndead && getenv("ORK_VERBOSE"))
+        fprintf(stderr, "[ORK SMOOTH] %d/%d channels below %.3g (1e-4 of mean act) left unsmoothed\n",
+                ndead, K, adead);
+    if (!nz) { c.clear(); return; }
+    const double gm = exp(logsum / (double) nz);               /* geometric mean -> 1 */
+    if (!(gm > 0.0) || !std::isfinite(gm)) { c.clear(); return; }
+    for (int j = 0; j < K; j++) {
+        float v = (float) (c[(size_t) j] / gm);
+        if (!std::isfinite(v) || v <= 0.0f) v = 1.0f;          /* never emit a scale that destroys a column */
+        c[(size_t) j] = v;
+    }
+
+    /* BOUND DERIVED FROM THE QUANTIZER, not a constant.
+     *
+     * What survives quantization is not the scale c_j but the SCALED MAGNITUDE m_j = c_j * wmax_j. A row
+     * is quantized against one step s = max_j(m_j) / qmax, so any channel with m_j < s/2 rounds to code 0
+     * and is annihilated — the smoothing deletes the very channel it was trying to help. The condition is
+     * therefore
+     *          m_j  >=  max_j(m_j) / (2 * qmax)
+     * which is 1/14 of the row maximum at int4 (qmax=7) and 1/254 at int8 (qmax=127).
+     *
+     * This is why a fixed floor cannot be right. The reference SmoothQuant implementations clamp the raw
+     * scale at 1e-5, which is calibrated for W8A8; at W4A4 it is ~5 orders of magnitude too loose (our
+     * degenerate 2.1e-9 would clamp to 1e-5 and still sit 3.4e6 below the row max — still fatal). And a
+     * fixed [1/16,16] — the previous version here — is roughly right for int4 but needlessly throttles a
+     * PROMOTED int8 weight, which can carry 18x more spread. Deriving it from qmax handles both tiers.
+     *
+     * Clamping m_j upward means raising c_j, which costs the weight side a little range; that is the
+     * correct trade, because the alternative is losing the channel outright. */
+    const double qm = qmax > 0 ? (double) qmax : 7.0;
+    double mmax = 0.0;
+    for (int j = 0; j < K; j++) { const double m = (double) c[(size_t) j] * (double) wmax[j];
+                                  if (m > mmax) mmax = m; }
+    int nclamp = 0;
+    if (mmax > 0.0) {
+        const double mfloor = mmax / (2.0 * qm);
+        for (int j = 0; j < K; j++) {
+            const double w = (double) wmax[j];
+            if (!(w > 0.0)) continue;                          /* no weight energy: scale is irrelevant */
+            const double m = (double) c[(size_t) j] * w;
+            if (m < mfloor) { c[(size_t) j] = (float) (mfloor / w); nclamp++; }
+        }
+    }
+    if (nclamp && getenv("ORK_VERBOSE"))
+        fprintf(stderr, "[ORK SMOOTH] raised %d/%d scales to the qmax=%d survival floor (1/%.0f of row max)\n",
+                nclamp, K, qmax, 2.0 * qm);
+}
+
 static inline bool ork_i4_rht_on(void) { static const int e = getenv("ORK_I4_RHT") != nullptr; return e; }
 static inline void ork_rht_signs(float * v, int n) {
     for (int i = 0; i < n; i++) {                       /* fixed hash, not rand(): must be reproducible */
@@ -4315,6 +4482,36 @@ static inline void ork_w4a4_rot(float * v, int n) {
     if (ork_i4_norot()) return;
     if (ork_i4_rht_on()) ork_rht_signs(v, n);
     ork_fwht_norm(v, n);
+}
+
+static inline bool ork_i4_nokron(void) { static const int e = getenv("ORK_I4_NOKRON") != nullptr; return e; }
+
+/* FULL-K rotation. K factors as b*m with b = K & -K (a power of two) and m odd; the FWHT handles b,
+ * and with m>1 the blocks were otherwise NEVER mixed with each other. At K=3072 (m=3) that left
+ * ffn_down — the largest weight, and the one carrying the top qerr — rotated only within three
+ * independent 1024-channel groups, so an outlier could never be spread beyond its own third. Every
+ * other shape here is a power of two and already got a full-K rotation.
+ *
+ * Kronecker it: R = Q_m (x) H_b, i.e. FWHT each block and then apply an m-point orthogonal ACROSS
+ * the blocks at each position. O(K*m), so ~3 extra multiply-adds per element at m=3.
+ *
+ * Q_3 is the DFT-derived orthogonal. It cannot be flat — a real Hadamard of order 3 does not exist,
+ * so some row must have unequal magnitudes — but it mixes all three blocks, which the identity did
+ * not. R stays orthogonal, so the matmul identity <Ra, RW> = <a, W> holds and both operands must
+ * use this SAME function. ORK_I4_NOKRON=1 restores block-diagonal for A/B. */
+static inline void ork_w4a4_rot_k(float * v, int K) {
+    if (ork_i4_norot()) return;
+    const int b = K & (-K), m = K / b;
+    for (int off = 0; off < K; off += b) ork_w4a4_rot(v + off, b);
+    if (m != 3 || ork_i4_nokron()) return;          /* m==1 is already full-K; other odd m: unhandled, stays block-diagonal */
+    static const float q00 = 0.57735027f, q10 = 0.81649658f, q11 = 0.40824829f, q22 = 0.70710678f;
+    float * v1 = v + b, * v2 = v + 2*b;
+    for (int p = 0; p < b; p++) {
+        const float x0 = v[p], x1 = v1[p], x2 = v2[p];
+        v [p] =  q00*(x0 + x1 + x2);
+        v1[p] =  q10*x0 - q11*(x1 + x2);
+        v2[p] =  q22*(x1 - x2);
+    }
 }
 
 /* WEIGHT-side MSE clip. The activation version below hardcodes the int4 grid (7.0f, clamp [-8,7]), so it
@@ -4601,6 +4798,12 @@ struct ork_gptq_cal {
     int K = 0, N = 0, b = 0;              // b = Hadamard block (largest pow2 dividing K)
     long samples = 0;                     // rows accumulated; rank(H) <= samples
     std::vector<double> H;                // K*K
+    /* SMOOTHQUANT vector, copied from the weight at registration. Finalize re-derives the rotated
+     * weight from `src` and must re-apply the SAME scaling; the wcache entry is not yet in scope at
+     * that point, so it rides along here. Empty = not smoothed. */
+    std::vector<float> smooth;
+    uint64_t src_hash = 0;          /* content of src at REGISTRATION, to catch a buffer changing under us */
+    const void * src_data = nullptr;
 };
 static std::unordered_map<const void *, ork_gptq_cal> g_gptq_cal;
 static bool ork_gptq_on(void)  { static const int e = getenv("ORK_GPTQ") != nullptr; return e; }
@@ -4662,6 +4865,23 @@ extern "C" double ggml_backend_ork_gptq_hessian_bytes(int K) { return (double) K
  * The block is held TRANSPOSED (AbT[i][r], row i's B samples contiguous) so the inner dot product over r is
  * unit-stride on both operands; the natural [r][i] layout would make it stride-K, which is the same cache
  * mistake one level down. AbT is B*K floats — 917 KiB at K=3584, B=64 — so it stays in L2. */
+/* Hash a tensor's raw bytes. Used to test whether the ggml_tensor captured at phase-1 registration
+ * still holds the SAME data when finalize dereferences it, many forward passes later. If ggml has
+ * moved, reused or re-quantized that buffer in between, finalize re-derives the weight from bytes
+ * that are no longer the ones GPTQ calibrated against — which corrupts the weight while leaving every
+ * other site individually correct. Sampled, not full: these are multi-MiB tensors and we only need to
+ * detect a change, not characterise it. */
+static uint64_t ork_tensor_hash(const struct ggml_tensor * t) {
+    if (!t || !t->data) return 0;
+    const size_t nb = ggml_nbytes(t);
+    const unsigned char * p = (const unsigned char *) t->data;
+    uint64_t h = 1469598103934665603ULL;
+    const size_t step = nb > 65536 ? nb / 4096 : 1;      /* ~4k samples, O(1) in tensor size */
+    for (size_t i = 0; i < nb; i += step) { h ^= p[i]; h *= 1099511628211ULL; }
+    h ^= nb; h *= 1099511628211ULL;
+    return h;
+}
+
 static void ork_gptq_accum(ork_gptq_cal & c, int M, const float * y) {
     const int K = c.K;
     const int B = 64;
@@ -4671,7 +4891,15 @@ static void ork_gptq_accum(ork_gptq_cal & c, int M, const float * y) {
         const int nb = (M - m0 < B) ? (M - m0) : B;
         for (int r = 0; r < nb; r++) {                            /* rotate the block, store transposed */
             memcpy(a.data(), y + (size_t)(m0+r)*K, (size_t)K*sizeof(float));
-            for (int off = 0; off < K; off += c.b) ork_w4a4_rot(a.data() + off, c.b);
+            /* SMOOTHQUANT: the Hessian must live in the SAME basis as the weight GPTQ will quantize.
+             * Finalize derives that weight as rotate(smooth * W) and inference feeds it
+             * rotate(a / smooth), so H has to be accumulated from rotate(a / smooth) too. Omitting this
+             * leaves H in the unsmoothed basis while W is smoothed: GPTQ's H^-1 error feedback is then
+             * computed against the wrong geometry and the model is destroyed, not merely degraded
+             * (measured: PPL 3e8). The divide must precede the rotation, which mixes channels. */
+            if (!c.smooth.empty() && !getenv("ORK_SQ_NO_HESS"))
+                for (int k = 0; k < K; k++) a[(size_t)k] /= c.smooth[(size_t)k];
+            ork_w4a4_rot_k(a.data(), K);
             for (int i = 0; i < K; i++) AbT[(size_t)i*B + r] = a[i];
         }
         #pragma omp parallel for schedule(static)
@@ -4739,7 +4967,7 @@ static bool ork_cpu_decode_m1(ggml_backend_ork_context * ctx, struct ggml_tensor
     std::vector<float> a((size_t) K);
     memcpy(a.data(), (const char *) src1->data, (size_t) K * sizeof(float));
     const int b = K & (-K);                                  /* same FWHT block the weight was rotated with */
-    for (int off = 0; off < K; off += b) ork_w4a4_rot(a.data() + off, b);
+    ork_w4a4_rot_k(a.data(), K);
     float mx = 1e-9f;
     for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
     const float ascale = mx / 127.0f, inv = 1.0f / ascale;
@@ -4790,6 +5018,44 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                   ork_pack_miss_check(ctx, src0->name, K, N, serves, 3); }   /* in the pack but unloadable = bug */
                 const int GRP = ork_i4_group_for(src0->name);
                 const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+                /* SMOOTHQUANT (ORK_I4_SMOOTH=1): build the per-input-channel vector before quantizing.
+                 *
+                 * The activation statistics come from `y`, THIS forward's activation block — the cold
+                 * pack runs inside a real forward pass, so a calibration sample is already in hand. That
+                 * avoids depending on the GPTQ Hessian, which does not exist yet at this point: phase 1
+                 * packs RTN codes first and only accumulates H afterwards. Using diag(H) would mean
+                 * moving this into finalize and re-deriving the rotation there.
+                 *
+                 * One batch is a smaller sample than a full calibration sweep, but M is the convert
+                 * batch (512 under ORK_GPTQ), and SmoothQuant is not sensitive to a precise maximum —
+                 * it needs the per-channel SHAPE, which is stable across batches.
+                 *
+                 * Costs one extra to_float pass over the weight for wmax. Pack-time only. */
+                if (ork_smooth_on() && y && M > 0) {
+                    std::vector<float> act((size_t) K, 0.0f), wmx((size_t) K, 0.0f);
+                    for (int m = 0; m < M; m++) {
+                        const float * yr = y + (size_t) m * K;
+                        for (int k = 0; k < K; k++) act[(size_t) k] += yr[k] * yr[k];
+                    }
+                    for (int k = 0; k < K; k++) act[(size_t) k] = sqrtf(act[(size_t) k] / (float) M);
+                    { std::vector<float> wc((size_t) K);
+                      for (int n = 0; n < N; n++) {
+                          if (type == GGML_TYPE_F32) memcpy(wc.data(), x + (size_t) n*nb01, (size_t) K*sizeof(float));
+                          else                       to_float((const char *) x + (size_t) n*nb01, wc.data(), K);
+                          for (int k = 0; k < K; k++) {
+                              const float a = fabsf(wc[(size_t) k]);
+                              if (a > wmx[(size_t) k]) wmx[(size_t) k] = a;
+                          }
+                      } }
+                    ork_smooth_build(K, act.data(), wmx.data(), ow.smooth, ow.wbits == 8 ? 127 : 7);
+                    if (getenv("ORK_VERBOSE") && !ow.smooth.empty()) {
+                        float lo = ow.smooth[0], hi = ow.smooth[0];
+                        for (int k = 1; k < K; k++) { lo = ow.smooth[k] < lo ? ow.smooth[k] : lo;
+                                                      hi = ow.smooth[k] > hi ? ow.smooth[k] : hi; }
+                        fprintf(stderr, "[ORK SMOOTH] %s K=%d alpha=%.2f scale range %.3f..%.3f\n",
+                                src0->name, K, ork_smooth_alpha(), lo, hi);
+                    }
+                }
                 /* ROTATED tier WIDTH. Promotion keeps the rotation and widens the quantiser instead of
                  * leaving the rotated path — measurement said losing rotation costs ~7x what the extra
                  * precision buys. QMAX is the only thing that differs downstream. */
@@ -4808,7 +5074,12 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                     float * col = f32 + (size_t) n*K;
                     if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
                     else                       to_float((const char *) x + (size_t) n*nb01, col, K);
-                    for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);   // rotate weight column R·B
+                    /* SMOOTHQUANT: scale the column by c BEFORE rotating (per-channel scaling after a
+                     * channel-mixing transform is meaningless). The activation side divides by the same
+                     * vector, also pre-rotation, so the product is unchanged. */
+                    if (!ow.smooth.empty())
+                        for (int k = 0; k < K; k++) col[k] *= ow.smooth[(size_t) k];
+                    ork_w4a4_rot_k(col, K);   // rotate weight column R·B (full-K: Kronecker across FWHT blocks)
                     if (GRP > 0) {                       /* one scale per (channel, K-group), laid out [g*N+n] */
                         for (int g = 0; g < NGP; g++) {
                             const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
@@ -4864,6 +5135,9 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                     ork_gptq_cal & c = g_gptq_cal[x];
                     if (!c.src) {
                         c.src = src0; c.K = K; c.N = N; c.b = b;
+                        c.smooth = ow.smooth;   /* finalize re-derives from src and must re-apply this */
+                        c.src_hash = ork_tensor_hash(src0);
+                        c.src_data = src0->data;
                         /* PIN until finalize. In CONVERT mode ork_wcache_evict's budget is deliberately
                          * ZERO (pack -> dump -> free each weight, so conversion fits any model size), so
                          * ANY call to it evicts every unpinned entry. A pure-int4 build never calls it and
@@ -4954,7 +5228,8 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 &&
-                          ctx->last_abits == ow.abits && !ctx->no_reuse);
+                          ctx->last_abits == ow.abits && ctx->last_smooth == (const void *) ow.smooth.data() &&
+                          !ctx->no_reuse);
             if (!reuse) {
                 // activations: rotate each row (A·R), per-row int4 quant with shape padding
                 #pragma omp parallel for if (M_padded >= 16)
@@ -4962,9 +5237,11 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                     if (m < M) {
                         float arow_local[K];
                         memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
-                        for (int off = 0; off < K; off += b) {
-                            ork_w4a4_rot(arow_local + off, b);
-                        }
+                        /* SMOOTHQUANT: divide by the same per-channel vector the weights were
+                         * multiplied by, BEFORE the rotation. Exact — see ork_smooth_build. */
+                        if (!ow.smooth.empty())
+                            for (int k = 0; k < K; k++) arow_local[k] /= ow.smooth[(size_t) k];
+                        ork_w4a4_rot_k(arow_local, K);
                         /* MSE-optimal clip rather than absmax/7 — measured (ORK_W4A4_DIAG) to cut the
                          * ACTIVATION half of the W4A4 error by 11-39% (mean ~26%) on every weight of
                          * qwen3.5-0.8B. The two error halves are at parity and independent, so this is
@@ -4996,8 +5273,33 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->last_K = K;
                 ctx->last_type = 3;
                 ctx->last_abits = ow.abits;
+                ctx->last_smooth = (const void *) ow.smooth.data();
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
+                fflush(stderr);
+            }
+
+            /* ORK_A_DIAG: one line per W4A4 matmul describing exactly what is about to reach the NPU.
+             * The arm-S doorbell miss is deterministic (always the 56th ffn_down) and data-dependent (a
+             * different calibration text does not trigger it), yet the only thing the data can touch is
+             * `ai`, whose codes are clamped. This prints the things that claim to be impossible — a
+             * non-finite activation scale, an out-of-range code — so the claim is checked, not argued. */
+            if (getenv("ORK_A_DIAG")) {
+                static int call = 0; call++;
+                int nbad_s = 0, nbad_y = 0, qlo = 127, qhi = -128;
+                float slo = INFINITY, shi = -INFINITY;
+                for (int m = 0; m < M_padded; m++) {
+                    const float sv = as[m];
+                    if (!std::isfinite(sv)) nbad_s++;
+                    else { if (sv < slo) slo = sv; if (sv > shi) shi = sv; }
+                }
+                for (size_t i = 0; i < (size_t) M_padded * K; i++) {
+                    const int v = ai[i]; if (v < qlo) qlo = v; if (v > qhi) qhi = v;
+                }
+                for (size_t i = 0; i < (size_t) M * K; i++) if (!std::isfinite(y[i])) nbad_y++;
+                fprintf(stderr, "[A-DIAG] #%d K=%d N=%d M=%d reuse=%d s=[%g..%g] nonfinite_s=%d "
+                                "code=[%d..%d] nonfinite_y=%d\n",
+                        call, K, N, M, (int) reuse, (double) slo, (double) shi, nbad_s, qlo, qhi, nbad_y);
                 fflush(stderr);
             }
 
@@ -5011,7 +5313,10 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 for (int m = 0; m < M; m++) {
                     float arow[K];
                     memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
-                    for (int off = 0; off < K; off += b) ork_w4a4_rot(arow + off, b);
+                    /* SMOOTHQUANT, grouped path — same pre-rotation divide as the per-channel path. */
+                    if (!ow.smooth.empty())
+                        for (int k = 0; k < K; k++) arow[k] /= ow.smooth[(size_t) k];
+                    ork_w4a4_rot_k(arow, K);
                     for (int g = 0; g < SK; g++) {
                         const int k0 = g*GRP, k1 = k0 + GRP;
                         /* ACTIVATION WIDTH follows the tier, as it does on the ungrouped path. This branch
@@ -5207,11 +5512,34 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             const auto * tt = ggml_get_type_traits(src->type);
             ggml_to_float_t const to_float = tt->to_float;
             const char * x = (const char *) src->data;
+            {   const uint64_t hnow = ork_tensor_hash(src);
+                if (c.src_hash && hnow != c.src_hash)
+                    fprintf(stderr, "[SQ-DBG] *** %s: src CHANGED between registration and finalize "
+                                    "(hash %016llx -> %016llx, data %p -> %p) — finalize is re-deriving "
+                                    "from different bytes than GPTQ calibrated against\n",
+                            src->name, (unsigned long long) c.src_hash, (unsigned long long) hnow,
+                            c.src_data, src->data);
+                else if (getenv("ORK_SMOOTH_DEBUG"))
+                    fprintf(stderr, "[SQ-DBG] %s: src stable (hash %016llx, data %p)\n",
+                            src->name, (unsigned long long) hnow, src->data);
+            }
             for (int n = 0; n < N; n++) {
                 float * col = W.data() + (size_t)n*K;
                 if (src->type == GGML_TYPE_F32) memcpy(col, x + (size_t)n*src->nb[1], (size_t)K*sizeof(float));
                 else                            to_float(x + (size_t)n*src->nb[1], col, K);
-                for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);
+                /* SMOOTHQUANT must be re-applied HERE. Finalize re-derives the rotated weight from the
+                 * SOURCE tensor rather than reusing phase 1's, so without this the persisted weight is
+                 * unsmoothed while ow.smooth still ships in the pack — the activation side then divides
+                 * by a vector the weights were never multiplied by. Measured cost of omitting it: PPL
+                 * 3e8, i.e. a destroyed model, not a regression. Order matches the pack path: smooth
+                 * per-channel BEFORE the rotation mixes channels. */
+                if (!c.smooth.empty() && !getenv("ORK_SQ_NO_FINAL"))
+                    for (int k = 0; k < K; k++) col[k] *= c.smooth[(size_t) k];
+                if (n == 0 && getenv("ORK_SMOOTH_DEBUG"))
+                    fprintf(stderr, "[SQ-DBG] finalize %s: c.smooth=%zu (K=%d) first=%.4f\n",
+                            src->name, c.smooth.size(), K,
+                            c.smooth.empty() ? -1.0f : c.smooth[0]);
+                ork_w4a4_rot_k(col, K);
             }
             /* accum filled only the LOWER triangle (halving its inner loop); mirror once, here. */
             std::vector<float> Hf((size_t)K*K);
@@ -5264,6 +5592,24 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
             auto it = ctx->wcache.find(keys[base + u]);
             if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
             ork_weight & ow = it->second;
+            /* The weight is smoothed with c.smooth but PERSISTED with ow.smooth. If those ever differ,
+             * inference divides activations by a different vector than the weights were multiplied by. */
+            if (c.smooth.size() != ow.smooth.size()) {
+                fprintf(stderr, "[SQ-DBG] *** %s: SIZE MISMATCH c.smooth=%zu ow.smooth=%zu\n",
+                        src->name, c.smooth.size(), ow.smooth.size());
+            } else if (!c.smooth.empty()) {
+                double worst = 0.0; size_t at = 0;
+                for (size_t q = 0; q < c.smooth.size(); q++) {
+                    const double d = fabs((double) c.smooth[q] - (double) ow.smooth[q]);
+                    if (d > worst) { worst = d; at = q; }
+                }
+                if (worst > 1e-9)
+                    fprintf(stderr, "[SQ-DBG] *** %s: VECTOR MISMATCH worst |c-ow|=%.6g at k=%zu "
+                                    "(c=%.6f ow=%.6f)\n", src->name, worst, at,
+                            c.smooth[at], ow.smooth[at]);
+                else if (getenv("ORK_SMOOTH_DEBUG"))
+                    fprintf(stderr, "[SQ-DBG] %s: c.smooth == ow.smooth\n", src->name);
+            }
             std::vector<int8_t> bi((size_t)K*N);
             ow.qerr = qerr[u];
             const int GQ = ow.gsize, NGq = GQ > 0 ? K / GQ : 1;
