@@ -38,6 +38,7 @@ ggml_add_backend_library(ggml-ork
                          ${ORK_DIR}/src/npu.c
                          ${ORK_NPU_MODULES}
                          ${ORK_DIR}/src/ork_ops.c
+                         ${ORK_DIR}/src/ork_gptq.c
                          ${ORK_ORKD_CLIENT}
                          ${ORK_DIR}/src/soc.c
                          ${ORK_DIR}/src/soc/rk3588.c
@@ -50,15 +51,22 @@ target_link_libraries     (ggml-ork PRIVATE Threads::Threads)
 # ork-driver's npu.c is C and needs _GNU_SOURCE (set in the file); keep its C sources as C.
 # orkd_client.c (v1.0.0) is the transparent orkd-daemon routing shim npu.c calls into under ORK_USE_ORKD.
 set_source_files_properties(
-    ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_DIR}/src/ork_ops.c ${ORK_ORKD_CLIENT} ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
+    ${ORK_DIR}/src/npu.c ${ORK_NPU_MODULES} ${ORK_DIR}/src/ork_ops.c ${ORK_DIR}/src/ork_gptq.c ${ORK_ORKD_CLIENT} ${ORK_DIR}/src/soc.c ${ORK_DIR}/src/soc/rk3588.c ${ORK_DIR}/src/soc/rk3576.c
     PROPERTIES LANGUAGE C)
 
 # Activation int8-quant in ggml-ork.cpp is parallelized with #pragma omp parallel for (per-row,
 # independent). The pragmas are no-ops unless OpenMP is linked into THIS target (ggml-base linking it
 # does not propagate here). Link it so prefill activation-quant runs multi-threaded.
+# NOTE both languages. OpenMP::OpenMP_CXX carries -fopenmp guarded by $<COMPILE_LANGUAGE:CXX>, so linking
+# only it leaves ork-driver's C sources (npu/, ork_gptq.c, the offline CPU GEMM) compiling WITHOUT the flag
+# — every #pragma omp in them is then a silent no-op. That was measured: an offline scoring run pinned at
+# 145% CPU on a 16-core host because orki_cpu_gemm_i32's per-row parallel for never took effect.
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
     target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if (OpenMP_C_FOUND)
+    target_link_libraries(ggml-ork PRIVATE OpenMP::OpenMP_C)
 endif()
 
 # ork_bench / ork_ppl — open-stack perf + quality harnesses that drive the llama.cpp C API against the
@@ -68,7 +76,7 @@ endif()
 # fa_diff_probe / bmm_diff_probe: differential CORRECTNESS oracles — build ONE attention node, compute it
 # on the ggml CPU backend (oracle) and on the ORK backend, and diff. ~20s answers vs 6-min model loads;
 # they call the ork backend directly so supports_op cannot silently decline the path under test.
-foreach(orktool ork_bench ork_ppl fa_diff_probe bmm_diff_probe)
+foreach(orktool ork_bench ork_ppl ork_qerr ork_calibrate fa_diff_probe bmm_diff_probe)
     if (EXISTS ${ORK_DIR}/tools/re/${orktool}.cpp)
         add_executable(${orktool} ${ORK_DIR}/tools/re/${orktool}.cpp)
         target_link_libraries(${orktool} PRIVATE llama ggml)

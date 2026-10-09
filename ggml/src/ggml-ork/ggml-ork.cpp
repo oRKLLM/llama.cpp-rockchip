@@ -74,7 +74,7 @@
 //   ORK_OFF=1            Diagnostic: force EVERYTHING to CPU (supports_op returns false). Same-binary
 //                        CPU baseline for A/B benchmarks.
 //   (QKV/gate-up group fusion is DEFAULT-ON for M>=2 (ORK_FUSE_MINM): +11% @M2 .. +17% @M64, bit-exact,
-//    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE forces fusion at ALL M.)
+//    decode M=1 untouched — see graph_compute. ORK_NO_FUSE disables; ORK_FUSE_MINM moves the floor.)
 //   ORK_QUANT=4          int4 tier — a BUILD-TIME override, not a run-time mode. Set it for the run that CREATES
 //                        the .orkpack; afterwards the pack is self-describing (its footer records the tier) and
 //                        loading it selects int4 on its own, so steady-state runs need nothing set. Also use it
@@ -135,12 +135,14 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 #include <map>
 #include <algorithm>
 #include <cstring>
+#include <sys/utsname.h>   // orkpack calibration provenance (kernel identity)
 #include <cstdlib>   // LEVER3: atexit
 #include <cmath>
 #include <ctime>
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <sys/stat.h>
 #include <deque>
 #include <thread>
 #include <atomic>
@@ -167,6 +169,9 @@ extern "C" {
 #include <fcntl.h>
 #include <unistd.h>
 #include <strings.h>   // strcasecmp (env_enabled)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // Truthy-VALUE env gate (not mere presence). Returns true only when the named var is set to one of
 // 1/true/yes/on (case-insensitive); UNSET or 0/false/off/empty -> false. Use this for any flag whose
@@ -202,14 +207,56 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 5u   // v5 adds quant_sig (build-config precision signature) to the footer; v4 adds bf_size
+#define ORKPACK_VERSION 7u   // v7 = adds the optional M-threshold calibration block (see orkpack_calib)
+                             // v6 = the 2026-08-24 format: dtype-tagged entries (incl. DT_I4_ROT_A8) plus
+                             // an embedded GGUF metadata section. v7/v8 were EXPERIMENTAL and never left
+                             // this workstation (no remote contains them), so they are collapsed back into
+                             // a single public increment rather than publishing two throwaway versions.
+                             // Every v7/v8 pack is archived and must be rebuilt.
+                             // v7 adds DT_I8_ROT; v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
+                             // quant_sig (build-config precision signature) to the footer; v4 adds bf_size
                              // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
+/* ROTATED int8: the same Hadamard-rotated weight the native-W4A4 tier stores, quantised at 8 bits instead
+ * of 4. It exists because the tier set was incoherent: the rotated path was int4-ONLY, so promoting a
+ * layer for quality necessarily dropped the rotation — and measurement showed that dropping rotation
+ * costs ~7x more than the added precision buys (mixing an unrotated int8 layer into a rotated model:
+ * +2.8% PPL; mixing a rotated higher-precision layer: +0.41%). In a rotated model every tier must be
+ * rotated. */
+#define ORKPACK_DT_I8_ROT     6u
+/* ROTATED i4a8: the stored bytes are EXACTLY a DT_I4_NATIVE weight (rotated int4, per-channel mx/7
+ * scales) — so it costs nothing extra on disk — but at run time the weight is inflated to int8 containers
+ * and the ACTIVATIONS are quantised to int8 instead of int4. The error diagnostic rates this the best of
+ * the tiers: its residual equals the WEIGHT-ONLY error (0.1578 vs W-only 0.1576, three decimals, on every
+ * weight measured), i.e. int8 activations remove the activation half of the budget entirely, for -28.6%
+ * total error at zero storage cost. Distinct from DT_I4 (i4a8) because that one drops the rotation, which
+ * measured WORSE than plain W4A4 — rotation is what makes 4-bit weights coherent. */
+#define ORKPACK_DT_I4_ROT_A8  7u
+/* ADDITIVE pack versions stay readable, and this is the ONE predicate that decides it.
+ * v6 added a trailing entry field; v7 and v8 only added dtype VALUES — none of them changes a byte an
+ * older pack already contains, so a v8 binary can read v6/v7 packs and refuse an unknown dtype per-entry.
+ * It lives here because it was previously open-coded at THREE sites and only one of them was relaxed:
+ * the staleness check accepted a v7 pack while the adopt gate and ork_orkpack_usable still demanded
+ * version==8, so the pack was neither regenerated nor loaded — it was silently ignored, the run fell
+ * back to inline packing, and every arm printed the SAME number. That reads as a quality regression,
+ * not as "your pack was dropped". Keep all version comparisons going through this function. */
+// EXACTLY 6. The old range accepted 6..8, which was right while 7 and 8 were live formats; now that they
+// are collapsed, a v7/v8 file on disk is a DIFFERENT layout wearing a number we reuse, so it must be
+// rejected, not read. It reports as STALE and (over ORK_ORKPACK_MAX_REGEN_MB) refuses to regenerate.
+static inline bool ork_pack_version_ok(uint32_t v) { return v == ORKPACK_VERSION; }
 // bf_size>0 (int8 tier only) => bf_size bytes of the full-K Bf blob follow the Bb blob contiguously (i.e. at
 // blob_off + blob_size), before bscale_off. 0 => no Bf (K outside the Bf envelope, or a pre-v4 concept).
-struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; };
+/* qerr = the MEASURED relative output error this weight suffers at the tier it was stored at (the
+ * ORK_W4A4_DIAG metric: exact product vs quantised product over a fixed subsample, ||dC|| / ||C||).
+ *
+ * WHY IT BELONGS IN THE FILE. The pack decides each weight's ROUTE; without this it does not record WHY,
+ * so the decision cannot be audited, reproduced, or re-optimised without re-running the model. It was
+ * previously computed at build time, printed to stderr, ranked BY HAND, and re-applied as an env list —
+ * which is not a mechanism, it is a person with sed. With qerr stored, re-tiering under a memory budget is
+ * a pure function of the pack: rank by qerr, promote until the byte budget is spent. 0 = not measured. */
+struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_size, bscale_off, bf_size; float qerr; uint32_t _pad; };
 // The footer is the pack's self-describing header metadata (EXIF-style): validation keys on it, NOT the filename.
 //   ork_fmt   = ork_pack_format_version() at write — a tile-layout/quant MAJOR change bumps it => tiled bytes incompatible.
 //   quant_sig = ork_build_sig() at write — the build-config PRECISION signature (forced ORK_QUANT + hybrid + hadamard).
@@ -217,7 +264,84 @@ struct orkpack_entry  { uint32_t K, N, dtype, bscale_n; uint64_t blob_off, blob_
 //               them, so a stored quant_sig != this run's => wrong precision, file rejected + regenerated. The .q4/.q8
 //               filename is only a convenience so both can coexist on disk; THIS field is the authoritative guard.
 // magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
-struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig; char magic[8]; };
+/* OPTIONAL M-THRESHOLD CALIBRATION (v7). The CPU/NPU routing threshold is where the NPU's fixed submit
+ * floor stops dominating; the built-in default is measured, but on one board with one model.
+ *
+ * It is NOT produced here. A per-shape microbenchmark at pack time was tried and does not predict it: the
+ * dominant cost at small M is graph-level, not per-node -- declining every node yields 1 graph split,
+ * accepting yields 133, and those backend boundaries are invisible to a single-matmul harness (its
+ * thresholds regressed M<=8 by up to 1.52x). Only a real forward pass measures the real quantity, and only
+ * a caller can run one, so the producer is the ork_calibrate tool via ggml_backend_ork_write_calib().
+ *
+ * PROVENANCE IS PART OF THE RECORD. A pack is portable and long-lived while the measurement is only valid
+ * for the machine it was taken on -- raising this board's A76s 2304->2400 MHz silently invalidated every
+ * earlier calibration. On load the stamp is compared against the live machine and a mismatch DISCARDS the
+ * value, making the block a self-invalidating cache rather than an assertion about the world. */
+struct orkpack_calib_hdr {
+    uint32_t cpu_max_khz;    // big-core cpuinfo_max_freq (kHz) -- moves with DTB/OPP changes and governors
+    uint32_t n_big;          // big-core count
+    uint32_t ork_fmt;        // ork-driver pack-format token at calibration time
+    uint32_t flags;          // bit0: all big-core governors were "performance"
+    uint64_t kernel_hash;    // FNV-64 of uname release+version: a kernel change can move the submit floor
+};
+// WHERE DOES DECODE RUN. A DECISION, not a set of mechanisms -- deliberately.
+//
+// The mechanisms (M==1 acceptance in supports_op, the fused FFN decode chain, group fusion at M=1) have
+// preconditions on each other, and as independent switches most combinations are silent no-ops.
+// ORK_FFN_DEC was dead for its entire existence in exactly that way: gated on ctx->via_orkd AND declined
+// upstream by supports_op at M==1, so setting it did nothing and nothing said so. An ordered route cannot
+// express a contradiction: each level implies the ones below it.
+enum ork_decode_route {
+    ORK_DECODE_CPU       = 0,   // supports_op declines dense MUL_MAT at M==1 (the measured-best default)
+    ORK_DECODE_NPU       = 1,   // dense M==1 matmuls on the NPU, per node
+    ORK_DECODE_NPU_FUSED = 2,   // + fused FFN decode chain + q,k,v/gate-up group fusion at M==1
+};
+// Row encoding. Sentinel keys are skipped by any reader that only matches its own keys, so new rows can be
+// added without a format bump -- which matters because a stale pack is refused rather than regenerated
+// (rebuilding a multi-GB pack costs hours).
+//   K=0, N=0                     -> global min_m threshold      (min_m = the threshold)
+//   K=ORK_CALIB_KEY_ROUTE, N=0   -> the resolved decode route   (min_m = enum ork_decode_route)
+//   K,N != 0                     -> per-shape min_m             (expressible, unpopulated today)
+#define ORK_CALIB_KEY_ROUTE 0xFFFFFFFFu
+struct orkpack_calib { uint32_t K, N, min_m, _pad; };
+
+// magic stays last so it remains the final 8 bytes of the file regardless of footer growth. Adding a field bumps VERSION.
+struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version; uint32_t ork_fmt; uint32_t quant_sig;
+                        uint64_t calib_off; uint32_t calib_n; uint32_t calib_pad; char magic[8]; };
+
+static void ork_calib_provenance(orkpack_calib_hdr * h) {
+    memset(h, 0, sizeof *h);
+    long best = 0; int nbig = 0, all_perf = 1;
+    for (int c = 0; c < 64; c++) {
+        char pth[128]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE * f = fopen(pth, "r"); if (!f) continue;
+        long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f);
+        if (v > best) { best = v; nbig = 0; }
+        if (v == best && v > 0) {
+            nbig++;
+            snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", c);
+            FILE * g = fopen(pth, "r");
+            if (g) { char buf[32] = {0}; if (fgets(buf, sizeof buf, g) && strncmp(buf, "performance", 11) != 0) all_perf = 0; fclose(g); }
+            else all_perf = 0;
+        }
+    }
+    h->cpu_max_khz = (uint32_t) best; h->n_big = (uint32_t) nbig;
+    h->ork_fmt = ork_pack_format_version(); h->flags = all_perf ? 1u : 0u;
+    struct utsname un; uint64_t k = 1469598103934665603ULL;
+    if (uname(&un) == 0) {
+        for (const char * q = un.release; *q; q++) { k ^= (unsigned char) *q; k *= 1099511628211ULL; }
+        for (const char * q = un.version; *q; q++) { k ^= (unsigned char) *q; k *= 1099511628211ULL; }
+    }
+    h->kernel_hash = k;
+}
+
+/* Field-by-field on purpose: a near-miss is still a miss, because each of these moves the ratio and none
+ * is interpolatable. */
+static bool ork_calib_valid_here(const orkpack_calib_hdr * st) {
+    orkpack_calib_hdr now; ork_calib_provenance(&now);
+    return st->cpu_max_khz == now.cpu_max_khz && st->n_big == now.n_big && st->ork_fmt == now.ork_fmt &&
+           st->flags == now.flags && st->kernel_hash == now.kernel_hash;
+}
 
 // Build-config precision signature stored in the footer (see above). Env-derived so the standalone validity check
 // (pre-init, no ctx) and the write path compute it identically. Encodes the knobs that change PACKED CONTENT:
@@ -231,15 +355,20 @@ struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version
 #define ORK_SIG_QB_MASK 0x0ffu   // forced-precision char: '4', '8', or 0 = source-driven default
 #define ORK_SIG_HY_BIT  0x100u   // ORK_HYBRID split
 #define ORK_SIG_HD_BIT  0x200u   // hadamard — now IMPLIED by native W4A4 (see ork_w4a4_native_on); vestigial in the sig
+static bool ork_i4_norot(void);   /* fwd: folded into the pack signature below */
+/* The forced base tier for THIS build. ONE function, because the tier is decided in TWO places — what
+ * ork_orkpack_tier WRITES, and what ork_build_sig says the pack IS — and those disagreeing is a bug this
+ * file has already had once (see the note in ork_orkpack_tier). --pack-bits wins when given; 0 means the
+ * caller said nothing, so ORK_QUANT decides as it always did. Returns '4', '8', or 0 = source-driven. */
+static uint32_t ork_forced_qb(void);
 static uint32_t ork_build_sig(void) {
-    const char * q = getenv("ORK_QUANT");
-    uint32_t qb = (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;   // '4','8',… or 0 = source-driven default
+    uint32_t qb = ork_forced_qb();                                   // '4','8',… or 0 = source-driven default
     uint32_t hy = (getenv("ORK_HYBRID") != nullptr) ? 1u : 0u;
     // hd is DERIVED, not read: native W4A4 is always rotated (see ork_w4a4_native_on), so it carries no independent
     // information. Deriving it keeps the emitted value bit-identical to what the old ORK_QUANT=4 +
     // ORK_HADAMARD=1 build wrote (0x234) and what a plain int8 build wrote (0x0) — no existing pack is
     // invalidated by removing the knob.
-    uint32_t hd = (qb == (uint32_t) '4') ? 1u : 0u;
+    uint32_t hd = (qb == (uint32_t) '4' && !ork_i4_norot()) ? 1u : 0u;   /* NOROT flips it -> pack refused if run rotated */
     return (qb & ORK_SIG_QB_MASK) | (hy << 8) | (hd << 9);
 }
 
@@ -267,27 +396,521 @@ static int ork_sig_qbits(uint32_t sig) {
 // run (both at the same block size), so ggml-ork is the only layer that can hold the invariant.
 static bool ork_w4a4_native_on(void) { return env_enabled("ORK_MIXED_W4A4"); }
 
+/* OFFLINE PACK MODE — build an .orkpack on a machine that has no NPU.
+ *
+ * Packing is the slow half of every quantization experiment (measured: 12.9 of ~13.5 min is GPTQ finalize,
+ * pure double-precision CPU math) and the board is both the weakest machine available and a single shared,
+ * wedge-prone resource. Nothing about the work needs hardware: the tiling has a CPU twin asserted
+ * byte-identical to the NPU's own (ork_i4_w_dump_cpu / test_i4_dump_cpu), and the int4 MAC is INTEGER, so
+ * a CPU GEMM reproduces the NPU's int32 accumulator exactly rather than approximately.
+ *
+ * ORK_OFFLINE=<soc-id> (e.g. "rk3588") selects it. The SoC must be named because there is no device tree
+ * to detect from, and a wrong nmax would tile a subtly wrong pack. Compute falls back to an exact CPU int4
+ * GEMM so calibration forwards still produce real activations for the Hessian. */
+static const char * ork_offline_soc(void) { static const char * s = getenv("ORK_OFFLINE"); return (s && *s) ? s : nullptr; }
+static bool ork_offline(void) { return ork_offline_soc() != nullptr; }
+
+/* PER-GROUP int4 weight scales (ORK_I4_GROUP=<G>, 0/unset = per-channel, the shipped default).
+ *
+ * One scale per (channel, K-group of G) instead of one per channel. It cannot factor out of the
+ * K-accumulation, so it needs K/G narrow matmuls plus a weighted reduction — which sounded fatal until
+ * measured: on the NONBLOCK doorbell with chaining that is 1.18x the per-channel cost at M=1, because the
+ * reduction is only ~5% and chaining removes ~96% of the dispatch. ork_i4_mm_pack_grouped /
+ * ork_i4_mm_run_grouped already implement the datapath; this wires the ROTATED (Hadamard) weights to it.
+ * NOTE the two APIs disagree on scale layout: ork_i4_gptq emits [n*ng+g], run_grouped wants [g*N+n]. */
+static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? atoi(getenv("ORK_I4_GROUP")) : 0; return g; }
+
+/* BUILD-TIME per-layer precision (ORK_I4_INT8_LAYERS=name,name,...). Names listed here are WRITTEN to the
+ * pack at the int8 tier instead of native W4A4; everything else stays W4A4. This is the only place the
+ * choice is made — at RUN time the pack's stored dtype decides the route (orkpack v6), so no env is needed
+ * to score the result and the decision cannot drift from what the bytes actually are.
+ *
+ * Pick the names from ORK_PACK_RANK (entry.qerr, worst first, with the MiB each promotion costs) rather
+ * than by hand: the stored metric is diag(H)-weighted against the final GPTQ weights, and it disagrees
+ * with eyeballed rankings. Substring match, so a whole family ("ffn_down") works too. */
+/* The build configuration (see ggml-ork.h). Defaults live HERE so the header documents intent and the
+ * implementation cannot drift from it: mixed on, a modest promotion budget, and a floor below which
+ * promoting a weight is not worth its bytes. */
+static ggml_backend_ork_pack_config g_pack_cfg = { 0, true, nullptr, nullptr, 8.0f, 0.05f };
+static bool g_pack_cfg_set = false;
+
+/* THE one place the decode route is resolved. Precedence mirrors min_m's: an explicit override wins, then
+ * the pack's measured decision, then the default.
+ *
+ * There are deliberately NO per-mechanism env knobs. ORK_M1_NPU and ORK_FFN_DEC are removed: as
+ * independent switches most of their combinations were silent no-ops (ORK_FFN_DEC did nothing at all for
+ * its entire existence -- supports_op declined M==1 upstream, so the FFN nodes never reached
+ * graph_compute, and nothing said so). The value comes from a published recipe keyed on (model
+ * fingerprint x SoC); ORK_DECODE_ROUTE remains only as a development override for A/B. */
+/* MODEL SHAPE FINGERPRINT — the recipe key, together with the SoC id.
+ *
+ * A SHAPE tuple, not a name. What decides whether a routing choice pays is the model's geometry measured
+ * against what the hardware achieves (layer count x weight sizes vs GB/s), so two fine-tunes of one
+ * architecture should inherit the same recipe and a name-keyed table would not give that. Derived from the
+ * pack's own index, which ggml-ork already parses -- no GGUF KV parser needed, and it is the artifact the
+ * consumer actually loaded. Zero means "not determined" (an unpacked run), and an unmatched fingerprint
+ * falls back to the safe default rather than guessing. */
+struct ork_model_fp { uint32_t n_layer, n_embd, n_ff, attn_kv; };
+static ork_model_fp g_model_fp = {0,0,0,0};
+/* The detected SoC, cached by the pack loader. A static rather than a reach into g_ork_ctx because the
+ * resolver is defined above the context type; NULL simply means "no key yet", which falls back to the
+ * safe default instead of guessing. */
+static const char * g_soc_id = nullptr;
+
+static void ork_fp_note(const std::string & name, const orkpack_entry & e) {
+    const char * b = strstr(name.c_str(), "blk.");
+    if (b) { int li = atoi(b + 4); if ((uint32_t)(li + 1) > g_model_fp.n_layer) g_model_fp.n_layer = li + 1; }
+    if (strstr(name.c_str(), "blk.0.")) {
+        if (strstr(name.c_str(), "attn_q"))   { g_model_fp.n_embd  = e.K; }
+        if (strstr(name.c_str(), "attn_k"))   { g_model_fp.attn_kv = e.N; }
+        if (strstr(name.c_str(), "ffn_gate")) { g_model_fp.n_ff    = e.N; }
+    }
+}
+
+static int g_pack_decode_route = -1;   // set by the pack loader; -1 = no valid decision in the pack
+
+/* PUBLISHED RECIPES, keyed by (model fingerprint x SoC id).
+ *
+ * Tuning is DATA, not knobs. The right routing for a model cannot be guessed -- this project has repeatedly
+ * had microbenchmarks predict wins that measured as 3-5x regressions -- and making every user sweep for it
+ * is worse than measuring once and publishing. So the table below carries what we measured, and an external
+ * file can override or extend it WITHOUT a recompile or a repack, which is how a tuning update ships.
+ *
+ * SoC is part of the key because the answer moves with the part, and rows are only applied on a match: a
+ * recipe measured on our board (A76 unlocked to 2400 MHz, custom kernel) must not be applied blind to a
+ * stock board. Anything unmatched falls back to the safe default, which is also the measured-best config on
+ * every model so far -- so an unknown model loses nothing by being absent from the table.
+ *
+ * External format, one row per line, '#' comments (deliberately not JSON -- no dependency, hand-editable):
+ *     soc  n_layer  n_embd  n_ff  attn_kv  decode_route  min_m
+ * Searched: $ORK_RECIPES, ./ork-recipes.txt, ~/.config/ork/recipes.txt, /etc/ork/recipes.txt. min_m 0 =
+ * leave to the existing default/calibration. */
+struct ork_recipe { const char * soc; uint32_t n_layer, n_embd, n_ff, attn_kv; int decode_route; int min_m; const char * note; };
+
+static const ork_recipe ORK_RECIPES_BUILTIN[] = {
+    /* All rows measured 2026-09-04 on rk3588 (A76 @2400MHz, kernel 6.1.115 #70, governors performance),
+     * ork_bench P=512 G=32, route 0 vs route 2 (and route 1 where it mattered). */
+    { "rk3588", 28, 1024,  3072, 1024, ORK_DECODE_CPU, 0,
+      "qwen3-0.6b-f16: CPU 15.70 vs route2 5.12-5.58 tok/s — NPU decode 2.8-3x slower" },
+    { "rk3588", 28, 2048, 12288, 1024, ORK_DECODE_CPU, 0,
+      "qwen3-1.7b (f16 AND q8_0 — same shape, one row): CPU 10.21 vs route2 10.36 tok/s, a tie inside "
+      "noise, so the default stands. Prefill FFN chain costs +0.35% PPL and +42% wall" },
+    { "rk3588", 28, 1536, 17920,  256, ORK_DECODE_CPU, 0,
+      "qwen2.5-1.5b-instruct-q8_0: CPU 11.51 vs route2 11.48 tok/s — tie inside noise, default stands" },
+    { "rk3588", 24, 1024,  3584,    0, ORK_DECODE_NPU, 0,
+      "qwen3.5-0.8b-bf16: NPU DECODE WINS — CPU 2.44 vs route1 3.40 tok/s (1.40x after the doorbell "
+      "big-core fix; 1.28x before it), reproducible to 0.4% "
+      "over 3 trials. route1 == route2 (3.13 both), so the win is M==1 acceptance alone and the fused FFN "
+      "chain adds nothing — hence route 1, not 2. THE FIRST MODEL WHERE DECODE-ON-NPU PAYS: attn_kv=0 marks "
+      "the GDN/linear-attention architecture, whose CPU decode baseline is unusually low, leaving headroom "
+      "the dense models do not have" },
+};
+
+/* A fingerprint is only a usable KEY if it actually discriminates. SSM/Mamba models have no attn_q /
+ * ffn_gate / attn_k tensors, so their fingerprint collapses to n_layer alone (measured: mamba2-130m
+ * 24/0/0/0, mamba2-2.7b 64/0/0/0) — which would happily collide with any future model of the same depth
+ * and apply the wrong recipe. Require n_embd, and let a degenerate key fall through to the safe default.
+ * Costs nothing today: both Mamba models measured CPU-decode-best anyway (130m 64.88 vs 36.30 route2;
+ * 2.7b 6.47 vs 6.09), which IS the default. Giving them real rows needs SSM-specific fields in the key. */
+static bool ork_fp_usable(void) { return g_model_fp.n_layer != 0 && g_model_fp.n_embd != 0; }
+
+static bool ork_recipe_match(const ork_recipe & r, const char * soc) {
+    return soc && r.soc && strcmp(r.soc, soc) == 0 &&
+           r.n_layer == g_model_fp.n_layer && r.n_embd == g_model_fp.n_embd &&
+           r.n_ff    == g_model_fp.n_ff    && r.attn_kv == g_model_fp.attn_kv;
+}
+
+/* Look up this (fingerprint, soc). External file first so a published update beats the compiled-in row.
+ * Returns false when nothing matches -- the caller then keeps the safe default. */
+static bool ork_recipe_lookup(const char * soc, ork_recipe * out) {
+    if (!soc || !g_model_fp.n_layer) return false;          // no pack / no SoC => no key, do not guess
+    if (!ork_fp_usable()) {
+        fprintf(stderr, "[ORK RECIPE] fingerprint too weak to key on (n_layer=%u, no attn/ffn shapes — "
+                        "an SSM model?) — using safe defaults\n", g_model_fp.n_layer);
+        return false;
+    }
+    const char * paths[4]; int np = 0;
+    if (const char * e = getenv("ORK_RECIPES")) paths[np++] = e;
+    paths[np++] = "ork-recipes.txt";
+    static std::string home_p;
+    if (const char * h = getenv("HOME")) { home_p = std::string(h) + "/.config/ork/recipes.txt"; paths[np++] = home_p.c_str(); }
+    paths[np++] = "/etc/ork/recipes.txt";
+    for (int i = 0; i < np; i++) {
+        FILE * f = fopen(paths[i], "r"); if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char soc_s[64]; unsigned nl, ne, nf, akv; int rt, mm;
+            if (line[0] == '#' || line[0] == '\n') continue;
+            if (sscanf(line, "%63s %u %u %u %u %d %d", soc_s, &nl, &ne, &nf, &akv, &rt, &mm) != 7) continue;
+            ork_recipe r = { soc_s, nl, ne, nf, akv, rt, mm, "external recipe file" };
+            if (ork_recipe_match(r, soc) && rt >= ORK_DECODE_CPU && rt <= ORK_DECODE_NPU_FUSED) {
+                *out = r; out->soc = soc; fclose(f);
+                fprintf(stderr, "[ORK RECIPE] matched %s -> decode route %d\n", paths[i], rt);
+                return true;
+            }
+        }
+        fclose(f);
+    }
+    for (const ork_recipe & r : ORK_RECIPES_BUILTIN)
+        if (ork_recipe_match(r, soc)) {
+            *out = r;
+            fprintf(stderr, "[ORK RECIPE] built-in: %s\n", r.note);
+            return true;
+        }
+    fprintf(stderr, "[ORK RECIPE] no recipe for this model on %s (n_layer=%u n_embd=%u n_ff=%u attn_kv=%u) "
+                    "— using safe defaults; publish one in ork-recipes.txt\n",
+            soc, g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv);
+    return false;
+}
+
+static int ork_decode_route_resolved(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    /* An explicit override needs no key and can be decided immediately. */
+    if (const char * e = getenv("ORK_DECODE_ROUTE")) {
+        int r = atoi(e);
+        if (r >= ORK_DECODE_CPU && r <= ORK_DECODE_NPU_FUSED) {
+            v = r;
+            if (v != ORK_DECODE_CPU) fprintf(stderr, "[ORK ROUTE] decode route %d from ORK_DECODE_ROUTE (dev override)\n", v);
+            return v;
+        }
+    }
+    /* DO NOT MEMOIZE BEFORE THE KEY EXISTS. supports_op runs during graph_reserve, and on some paths the
+     * first call lands before ork_persist_init has read the pack — caching then would freeze the default
+     * in and the recipe would never be consulted, which is exactly the bug this guard fixes (the external
+     * override silently did nothing). Return the safe default uncached until the fingerprint is known. */
+    if (!g_soc_id || !g_model_fp.n_layer) return ORK_DECODE_CPU;
+    v = ORK_DECODE_CPU;
+    const char * src = "default";
+    ork_recipe rc;
+    if (ork_recipe_lookup(g_soc_id, &rc)) {
+        v = rc.decode_route; src = "recipe";
+    }
+    /* A pack calibration outranks a published recipe: it is a measurement taken on THIS machine and
+     * ork_calib_valid_here() has already confirmed the machine still matches. */
+    if (g_pack_decode_route >= 0) { v = g_pack_decode_route; src = "pack calibration"; }
+    if (v != ORK_DECODE_CPU) fprintf(stderr, "[ORK ROUTE] decode route %d from %s\n", v, src);
+    return v;
+}
+
+/* Caller-forced routing threshold for one measurement pass; <=0 restores normal selection. Exists because
+ * ORK_MINM is read into a static on first use, so an env var cannot be flipped between passes of one run --
+ * which is exactly what a sweep must do. */
+static int g_min_m_override = -1;
+extern "C" void ggml_backend_ork_set_min_m(int m) { g_min_m_override = m; }
+
+/* Store an end-to-end measured threshold into an existing pack as ONE global record (K=N=0), stamped with
+ * this machine's state. Deliberately not per-shape: an end-to-end run cannot attribute its time to a single
+ * (K,N), and recording per-shape values it did not measure would be a lie in the file format. */
+extern "C" bool ggml_backend_ork_write_calib(const char * pack_path, int min_m) {
+    if (!pack_path || min_m <= 0) return false;
+    FILE * f = fopen(pack_path, "r+b");
+    if (!f) { fprintf(stderr, "[ORK CALIB] cannot open %s\n", pack_path); return false; }
+    orkpack_footer ft;
+    if (fseek(f, -(long) sizeof ft, SEEK_END) != 0 || fread(&ft, sizeof ft, 1, f) != 1 ||
+        memcmp(ft.magic, ORKPACK_MAGIC, 8) != 0) {
+        fprintf(stderr, "[ORK CALIB] %s is not a pack\n", pack_path); fclose(f); return false; }
+    if (fseek(f, -(long) sizeof ft, SEEK_END) != 0) { fclose(f); return false; }
+    const long at = ftell(f);                       // overwrite the old footer: block, then new footer
+    orkpack_calib_hdr h; ork_calib_provenance(&h);
+    orkpack_calib r; r.K = 0; r.N = 0; r.min_m = (uint32_t) min_m; r._pad = 0;
+    orkpack_calib rr; rr.K = ORK_CALIB_KEY_ROUTE; rr.N = 0; rr._pad = 0;
+    rr.min_m = (uint32_t) ork_decode_route_resolved();
+    if (fwrite(&h, sizeof h, 1, f) != 1 || fwrite(&r, sizeof r, 1, f) != 1 ||
+        fwrite(&rr, sizeof rr, 1, f) != 1) { fclose(f); return false; }
+    ft.calib_off = (uint64_t) at; ft.calib_n = 2;
+    if (fwrite(&ft, sizeof ft, 1, f) != 1) { fclose(f); return false; }
+    fclose(f);
+    fprintf(stderr, "[ORK CALIB] wrote global threshold M>=%d + decode route %u into %s (cpu_max=%u kHz, %u big cores)\n",
+            min_m, rr.min_m, pack_path, h.cpu_max_khz, h.n_big);
+    return true;
+}
+
+extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pack_config * cfg) {
+    if (!cfg) return;
+    cfg->weight_bits = 0; cfg->mixed = true; cfg->promote_list = nullptr;   /* 0 = unset: ORK_QUANT / source policy decides */
+    cfg->qerr_source_pack = nullptr; cfg->promote_budget_mb = 8.0f; cfg->promote_qerr_min = 0.05f;
+}
+
+extern "C" void ggml_backend_ork_set_pack_config(const struct ggml_backend_ork_pack_config * cfg) {
+    if (!cfg) { ggml_backend_ork_pack_config_defaults(&g_pack_cfg); g_pack_cfg_set = false; return; }
+    g_pack_cfg = *cfg; g_pack_cfg_set = true;
+    char wb[32];
+    if (cfg->weight_bits) snprintf(wb, sizeof wb, "%d", cfg->weight_bits);
+    else                  snprintf(wb, sizeof wb, "unset (ORK_QUANT/source)");
+    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%s mixed=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
+            wb, cfg->mixed ? "yes" : "no (pure)", cfg->promote_budget_mb, cfg->promote_qerr_min,
+            cfg->promote_list ? " list=explicit" : "", cfg->qerr_source_pack ? " qerr_source=set" : "");
+}
+
+static uint32_t ork_forced_qb(void) {
+    if (g_pack_cfg.weight_bits == 4) return (uint32_t) '4';
+    if (g_pack_cfg.weight_bits == 8) return (uint32_t) '8';
+    const char * q = getenv("ORK_QUANT");
+    return (q && *q) ? (uint32_t) (unsigned char) q[0] : 0u;
+}
+/* The forced tier as 4 / 8, or 0 when nothing forces one. EVERY tier decision goes through this — the
+ * signature, the pack-staleness check, ctx->qbits, and the two supports_op gates. #3 routed only two of
+ * them and #4 was the result: --pack-bits stamped a pack int4 while the weights were still written int8,
+ * because ctx->qbits read the environment directly. A tier decided in six places needs one function, not
+ * a fix per place. */
+static int ork_forced_qbits(void) {
+    const uint32_t qb = ork_forced_qb();
+    return qb == (uint32_t) '4' ? 4 : qb == (uint32_t) '8' ? 8 : 0;
+}
+
+/* Which weights get promoted to int8 at BUILD time. Precedence: an explicit list, else the qerr-ranked
+ * policy over a source pack, else nothing (a first, uniform build — which is what RECORDS the qerr that
+ * makes the next build informed). ORK_I4_INT8_LAYERS remains as a scripting fallback. */
+/* Per-layer GROUPING (ORK_I4_GROUP_LAYERS=name,...): the named weights get per-group int4 scales while
+ * the rest stay per-channel. Both remain ROTATED, i.e. both stay on the native-W4A4 path.
+ *
+ * This exists to isolate ONE variable. Promoting a layer to int8 changes precision AND drops the Hadamard
+ * rotation at the same time, and the resulting model was worse than either pure tier — with every
+ * individual matmul measuring correct. Raising precision while STAYING rotated separates the two: if
+ * mixing rotated tiers is harmless and mixing an unrotated tier is not, rotation is the culprit and
+ * "rotated w8a8" is the fix. If both degrade, rotation is exonerated and the cause is elsewhere. */
+static int ork_i4_group_for(const char * name) {
+    static const char * spec = getenv("ORK_I4_GROUP_LAYERS");
+    const int g = ork_i4_group();
+    if (!spec || !*spec) return g;                    /* no list -> the global setting applies to all */
+    if (!name) return 0;
+    const size_t nlen = strlen(name);
+    for (const char * p = spec; *p; ) {
+        const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
+        const size_t l = (size_t)(e - p);
+        if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
+            if (!strncmp(name + i, p, l)) return g > 0 ? g : 128;   /* listed -> grouped */
+        p = (*e == ',') ? e + 1 : e;
+    }
+    return 0;                                          /* not listed -> per-channel */
+}
+
+/* Which int8 tier a promoted weight goes to. ORK_I4_PROMOTE_ROT=0 selects PLAIN (unrotated) int8.
+ *
+ * Default is rotated, on the reasoning that a rotated model should keep every tier rotated. The sweep
+ * questions that: all-ROTATED-int8 scores 13.321 where the stock UNROTATED int8 pack scores 11.952 on the
+ * same screen — 11% worse. Plausible mechanism: per-channel scaling exploits inter-channel variance, and
+ * Hadamard deliberately flattens it. At 4 bits that trade wins (outliers dominate 16 levels); at 8 bits
+ * there is ample resolution and flattening just discards the adaptivity. So rotation may help int4 and
+ * HURT int8, which would make plain DT_I8 the right tier for promoted layers. This knob makes that a
+ * measurement rather than an argument. */
+/* ORK_I4_PROMOTE = rot8 (default) | i8 | i4a8 — which tier a promoted weight is written to:
+ *   rot8  DT_I8_ROT  rotated int8 weights + rotated int8 activations  (+1 MiB/weight over int4)
+ *   i8    DT_I8      plain int8, no rotation, per-channel scales       (+3 MiB/weight — also writes Bf)
+ *   i4a8  DT_I4      int4 STORAGE inflated to int8, int8 activations   (+0 bytes on disk)
+ * The three differ in what they cost as much as in what they buy, so they are worth measuring together:
+ * i4a8 is free on disk but pays inflation into IOVA on every domain swap; i8 is the most accurate tier but
+ * the most expensive; rot8 sits between and keeps the model in one basis. */
+static int ork_promote_tier(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("ORK_I4_PROMOTE");
+        const char * r = getenv("ORK_I4_PROMOTE_ROT");          /* back-compat with the earlier knob */
+        v = 0;                                                   /* 0 = rot8, 1 = i8, 2 = i4a8 */
+        if (e && !strcmp(e, "i8"))   v = 1;
+        else if (e && !strcmp(e, "i4a8")) v = 2;
+        else if (e && !strcmp(e, "roti4a8")) v = 3;   /* rotated int4 weights + int8 activations */
+        else if (r && atoi(r) == 0)  v = 1;
+    }
+    return v;
+}
+static bool ork_promote_rotated(void) { const int t = ork_promote_tier(); return t == 0 || t == 3; }
+
+/* What promoting ONE weight from int4 to int8 actually costs the .orkpack, in MiB.
+ *
+ * The blob doubles (K*N/2 -> K*N, so +K*N/2), and that is the whole story ONLY outside the Bf envelope.
+ * An int8 entry inside it ALSO carries a full-K Bf sidecar (ork_i8_w_dump_bf_cpu, K%512==0 && K<=4096)
+ * that the int4 form never has, worth another K*N — so the true cost there is 3x the blob delta, not 1x.
+ * Counting only the delta let a 32 MiB budget spend 36 MiB, measured: five ffn_down (K=6144, outside the
+ * envelope) plus one attn_output (K=2048, inside it) came to 32.00 MiB budgeted and 36.00 MiB on disk.
+ *
+ * ONE function, used by both the budget and ORK_PACK_RANK's printed cost, so what the ranking quotes and
+ * what the policy spends cannot drift — the same reason ork_forced_qb exists. */
+static double ork_promote_cost_mb(uint32_t K, uint32_t N) {
+    const double blob_delta = (double) K * N / 2.0;                    /* int4 -> int8 */
+    const double bf         = (K % 512u == 0 && K <= 4096u) ? (double) K * N : 0.0;   /* Bf sidecar */
+    return (blob_delta + bf) / 1048576.0;
+}
+
+/* THE QERR-RANKED PROMOTION SET — the middle clause of the precedence documented above, which was
+ * described there long before it existed (oRKLLM/llama.cpp-rockchip#1: --pack-qerr-source, --pack-budget
+ * and --pack-qerr-min parsed, echoed, and then read by nothing).
+ *
+ * Reads ONLY the source pack's index. entry.qerr plus K/N is everything the policy needs, so this maps no
+ * blobs, allocates no IOVA and never runs the model — the whole point of storing qerr in the pack was that
+ * re-tiering becomes a pure function of the file. Ranks worst-first, promotes while qerr >= qerr_min and the
+ * cumulative int4->int8 delta (+K*N/2, the same figure ORK_PACK_RANK prints) still fits the budget.
+ *
+ * Built once, and it REPORTS what it did. A policy that silently promotes nothing is indistinguishable from
+ * one that is not wired up at all, which is exactly how the inert flags survived a release. */
+static const std::unordered_set<std::string> & ork_qerr_promote_set(void) {
+    static std::unordered_set<std::string> promo;
+    static bool built = false;
+    if (built) return promo;
+    built = true;
+
+    const char * path = g_pack_cfg.qerr_source_pack;
+    if (!path || !*path) return promo;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' cannot be opened — no promotion\n", path); return promo; }
+    off_t sz = lseek(fd, 0, SEEK_END);
+    orkpack_footer f;
+    if (sz <= (off_t) sizeof f || pread(fd, &f, sizeof f, sz - (off_t) sizeof f) != (ssize_t) sizeof f ||
+        memcmp(f.magic, ORKPACK_MAGIC, 8) != 0 || f.index_off >= (uint64_t) sz) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' is not an .orkpack — no promotion\n", path);
+        close(fd); return promo;
+    }
+    if (!ork_pack_version_ok(f.version)) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s' is format v%u, this build reads v%u — no promotion\n",
+                path, f.version, ORKPACK_VERSION);
+        close(fd); return promo;
+    }
+    const size_t idx_n = (size_t) (sz - (off_t) f.index_off) - sizeof f;
+    std::vector<char> buf(idx_n);
+    if (pread(fd, buf.data(), idx_n, (off_t) f.index_off) != (ssize_t) idx_n) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': short read of the index — no promotion\n", path);
+        close(fd); return promo;
+    }
+    close(fd);
+
+    /* Same index layout as the load path: two u64 of metadata offsets, then n_entries of
+     * {u32 name_len, name bytes, orkpack_entry}. Bounds-checked because this file is user-supplied. */
+    const char * idx = buf.data(); const char * end = buf.data() + idx_n;
+    if (end - idx < 16) return promo;
+    idx += 16;
+    std::vector<std::pair<float, std::string>> rank;
+    std::unordered_map<std::string, orkpack_entry> ent;
+    uint32_t n_read = 0;
+    for (uint32_t i = 0; i < f.n_entries; i++) {
+        if (end - idx < 4) break;
+        uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
+        if (nl > (uint32_t) (end - idx)) break;
+        std::string name(idx, nl); idx += nl;
+        if ((size_t) (end - idx) < sizeof(orkpack_entry)) break;
+        orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+        n_read++;
+        if (e.qerr > 0.0f) { rank.emplace_back(e.qerr, name); ent.emplace(std::move(name), e); }
+    }
+
+    if (rank.empty()) {
+        fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': %u entries, none carry qerr — "
+                        "that pass recorded no error, so there is nothing to rank (no promotion)\n", path, n_read);
+        return promo;
+    }
+
+    std::sort(rank.rbegin(), rank.rend());                       /* worst qerr first */
+    const double budget_mb = g_pack_cfg.promote_budget_mb;
+    const float  qmin      = g_pack_cfg.promote_qerr_min;
+    double spent = 0;
+    for (const auto & r : rank) {
+        if (r.first < qmin) continue;                             /* below the floor: not worth its bytes */
+        const orkpack_entry & e = ent.at(r.second);
+        const double mb = ork_promote_cost_mb(e.K, e.N);          /* blob delta + Bf sidecar where it applies */
+        if (spent + mb > budget_mb) continue;                     /* keep going: a smaller one may still fit */
+        spent += mb;
+        promo.insert(r.second);
+    }
+    fprintf(stderr, "[ORK PACK-PROMOTE] qerr source '%s': %u entries, %zu with qerr, %zu promoted to int8 "
+                    "(qerr >= %.3f), %.2f of %.2f MiB budget spent\n",
+            path, n_read, rank.size(), promo.size(), (double) qmin, spent, budget_mb);
+    if (promo.empty())
+        fprintf(stderr, "[ORK PACK-PROMOTE] nothing promoted — every qerr is below --pack-qerr-min %.3f "
+                        "(worst is %.4f), or the budget is smaller than the cheapest candidate\n",
+                (double) qmin, (double) rank.front().first);
+    return promo;
+}
+
+static bool ork_i4_force_i8(const char * name) {
+    static const char * spec = g_pack_cfg.promote_list ? g_pack_cfg.promote_list : getenv("ORK_I4_INT8_LAYERS");
+    if (g_pack_cfg_set && !g_pack_cfg.mixed) return false;         // pure int4: explicit opt-out
+    if (!name) return false;
+    if (spec && *spec) {                                           // clause 1: an explicit list is EXCLUSIVE
+        const size_t nlen = strlen(name);
+        for (const char * p = spec; *p; ) {
+            const char * e = strchr(p, ','); if (!e) e = p + strlen(p);
+            const size_t l = (size_t)(e - p);
+            if (l && l <= nlen) for (size_t i = 0; i + l <= nlen; i++)
+                if (!strncmp(name + i, p, l)) return true;
+            p = (*e == ',') ? e + 1 : e;
+        }
+        return false;
+    }
+    const std::unordered_set<std::string> & promo = ork_qerr_promote_set();   // clause 2: qerr-ranked
+    return !promo.empty() && promo.count(name) != 0;                          // clause 3: else nothing
+}
+
 // Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —
 // unless ORK_QUANT explicitly forces a tier, in which case a conflicting pack is stale and gets rebuilt.
 static bool ork_sig_compatible(uint32_t sig) {
     if ((sig & ORK_SIG_HY_BIT) != (ork_build_sig() & ORK_SIG_HY_BIT)) return false;
-    const char * q = getenv("ORK_QUANT");
-    if (q && *q) return ork_sig_qbits(sig) == ((q[0] == '4') ? 4 : 8);
+    /* ROTATION (bit 9) is deliberately NOT checked here, and that is a known hole -- see ORK_I4_NOROT.
+     * Checking it looks obvious and is wrong in this spot: a false from ork_sig_compatible marks the pack
+     * STALE, and stale means REGENERATE, not refuse. Adding the check turned a read of a mismatched pack
+     * into a silent destructive rebuild -- it overwrote a G=32 GPTQ pack with a per-channel RTN one and
+     * scored 6795 instead of erroring. The rotation state needs a check on the REFUSE path (like the
+     * pack-miss guard), not on the staleness path. Until then ORK_I4_NOROT is build/run-must-match by
+     * convention, and mismatching it yields garbage (measured: PPL 7,059,519). */
+    const int fq = ork_forced_qbits();
+    if (fq) return ork_sig_qbits(sig) == fq;
     return true;
+}
+
+// Is [p, p+n) inside a FILE-BACKED mapping? This is the safety precondition for evicting it below, and it
+// is a property of the CALLER's mapping, so it is measured rather than declared: llama.cpp mmaps the GGUF
+// by default (file-backed) but --no-mmap allocates anonymous memory, and the two respond to MADV_DONTNEED
+// in opposite ways -- drop-and-refault vs ZERO-FILL.
+//
+// Single-entry range cache: weights are packed sequentially out of one GGUF mapping, so after the first
+// lookup every subsequent weight hits the cached VMA and /proc/self/maps is not re-read. A miss (a second
+// mapping, or a model reload) just re-reads it. Unreadable /proc, or an address in no mapping we can
+// prove is file-backed, answers NO -- the failure mode of a wrong YES is silent data loss, so the
+// unprovable case must not evict.
+static bool ork_src_file_backed(const void * p, size_t n) {
+    static uintptr_t c_lo = 0, c_hi = 0;
+    const uintptr_t a = (uintptr_t) p, e = a + n;
+
+    if (c_hi && a >= c_lo && e <= c_hi) return true;
+
+    FILE * f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    char line[1024];
+    bool ok = false;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo = 0, hi = 0;
+        int poff = 0;
+        // address perms offset dev inode pathname
+        if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %n", &lo, &hi, &poff) < 2) continue;
+        if (a < lo || e > hi) continue;
+        const char * path = (poff > 0) ? line + poff : "";
+        while (*path == ' ') path++;
+        // A pathname that is neither empty nor a pseudo-file ("[heap]", "[stack]", "[vvar]") means the
+        // pages are clean and file-backed, so DONTNEED drops them and a later touch re-faults from disk.
+        if (*path && *path != '\n' && *path != '[') { c_lo = lo; c_hi = hi; ok = true; }
+        break;
+    }
+    fclose(f);
+    return ok;
 }
 
 // Custom-loader memory relief: once a weight is packed NPU-resident, its source GGUF plane is dead weight.
 // Evicting those mmap'd pages keeps the source's RSS shrinking as packed RSS grows (peak ~max(src,packed)
-// not src+packed). Page-aligned MADV_DONTNEED drops only clean, file-backed pages (re-faulted on demand);
-// opt-in via ORK_EVICT_SRC because with --no-mmap the mapping is anonymous and DONTNEED would zero data.
+// not src+packed), and a page that is touched again simply re-faults from the file.
+//
+// This used to be opt-in behind ORK_EVICT_SRC, because under --no-mmap the mapping is anonymous and
+// MADV_DONTNEED zero-fills instead of dropping -- i.e. it would silently destroy the weights. That made
+// correctness depend on the operator knowing an interaction between two flags in different layers. The
+// precondition is now MEASURED per range (ork_src_file_backed) and the knob is gone: safe cases get the
+// relief automatically, unsafe ones are skipped whether or not anyone remembered.
 static void ork_evict_src(const void * p, size_t n) {
-    static int on = -1;
-    if (on < 0) on = getenv("ORK_EVICT_SRC") ? 1 : 0;
-    if (!on || !p || !n) return;
+    if (!p || !n) return;
     uintptr_t a = (uintptr_t) p, end = a + n;
     uintptr_t pa = (a + 4095u) & ~(uintptr_t) 4095u;
     uintptr_t pe = end & ~(uintptr_t) 4095u;
-    if (pe > pa) madvise((void *) pa, (size_t) (pe - pa), MADV_DONTNEED);
+    if (pe <= pa) return;
+    if (!ork_src_file_backed(p, n)) return;   // anonymous (--no-mmap): DONTNEED would ZERO it
+    madvise((void *) pa, (size_t) (pe - pa), MADV_DONTNEED);
 }
 
 struct ggml_backend_ork_context;   // fwd
@@ -333,14 +956,45 @@ static size_t ork_stream_ram_budget() {
 //   int4 (W4A4):  gsize==G,  bscale [(K/G)*N]      (per K-group, per channel)
 struct ork_weight {
     ork_w * w = nullptr;
+    float   qerr = 0.0f;     // measured diag(H)-weighted relative error at the stored tier; persisted
+    int     wbits = 4;       // WEIGHT container width: 4 = int4 MAC, 8 = int8 MAC (native int8, or int4
+                             // values inflated into int8 containers for DT_I4_ROT_A8).
+    int     abits = 4;       // ACTIVATION width, independent of the weight: DT_I4_ROT_A8 pairs int4 weights
+                             // with int8 activations, which is the whole point of that tier.
     ork_stream_entry * se = nullptr;   // STREAM-POOL tier: RAM-resident inflated int8 (map/unmap cheap)
     std::vector<float> bscale;
+    // CPU-layout nibble plane (ork_native_cpu.h ORK_CPU_I4), built lazily from the device-tiled blob the
+    // first time M=1 decode touches this weight. The two engines want opposite majorness, so one of them
+    // has to convert; doing it here keeps the pack single-layout at the cost of N*K/2 RAM per weight.
+    std::vector<uint8_t> cpu_nib;
     int gsize = 0;
     size_t   bytes = 0;       // resident NPU bytes (for the streaming LRU budget)
     size_t   ram_bytes = 0;   // STREAM-POOL: RAM bytes held by `se` (for the RAM-LRU budget)
     uint64_t last_use = 0;    // monotonic tick of last access (LRU eviction order)
     bool     is_expert = false;   // MoE STREAM: a routed-expert slice (evicted by ork_wcache_evict_experts; dense stays)
 };
+
+/* Does a cached weight have the geometry the caller is about to use it with?
+ *
+ * The wcache is keyed by the SOURCE TENSOR'S DATA POINTER, and a fused group weight is stored under its
+ * FIRST MEMBER'S pointer. So one key legitimately names two different weights: the per-tensor one the
+ * unfused path wants (decode, M<32) and the K x Ntot concatenation the group path wants (prefill).
+ * Nothing checked, so whichever route populated the entry first won, and the other silently computed
+ * against the wrong shape -- the matmul then wrote nothing and the zeros propagated to constant logits
+ * (ork-driver#4). A mismatch is a MISS, not a hit: the caller rebuilds the weight it actually needs.
+ * Cheap: two ints from the driver, once per matmul, against work measured in millions of MACs. */
+static bool ork_wcache_shape_ok(const ork_weight & ow, int K, int N) {
+    if (!ow.w) return false;
+    int wk = 0, wn = 0;
+    ork_w_dims(ow.w, &wk, &wn);
+    if (wk == K && wn == N) return true;
+    if (getenv("ORK_VERBOSE")) {
+        static int warned = 0;
+        if (warned++ < 8) fprintf(stderr, "[ork] wcache SHAPE MISMATCH: cached %dx%d, caller wants %dx%d — rebuilding\n", wk, wn, K, N);
+    }
+    return false;
+}
+
 
 // One reusable slot in the MoE expert pool: a packed weight whose DMA buffer is reused (repack-in-place)
 // across different experts of the SAME shape, so the NPU IOMMU isn't churned/fragmented by alloc+free.
@@ -492,10 +1146,34 @@ struct ggml_backend_ork_context {
     int      persist_mode = 0;
     void *   persist_map = nullptr; size_t persist_map_sz = 0;
     std::unordered_map<std::string, orkpack_entry> persist_idx;             // read-mode index
+    // Tier 15: name -> domain, planned ONCE over the complete index at pack open (see the planner). Not
+    // stored in the pack: a domain id is hardware-specific (domain count, IOVA width, RAM budget), and
+    // baking it in would mean one artifact per memory configuration. The pack stays portable; the PLAN is
+    // derived locally and is a pure function of (index, hardware), so it is identical run to run.
+    std::unordered_map<std::string, int> placement;
+    std::unordered_map<uint64_t, uint32_t> calib_minm;   // (K<<32|N) -> measured threshold (unused today)
+    int calib_global = 0;                                // end-to-end measured threshold, 0 = none/stale
+    int decode_route = ORK_DECODE_CPU;                   // resolved once at load; see enum ork_decode_route
+    uint64_t pack_meta_off = 0, pack_meta_size = 0;   // v6 embedded GGUF metadata section (0 = absent)
+    // The model file's packed tensors are HOLES -> ork must serve them on every path. Set from
+    // ORK_SOURCE_IS_STUB (the caller knows: it passed a .orkpack and used the extracted gguf) because
+    // there is no reliable in-backend hook — buffer_set_tensor never fires for model weights.
+    int source_is_stub = getenv("ORK_SOURCE_IS_STUB") ? 1 : 0;
+    long cpu_dec_calls = 0;   // M=1 decode matmuls served by ork's own NEON kernel over the pack
+    // PRELOAD REGISTRY (Tier 15 stage 3). Every pack-owned MUL_MAT weight ggml plans to run, recorded at
+    // supports_op time -- the ONLY hook that actually enumerates them. Three others do not: set_tensor
+    // never fires for weights (they live in CPU buffers, not ORK_Weights), a cgraph walk sees one SPLIT at
+    // a time (641 at bs=64 on 27B, so it found 1 of ~400), and a 1-token warmup materialises nothing
+    // because M==1 is declined to the CPU. supports_op runs on every node during graph_reserve, at model
+    // load, before any execution -- which is exactly when a preload wants the list.
+    std::vector<const struct ggml_tensor *> preload_reg;
+    std::unordered_set<const void *> preload_seen;
+    int preload_done = 0;
     FILE *   persist_out = nullptr; std::string persist_tmp, persist_final; // write-mode
     std::vector<std::pair<std::string, orkpack_entry>> persist_built; uint64_t persist_off = 0;
     std::unordered_set<std::string> persist_dumped;   // names already written to .orkpack (skip re-dump on convert-decode re-pack)
     long persist_hits = 0, persist_misses = 0;   // weights loaded from .orkpack vs packed (diagnostic)
+    int  dom_advance_fails = 0;   // capped: every failed alloc leaks kernel IOVA (see ork_domain_advance)
     // MoE expert weights are too numerous to keep ALL packed NPU-resident (the IOMMU exhausts ~2k).
     // Fixed pool PER SHAPE: a bounded set of slots allocated once, reused round-robin via repack-in-place
     // (NO alloc/free → no IOMMU fragmentation). Dense/attn weights stay in wcache (resident forever).
@@ -520,6 +1198,12 @@ struct ggml_backend_ork_context {
     // (Q/K/V off the normed hidden state; FFN gate/up off the same x) — skips redundant per-matmul
     // activation int8-quant. Holds for the data in ctx->ai/as while last_* matches.
     const void * last_src1 = nullptr; int last_M = 0, last_K = 0; int last_type = 0;
+    /* ACTIVATION WIDTH is part of the reuse key. The hadamard path quantises activations to the tier's
+     * width (4 for W4A4, 8 for the rotated int8 / rotated-i4a8 tiers), and a MIXED pack has both sharing
+     * one activation row at the same (y, M, K). Without this, whichever weight ran first won: int4
+     * activations (+/-7) handed to an int8 weight lose precision, and int8 activations (+/-127) handed to
+     * the int4 MAC are flatly out of range. Measured: +33% PPL on a k=28 rotated-int8 pack. */
+    int last_abits = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
@@ -573,6 +1257,32 @@ struct ggml_backend_ork_context {
         int fused = -1;                       // -1 uninit; 0/1 = this layer's resident scales are per-head/global
     };
     std::unordered_map<const void *, ork_kv_layer> attn_kv;
+    /* PRECOMPILED FFN DECODE CHAINS (ork_pc_*). The M=1 decode wall is per-call HOST cost, not bandwidth
+     * or hardware: kernel-side per-job time is identical between a tight probe and this handler, and the
+     * sentinel poll never waits (see the wiki Optimization Roadmap). ork_pc_compile bakes the regcmd once
+     * and ork_pc_run then only refreshes A and submits — no synth, no validate, no K-slice accumulate.
+     * Measured per call at decode shapes: 0.460 -> 0.321 ms (down), 0.450 -> 0.322 (gate/up), 0.377 ->
+     * 0.108 (q/k/v/o). It submits SINGLE-CORE and needs C in an ork DMA buffer, so it trades hardware
+     * time for host time and only wins where host cost dominates — which at M=1 it does.
+     *
+     * Two contract details that dictate the shape of this cache: ork_pc_compile CAPTURES the A pointer
+     * (ork_pc_run memcpy's from it each call), so A must be a PERSISTENT buffer, not a per-call malloc;
+     * and C must come from ork_dma_alloc. Hence both live here, per layer, keyed on the gate weight. */
+    struct ork_ffn_pc {
+        ork_pc_chain *gu = nullptr, *dn = nullptr;   // [gate,up] as one 2-task chain; down as one task
+        int8_t  *xi = nullptr, *glu8 = nullptr;      // persistent A sources (captured by compile)
+        float   *glf = nullptr;                      // silu scratch (the generic path's is allocated later)
+        /* CACHED MIRRORS of the DMA outputs. ork_pc bakes C's address in, so the outputs must live in
+         * ork_dma_alloc memory — which is uncached/write-combined. Reading it with a scalar loop cost
+         * 6144 uncached accesses and blew host-silu from 45us to 311us, eating most of what the
+         * precompiled submits saved. One burst memcpy into cached memory is ~1us and the loop then runs
+         * at normal speed. */
+        int32_t *gm = nullptr, *um = nullptr, *dm = nullptr;
+        int32_t *gi = nullptr, *ui = nullptr, *di = nullptr;   // DMA outputs
+        int K = 0, Nff = 0, Kd = 0;
+        bool tried = false;                          // compile attempted; false gu/dn => refused, use the generic path
+    };
+    std::unordered_map<const void *, ork_ffn_pc> ffn_pc;
     // Per-layer DECODE FFN calibration cache (ORK_FFN_DEC): route the SwiGLU inner through the fused orkd
     // chain (ork_mm_ffn_orkd — one submit) at decode. Per-tensor int8; the intermediate int8 scales (is/os/
     // us/gs) are calibrated ONCE per layer on the first real decode activation (representative), then reused;
@@ -681,6 +1391,17 @@ static int ork_layer_of(const char * name) {
 // domain (it's under-filled by ceil rounding). When domain_layers==0 (byte-balanced auto sizing) the fill
 // still advances ONLY at a layer boundary, so a layer stays co-domain — preserving ork_dispatch_i8's
 // cross-core RR chains. `layer` = ork_layer_of(name), or -1 if non-layer/unknown.
+/* Planned placement if we have one for this weight, else the incremental fill below. The plan is what
+ * makes the layout DETERMINISTIC: the fallback assigns domains in graph-VISIT order, which is why the same
+ * 9B pack has landed as 5 domains (46 t/s) on one run and 7 (4.3 t/s) on another. */
+static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int layer);
+static int ork_weight_domain_named(ggml_backend_ork_context * ctx, const char * name, size_t bytes, int layer) {
+    if (name && !ctx->placement.empty()) {
+        auto it = ctx->placement.find(name);
+        if (it != ctx->placement.end()) return it->second;
+    }
+    return ork_weight_domain(ctx, bytes, layer);
+}
 static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int layer) {
     if (ctx->n_domains <= 1) return 0;
     if (ctx->domain_layers > 0) {
@@ -708,8 +1429,30 @@ static int ork_weight_domain(ggml_backend_ork_context * ctx, size_t bytes, int l
 }
 // A pack/load just failed in the current domain (its IOVA window is full). Advance to the next domain if
 // one remains; returns the new domain, or -1 when the last domain is also exhausted (a real OOM).
+/* Advancing is CAPPED, because a failed allocation is not free: the kernel leaves a partially-mapped
+ * object behind, its later unmap trips WARN_ON(unmapped != size) in __iommu_dma_unmap, and that IOVA is
+ * never reclaimed -- it survives process exit and accumulates until reboot. Measured: a clean run leaks
+ * NOTHING, a failed 27B run leaks exactly 5 mappings, and 5 is how many domains the retry walked. So the
+ * retry does not rescue the allocation, it multiplies a kernel bug by the number of domains.
+ *
+ * Advancing is still right when a domain is genuinely full -- that is what it is for. What is NOT right is
+ * continuing after a domain that had plenty of room ALSO failed: the evidence there is unambiguous (every
+ * domain refusing at ~29-36 MB of a 3900 MB ceiling, with PRIME_FD_TO_HANDLE returning ENOMEM), and that is
+ * a kernel allocation failure which the next domain will reproduce exactly. Stop after the first such.
+ * ORK_DOM_ADVANCE_MAX overrides the cap for deliberate experiments. */
 static int ork_domain_advance(ggml_backend_ork_context * ctx) {
     if (ctx->domain_cursor >= ctx->n_domains - 1) return -1;
+    static const int cap = getenv("ORK_DOM_ADVANCE_MAX") ? atoi(getenv("ORK_DOM_ADVANCE_MAX")) : 2;
+    if (++ctx->dom_advance_fails > cap) {
+        static int said = 0;
+        if (!said++)
+            fprintf(stderr,
+                "[ork] domain advance CAPPED after %d failures — each failed allocation leaks an IOVA\n"
+                "[ork]   mapping the kernel cannot reclaim (WARN_ON in __iommu_dma_unmap; survives exit,\n"
+                "[ork]   needs a reboot). Retrying further domains would multiply the leak, not fix it.\n"
+                "[ork]   Reduce resident footprint (coarser group size / fewer promoted weights) instead.\n", cap);
+        return -1;
+    }
     int d = ++ctx->domain_cursor;
     ork_npu_set_pack_domain(ctx->npu, d);
     fprintf(stderr, "[ork] domain %d full — advancing residence to domain %d\n", d - 1, d);
@@ -858,6 +1601,8 @@ static std::string ork_default_orkpack_path() {
     const size_t dot = m.rfind(".gguf");
     return m.substr(0, dot) + ".orkpack";
 }
+static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed);
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_i8_mm_import),
@@ -891,6 +1636,12 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (!p || !*p) return;
     ctx->persist_final = p;    // resolved pack path, valid in BOTH read and write mode (sidecars key off it)
     bool stale = false;   // present-but-incompatible pack seen -> regenerate + delete the old sidecar
+    /* A well-formed pack that we neither ADOPTED nor diagnosed as stale means the load gates disagree
+     * with each other. That is not a rebuild condition, it is a bug, and the write path below would
+     * destroy the file while "self-healing" it. Measured cost of not having this: a version gate that
+     * accepted a pack as fresh and then failed to adopt it silently overwrote two GPTQ packs with RTN
+     * content and reported the result as a quality regression. */
+    bool pack_well_formed = false;
     int fd = open(p, O_RDONLY);
     if (fd >= 0) {
         off_t sz = lseek(fd, 0, SEEK_END);
@@ -915,7 +1666,14 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                 // change bumps ork-driver's MAJOR version). Same-(K,N) blobs from an incompatible major
                 // are the SAME size, so this token is the only thing that catches them.
                 bool magic_ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
-                if (magic_ok && f.version != ORKPACK_VERSION) {        // older footer schema (pre-v3, no token)
+                pack_well_formed = magic_ok;
+                /* v6 is now an EXACT match (see ork_pack_version_ok). The old 6..8 range was correct while
+                 * 7 and 8 were live formats that only ADDED dtype values; collapsing them back into 6 means
+                 * a v7/v8 file is a different layout wearing a number we reuse, so accepting it by range
+                 * would misread it. A rejected pack falls back to inline packing, which reads as a
+                 * mysterious quality regression -- hence the explicit message below rather than silence. */
+                const bool version_ok = ork_pack_version_ok(f.version);
+                if (magic_ok && !version_ok) {                         // older footer schema (pre-v3, no token)
                     fprintf(stderr, "[ORK PERSIST] %s predates the pack-compat token (footer < v%u) — regenerating\n", p, ORKPACK_VERSION);
                     stale = true;
                 } else if (magic_ok && f.ork_fmt != ork_pack_format_version()) {  // v3 file, but tiling/quant major differs
@@ -927,20 +1685,91 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             p, f.quant_sig, ork_build_sig());
                     stale = true;
                 }
-                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+                if (memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
                     f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz) {
                     const char * idx = (const char *) m + f.index_off;
+                    /* v6 METADATA SECTION. Two u64 at the head of the index region -- deliberately here and
+                     * not in the footer, so the footer stays binary-stable and an older reader still finds
+                     * magic where it expects it (it then fails the version check cleanly instead of
+                     * misparsing a longer footer). 0/0 = no embedded metadata. */
+                    uint64_t meta_off = 0, meta_size = 0;
+                    memcpy(&meta_off, idx, 8);  idx += 8;
+                    memcpy(&meta_size, idx, 8); idx += 8;
+                    ctx->pack_meta_off = meta_off; ctx->pack_meta_size = meta_size;
+                    /* Adopt a stored threshold only if the machine still matches. Discarding is silent-safe:
+                     * dispatch falls back to the built-in default. */
+                    if (f.calib_n && f.calib_off && f.calib_off + sizeof(orkpack_calib_hdr) <= (uint64_t) sz) {
+                        orkpack_calib_hdr ch; memcpy(&ch, (const char *) m + f.calib_off, sizeof ch);
+                        const uint64_t need = f.calib_off + sizeof ch + (uint64_t) f.calib_n * sizeof(orkpack_calib);
+                        if (need <= (uint64_t) sz && ork_calib_valid_here(&ch)) {
+                            const char * cp = (const char *) m + f.calib_off + sizeof ch;
+                            for (uint32_t i = 0; i < f.calib_n; i++) {
+                                orkpack_calib r; memcpy(&r, cp, sizeof r); cp += sizeof r;
+                                if (r.K == ORK_CALIB_KEY_ROUTE && r.N == 0) {
+                                    int rt = (int) r.min_m;
+                                    if (rt >= ORK_DECODE_CPU && rt <= ORK_DECODE_NPU_FUSED) {
+                                        ctx->decode_route = rt; g_pack_decode_route = rt;
+                                    }
+                                } else if (r.K == 0 && r.N == 0) ctx->calib_global = (int) r.min_m;
+                                else ctx->calib_minm[((uint64_t) r.K << 32) | r.N] = r.min_m;
+                            }
+                            fprintf(stderr, "[ORK CALIB] using measured threshold M>=%d from the pack\n", ctx->calib_global);
+                        } else if (need <= (uint64_t) sz) {
+                            orkpack_calib_hdr now; ork_calib_provenance(&now);
+                            fprintf(stderr, "[ORK CALIB] pack was calibrated on a DIFFERENT machine "
+                                            "(cpu_max %u vs %u kHz, %u vs %u big cores) — ignoring it\n",
+                                    ch.cpu_max_khz, now.cpu_max_khz, ch.n_big, now.n_big);
+                        }
+                    }
                     for (uint32_t i = 0; i < f.n_entries; i++) {
                         uint32_t nl; memcpy(&nl, idx, 4); idx += 4;
                         std::string name(idx, nl); idx += nl;
                         orkpack_entry e; memcpy(&e, idx, sizeof e); idx += sizeof e;
+                        ork_fp_note(name, e);                     // build the recipe key as we go
                         ctx->persist_idx.emplace(std::move(name), e);
                     }
                     // ADOPT the pack's tier. ork_persist_init runs BEFORE ctx->qbits is set, so this is the
                     // value the ctx init picks up when ORK_QUANT is unset: loading an int4 pack selects int4.
+                    g_soc_id = ork_npu_soc_id(ctx->npu);
+                    fprintf(stderr, "[ORK RECIPE] model fingerprint: n_layer=%u n_embd=%u n_ff=%u attn_kv=%u soc=%s\n",
+                            g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv,
+                            g_soc_id ? g_soc_id : "?");
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
+                    /* ORK_MAKE_STUB=1: emit the companion stub for a pack that already exists. The stub needs
+                     * only the source model and the set of names the pack owns, both of which are in hand
+                     * here -- rebuilding a 12 GiB pack merely to get its ~2 GiB sidecar would be absurd.
+                     * Explicit rather than automatic: writing gigabytes as a side effect of a read would be
+                     * a nasty surprise in the middle of a timed run. */
+                    if (getenv("ORK_MAKE_STUB")) {
+                        std::vector<std::pair<std::string, orkpack_entry>> owned;
+                        owned.reserve(ctx->persist_idx.size());
+                        for (const auto & kv : ctx->persist_idx) owned.emplace_back(kv.first, kv.second);
+                        const std::string src = ork_find_model_path();
+                        if (!src.empty()) ork_write_stub_gguf(src.c_str(), (std::string(p) + ".gguf").c_str(), owned);
+                        else fprintf(stderr, "[ORK STUB] source model path unknown — no stub written\n");
+                    }
+                    /* ORK_PACK_RANK: print the pack's own quality evidence, worst first, with the bytes a
+                     * promotion to int8 would cost (int8 = 2x int4, so +K*N/2). This is the input a
+                     * re-tiering policy needs, and it comes from the FILE — no model run, no diagnostic
+                     * pass, no hand-ranking with sed, which is how the previous "worst layers" list was
+                     * produced and why it could not be reproduced. */
+                    if (getenv("ORK_PACK_RANK")) {
+                        std::vector<std::pair<float,std::string>> rank;
+                        for (const auto & kv : ctx->persist_idx)
+                            if (kv.second.qerr > 0.0f) rank.emplace_back(kv.second.qerr, kv.first);
+                        std::sort(rank.rbegin(), rank.rend());
+                        if (rank.empty()) fprintf(stderr, "[ORK PACK-RANK] no qerr in this pack (built before v6) — rebuild to record it\n");
+                        double cum = 0;
+                        for (size_t i = 0; i < rank.size() && i < 20; i++) {
+                            const orkpack_entry & e2 = ctx->persist_idx[rank[i].second];
+                            const double mb = ork_promote_cost_mb(e2.K, e2.N);   /* blob delta + Bf where it applies */
+                            cum += mb;
+                            fprintf(stderr, "[ORK PACK-RANK] %2zu  qerr=%.4f  %-34s K=%-5u N=%-5u  +%.2f MiB (cum %.2f)\n",
+                                    i+1, rank[i].first, rank[i].second.c_str(), e2.K, e2.N, mb, cum);
+                        }
+                    }
                     // Not VERBOSE-gated: a pack silently switching the run's weight tier is the one adoption
                     // a reader must not have to guess at. (Tier only — the 4-bit COMPUTE path stays opt-in.)
                     if (ctx->persist_qbits == 4)
@@ -955,6 +1784,42 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // WRITE mode (build the .orkpack) works under orkd too: the tiling is done PURE-CPU (ork_i8_w_dump_cpu for
     // Bb + ork_i8_w_dump_bf_cpu for Bf) from the live-converted raw int8 — no resident NPU tile, no daemon. So a
     // missing/stale .orkpack self-heals: this run rebuilds it (one-time), future runs READ + import it.
+    /* REFUSE to overwrite a pack we should have been able to read. See pack_well_formed above: reaching
+     * the writer with a well-formed, non-stale pack on disk means an adopt gate rejected what the
+     * staleness gate accepted, and rebuilding would silently replace hours of GPTQ work with RTN
+     * weights AND make the run report a bogus number. Fail loudly instead; ORK_ORKPACK_CLOBBER=1 is
+     * the deliberate override for the case where the operator really does want it rebuilt in place. */
+    if (pack_well_formed && !stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+        fprintf(stderr,
+            "[ORK PERSIST] FATAL: %s is well-formed and NOT stale, but was not adopted — refusing to\n"
+            "              overwrite it. This is a loader bug, not a stale pack. Re-run with\n"
+            "              ORK_ORKPACK_CLOBBER=1 only if you intend to discard and rebuild this pack.\n", p);
+        abort();
+    }
+    /* REGENERATING A LARGE PACK IS DESTRUCTIVE, AND "STALE" DOES NOT MEAN "DISPOSABLE".
+     *
+     * The no-clobber guard above only fires for a pack that is well-formed AND not stale. A pack from an
+     * older format version IS legitimately stale, so the guard stands aside and this writer rebuilds over
+     * it -- correct for a 155 MiB pack that takes two minutes, catastrophic for a 17 GiB one that takes
+     * hours and whose source GGUF or build config may no longer exist. Measured 2026-08-24: 53 packs
+     * totalling 220 GiB on the board were pre-v6, every one of which this path would have overwritten on
+     * first read, including several 15-17 GiB packs. A run was seconds from doing exactly that.
+     *
+     * So above a size threshold, regeneration requires saying so. ORK_ORKPACK_MAX_REGEN_MB tunes it
+     * (default 2048); ORK_ORKPACK_CLOBBER=1 overrides entirely, same escape hatch the no-clobber guard uses. */
+    if (stale && getenv("ORK_ORKPACK_CLOBBER") == nullptr) {
+        struct stat pst;
+        const long long capmb = getenv("ORK_ORKPACK_MAX_REGEN_MB") ? atoll(getenv("ORK_ORKPACK_MAX_REGEN_MB")) : 2048;
+        if (stat(p, &pst) == 0 && (long long) pst.st_size > capmb * 1024 * 1024) {
+            fprintf(stderr,
+                "[ORK PERSIST] FATAL: %s is %.2f GiB and STALE (older format) - refusing to regenerate over it.\n"
+                "              Rebuilding a pack this size costs hours and its source may no longer exist, so\n"
+                "              staleness alone is not authority to destroy it. Archive or delete it first, or\n"
+                "              set ORK_ORKPACK_CLOBBER=1 (or raise ORK_ORKPACK_MAX_REGEN_MB=%lld) to proceed.\n",
+                p, pst.st_size / (1024.0*1024*1024), capmb);
+            abort();
+        }
+    }
     ctx->persist_final = p; ctx->persist_tmp = std::string(p) + ".tmp";
     // Stale pack: the fresh one is written to <p>.tmp and atomically rename()'d over the old <p> at finalize
     // (create-new-then-replace-old, crash-safe). The <p>.gmax sidecar is NOT covered by that rename, so delete
@@ -984,7 +1849,7 @@ extern "C" bool ggml_backend_ork_orkpack_valid(const char * path) {
     if (sz > (off_t) sizeof(orkpack_footer) && lseek(fd, sz - (off_t) sizeof(orkpack_footer), SEEK_SET) >= 0) {
         orkpack_footer f;
         if (read(fd, &f, sizeof f) == (ssize_t) sizeof f)
-            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && f.version == ORKPACK_VERSION &&
+            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
                  f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) && f.index_off < (uint64_t) sz;
     }
     close(fd);
@@ -1135,6 +2000,7 @@ static const float * ork_imatrix_lookup(const char * name, int K) {
 //       ORK_ORKPACK_I4_FFN=1          force int4 on the FFN/expert tensors, int8 the rest
 //
 // int4 needs K%32==0 && N%32==0; tensors that don't satisfy it stay int8 regardless. Returns 4 or 8.
+static bool ork_i4_force_i8(const char * name);   /* selective per-layer precision (defined below) */
 static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_type) {
     static int init = 0, i4_ffn = 0, from_src = 1, q4_force = 0; static long i4_above_bytes = -1;
     if (!init) {
@@ -1144,10 +2010,24 @@ static int ork_orkpack_tier(const char * name, int K, int N, enum ggml_type src_
         i4_ffn = getenv("ORK_ORKPACK_I4_FFN") ? 1 : 0;
         const char * fs = getenv("ORK_ORKPACK_TIER_FROM_SRC");   // default ON; "0" disables
         if (fs && fs[0] == '0' && fs[1] == '\0') from_src = 0;
-        const char * q = getenv("ORK_QUANT");                    // ORK_QUANT=4: force compact i4a8 STORAGE for every
-        if (q && q[0] == '4') q4_force = 1;                       // eligible tensor (compute stays W8A8-inflate on the NPU)
+        // --pack-bits 4 (or ORK_QUANT=4) forces compact i4a8 STORAGE for every eligible tensor; the compute
+        // stays W8A8-inflate on the NPU. Via ork_forced_qb so the bytes written and the signature stamped
+        // on them cannot disagree -- --pack-bits used to be inert here, which is oRKLLM/llama.cpp-rockchip#3.
+        if (ork_forced_qb() == (uint32_t) '4') q4_force = 1;
     }
     if ((K % 32) != 0 || (N % 32) != 0) return 8;          // int4 shape constraint → int8 regardless
+
+    /* SELECTIVE PRECISION WINS OVER THE GLOBAL TIER. This must be tested BEFORE q4_force, which is a
+     * blanket "everything eligible becomes int4 storage" — it was silently overriding the per-weight
+     * decision, so a weight routed to the int8 COMPUTE path was still written at int4 STORAGE and came
+     * back as i4a8. Two decisions about one weight, made in two places, disagreeing: the pack recorded
+     * int4 while the caller believed it had asked for int8, and the resulting file looked "mixed" while
+     * containing no int8 at all.
+     * (Note q4_force also preempts the ORK_ORKPACK_TIERMAP override below, which looks like the same
+     * bug in an older guise — that map documents itself as winning over source-type, and under
+     * ORK_QUANT=4 it never gets the chance.) */
+    if (ork_i4_force_i8(name)) { const int t = ork_promote_tier(); return (t == 2 || t == 3) ? 4 : 8; }   /* i4a8 + rot-i4a8 keep int4 STORAGE */
+
     if (q4_force) return 4;                                // ORK_QUANT=4 forces int4 storage regardless of source type
 
     // (A0) external tier map (ORK_ORKPACK_TIERMAP) — wins over source-type so an fp16 source can
@@ -1239,12 +2119,21 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
         size_t tb = ork_i4a8_pack_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, nullptr, 0);
         if (tb) {
             std::vector<char> tmp(tb);
-            ork_i4a8_pack_cpu_blob(ctx->npu, K, N, f32_plane, im, nf4, tmp.data(), tb);
-            orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0;
+            /* RECORD the quantisation error while the packer still has both w and the codes in hand. Same
+             * blob either way (the _qerr form is byte-identical), and the same metric the GPTQ path stores:
+             * sqrt(SUM imp*(w-q)^2 / SUM imp*w^2), imp = the imatrix when supplied. That matters because the
+             * two must be COMPARABLE — imatrix importance is in_sum2[k]/counts and diag(H)[k] is SUM a_k^2,
+             * the same quantity up to a scale factor, and ranking is scale-invariant. Without this, qerr was
+             * written only by ORK_GPTQ finalize, so an ordinary build recorded 0 for every entry and
+             * --pack-qerr-source had nothing to rank (#2). */
+            float qerr = 0.0f;
+            ork_i4a8_pack_cpu_blob_qerr(ctx->npu, K, N, f32_plane, im, nf4, tmp.data(), tb, &qerr);
+            orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4; e.bscale_n = 0; e.qerr = qerr;
             e.blob_off = ctx->persist_off; e.blob_size = tb; e.bscale_off = 0;   /* e.bf_size = 0 (value-init) */
             fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
             ctx->persist_built.emplace_back(std::string(name), e);
-            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B)\n", name, K, N, tb);
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] int4(cpu) %s K=%d N=%d (%zu B) qerr=%.4f%s\n",
+                                               name, K, N, tb, (double) qerr, im ? "" : " (unweighted: no imatrix)");
             return;
         }
         // CPU int4 pack failed → fall through to int8 (never persist a broken entry)
@@ -1287,10 +2176,15 @@ static void ork_persist_write(ggml_backend_ork_context * ctx, const char * name,
 static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, const ork_weight & ow) {
     if (ctx->persist_mode != 2 || !ctx->persist_out || !ow.w) return;
     if (!ctx->persist_dumped.insert(name).second) return;   // already dumped (convert-decode re-pack)
-    size_t tb = ork_w_dump(ow.w, nullptr, 0);
+    size_t tb = ork_w_dump(ow.w, nullptr, 0);   // offline: ork_w_dump CPU-tiles, same bytes
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
-    orkpack_entry e{}; e.K = K; e.N = N; e.dtype = ORKPACK_DT_I4_NATIVE; e.bscale_n = (uint32_t) ow.bscale.size();
+    orkpack_entry e{}; e.K = K; e.N = N;
+    e.dtype = (ow.wbits == 8) ? ORKPACK_DT_I8_ROT
+            : (ow.abits == 8) ? ORKPACK_DT_I4_ROT_A8      /* rotated int4 bytes, int8 activations */
+                              : ORKPACK_DT_I4_NATIVE;
+    e.bscale_n = (uint32_t) ow.bscale.size();
+    e.qerr = ow.qerr;   /* the evidence for this weight's tier, so re-tiering needs no model run */
     e.blob_off = ctx->persist_off; e.blob_size = tb;
     fwrite(tmp.data(), 1, tb, ctx->persist_out); ctx->persist_off += tb;
     e.bscale_off = ctx->persist_off;
@@ -1302,31 +2196,139 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
 // Read a native-W4A4 weight by name (read mode): fills `ow` and returns true on a matching hit (skip the
 // cold rotate+pack), false to pack normally. Per-(K,N,dtype) re-checked so a stale .orkpack can't feed
 // wrong weights. Single/current pack-domain (native W4A4 is the <4GB compute path; multi-domain is later).
+/* A read-mode pack MISS on a weight the index demonstrably contains is a BUG, not a rebuild condition.
+ *
+ * The fallback to inline packing is correct and necessary for a genuinely cold weight, which is exactly why
+ * it is so dangerous here: the run continues, produces a weight of the wrong TIER, and reports a plausible
+ * number. DT_I4_ROT_A8 sat in that state indefinitely -- its blob was written tiled while its loader
+ * demanded the compact container, so it never loaded once, at any size, and the only symptom was a
+ * perplexity that looked believable enough to publish.
+ *
+ * This is the fourth mechanism in one session to manufacture a confident wrong answer (the others: rsync -a
+ * preserving mtimes so cmake skipped rebuilds; an offline path with no implementation; a pack silently
+ * overwritten by its own reader). The other three are now loud. This one closes the set.
+ *
+ * Three outcomes, deliberately different:
+ *   - no index entry            -> silent. A cold weight SHOULD be packed inline; that is the design.
+ *   - entry with an unknown dtype -> warn once, continue. Forward compat is intentional: a newer pack read
+ *                                   by an older build refuses that entry per-weight rather than failing.
+ *   - entry this build can serve -> ABORT. The pack has it, the shapes agree, the dtype is supported, and
+ *                                   the load still failed. Nothing downstream of that is trustworthy.
+ * ORK_ALLOW_PACK_MISS=1 downgrades the abort to a warning for deliberate experiments. */
+static void ork_pack_miss_check(ggml_backend_ork_context * ctx, const char * name, int K, int N,
+                                const uint32_t * serves, int n_serves) {
+    if (!ctx || ctx->persist_mode != 1) return;
+    auto pit = ctx->persist_idx.find(name);
+    if (pit == ctx->persist_idx.end()) return;                  /* genuine cold weight -- pack it inline */
+    const orkpack_entry & e = pit->second;
+    /* CROSS-LOADER misses are legitimate and must stay silent. Each loader serves a subset of the dtypes:
+     * the i4-native loader takes the rotated/native int4 family, the int8 loader takes DT_I8 / DT_I4. A
+     * DT_I4 entry declining to load through the i4-native path is routing doing its job, not a fault --
+     * and a guard that cannot tell those apart aborts a healthy run, which the negative control caught it
+     * doing on a perfectly good i4a8 pack. So the caller states what IT can serve. */
+    bool mine = false;
+    for (int i = 0; i < n_serves; i++) if (e.dtype == serves[i]) { mine = true; break; }
+    if (!mine) return;
+    const bool known = (e.dtype == ORKPACK_DT_I8 || e.dtype == ORKPACK_DT_I4 ||
+                        e.dtype == ORKPACK_DT_I4_NATIVE || e.dtype == ORKPACK_DT_I8_ROT ||
+                        e.dtype == ORKPACK_DT_I4_ROT_A8);
+    if (!known) {
+        static std::unordered_set<uint32_t> said;
+        if (said.insert(e.dtype).second)
+            fprintf(stderr, "[ORK PERSIST] note: pack entry dtype %u is newer than this build "
+                            "(first: %s) — those weights are packed inline\n", e.dtype, name);
+        return;
+    }
+    const bool allow = env_enabled("ORK_ALLOW_PACK_MISS");
+    fprintf(stderr,
+        "[ORK PERSIST] %s: %s is IN the pack (K=%u N=%u dtype=%u) but failed to load; the run wants "
+        "K=%d N=%d.\n"
+        "              A miss here silently packs the weight inline at a DIFFERENT tier than the pack "
+        "specifies, so the\n"
+        "              model still runs and still reports a plausible number. %s\n",
+        allow ? "WARNING" : "FATAL", name, e.K, e.N, e.dtype, K, N,
+        allow ? "Continuing (ORK_ALLOW_PACK_MISS)." : "Set ORK_ALLOW_PACK_MISS=1 to continue anyway.");
+    if (!allow) abort();
+}
+
 static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char * name, int K, int N, ork_weight & ow) {
     if (ctx->persist_mode != 1 || !ctx->persist_map) return false;
     auto pit = ctx->persist_idx.find(name);
     if (pit == ctx->persist_idx.end() || pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N ||
-        pit->second.dtype != ORKPACK_DT_I4_NATIVE) return false;
+        (pit->second.dtype != ORKPACK_DT_I4_NATIVE && pit->second.dtype != ORKPACK_DT_I8_ROT &&
+         pit->second.dtype != ORKPACK_DT_I4_ROT_A8)) return false;
     const orkpack_entry & e = pit->second;
     const char * blob = (const char *) ctx->persist_map + e.blob_off;
     // Multi-domain residence: byte-balance this dense int4 weight across domains (same as the int8 resolve +
     // expert paths) so domain_bytes stays accurate (else experts over-admit to domain 0 and overfill it) and
     // retry the next domain on IOVA exhaustion. IMPORT first (bimport, multi-domain-safe); bcreate fallback.
-    int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(name));
+    /* WIDTH comes from the stored dtype, and it selects the loader: DT_I8_ROT holds int8 tiles (2x the
+     * bytes), DT_I4_NATIVE holds int4. Both hold a ROTATED weight — that is what the two share and what
+     * the run path relies on; only the width differs. */
+    /* DT_I4_ROT_A8 stores int4 bytes but RUNS on the int8 MAC: inflate at load (ork_i4a8_mm_load turns
+     * int4 tiles into int8 containers) and pair with int8 activations. bscale stays the int4 mx/7 scale,
+     * which is correct — inflation does not change the represented values. */
+    const bool rot_a8 = (e.dtype == ORKPACK_DT_I4_ROT_A8);
+    ow.wbits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
+    ow.abits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
+    const size_t wbytes = (size_t) K * N / (ow.wbits == 8 ? 1 : 2);   /* rot_a8: int8 RESIDENT though int4 on disk */
+    int _dom = ork_weight_domain_named(ctx, name, wbytes, ork_layer_of(name));
     ork_npu_set_pack_domain(ctx->npu, _dom);
-    ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+    if (rot_a8) {                                   /* int4 bytes -> int8 containers */
+        /* _tiled, not ork_i4a8_mm_load. The blob here was written by ork_w_dump in the i4-NATIVE TILED
+         * layout (page-padded Kp*Nc/2 tiles, no header, no scales); ork_i4a8_mm_load wants the COMPACT
+         * container (hdr + bscale[N] + Bi4[K*N/2]) and gates on an exact size match, so it returned NULL
+         * for EVERY DT_I4_ROT_A8 weight ever written. The miss then fell back to inline packing, which is
+         * a legitimate event for a cold weight and therefore silent -- at 0.8B that produced a plausible
+         * wrong number, at 27B it inline-packed 80 weights at ~27-89 MB each and exhausted IOVA. */
+        /* Group size is derived from the SCALE COUNT and must be known BEFORE the load: a group's bytes are
+         * strided across the normal K-slice layout, so group-tiling has to happen while tiling, not after. */
+        const int gpre = (e.bscale_n > (uint32_t) N && N > 0 && (e.bscale_n % (uint32_t) N) == 0)
+                       ? (int) (K / (e.bscale_n / (uint32_t) N)) : 0;
+        ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size, gpre);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
+            ow.w = ork_i4a8_mm_load_tiled(ctx->npu, K, N, blob, e.blob_size, gpre);
+    } else if (ow.wbits == 8) {
+        ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+        while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0)
+            ow.w = ork_i8_mm_load(ctx->npu, K, N, blob, e.blob_size);
+    } else {
+    /* ORK_NO_IMPORT also gates the native-W4A4 loader. It previously guarded only the spool/i4a8 paths, so
+     * this one had no way to be taken out of the picture — and the zero-copy import maps .orkpack page-cache
+     * pages at blob_off, which is sensitive to things a plain memcpy of the same bytes is not. When the board
+     * and an exact CPU emulation disagreed on the SAME pack (0.168 vs 0.111 relative error on the first
+     * matmul, identical inputs) with the MAC, the tiler and the un-tiler each independently proven exact,
+     * the loader was the only remaining difference and there was no switch to test it with. */
+    const bool no_import_i4n = env_enabled("ORK_NO_IMPORT");
+    if (!no_import_i4n) ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+    /* Report the import outcome ONCE. Zero-copy import is a real feature (it maps .orkpack page-cache pages
+     * straight into IOVA instead of copying), and a silent fallback to the copying path is indistinguishable
+     * from it working — which is how it went unnoticed that toggling ORK_NO_IMPORT changed nothing at all. */
+    { static int said_imp = 0;
+      if (!said_imp++ && !no_import_i4n)
+          fprintf(stderr, "[ORK PERSIST] i4-native zero-copy import %s (blob_off=%llu%s, size=%llu)\n",
+                  ow.w ? "OK" : "FAILED -> copying fallback",
+                  (unsigned long long) e.blob_off,
+                  (e.blob_off & 4095) ? " NOT page-aligned" : " page-aligned",
+                  (unsigned long long) e.blob_size); }
     if (!ow.w) ow.w = ork_i4_mm_load(ctx->npu, K, N, blob, e.blob_size);
     while (!ow.w && (_dom = ork_domain_advance(ctx)) >= 0) {
-        ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
+        if (!no_import_i4n) ow.w = ork_i4_mm_load_import(ctx->npu, K, N, blob, e.blob_size);
         if (!ow.w) ow.w = ork_i4_mm_load(ctx->npu, K, N, blob, e.blob_size);
     }
+    }
     if (!ow.w) return false;
-    ow.gsize = 0; ow.bscale.resize(e.bscale_n);
+    /* gsize is not a field in the pack entry — recover it from the scale COUNT: per-channel stores N,
+     * per-group stores (K/G)*N, so G = K / (bscale_n / N). Keeps old packs loading unchanged. */
+    ow.gsize = (e.bscale_n > (uint32_t) N && N > 0 && (e.bscale_n % (uint32_t) N) == 0)
+             ? (int) (K / (e.bscale_n / (uint32_t) N)) : 0;
+    ow.bscale.resize(e.bscale_n);
     if (e.bscale_n) memcpy(ow.bscale.data(), (const char *) ctx->persist_map + e.bscale_off, (size_t) e.bscale_n * sizeof(float));
     ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
     if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
     ctx->persist_hits++;
     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] i4-native LOAD %s K=%d N=%d dom=%d\n", name, K, N, _dom);
+        if (ow.gsize > 0 && ow.w) ork_w_set_group(ow.w, ow.gsize);   // the pack entry has no gsize; it came from the scale count
     return true;
 }
 
@@ -1515,13 +2517,259 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     }
 }
 
+/* ---- STUB GGUF -------------------------------------------------------------------------------------
+ * Emitted next to the .orkpack at build time, so a run needs (stub GGUF + orkpack) instead of (FULL GGUF
+ * + orkpack). Without it the matmul weights are carried TWICE -- once as source GGUF bytes and again as
+ * packed int4 in IOVA. At 27B that is a 40.8 GiB working set on a 31 GiB board, and it does not surface
+ * as an OOM: the GGUF is mmap'd, so pages churn, submits time out, and the NPU self-heals in a loop that
+ * reads like a driver fault. The stub removes the duplicate instead of tuning around it.
+ *
+ * HOW: the stub is byte-identical to the source in layout. Header + KV + tensor-info are copied verbatim,
+ * so every tensor keeps its exact data offset and llama.cpp loads it with no loader change at all; then
+ * only the tensors the pack does NOT own are copied into the data section, and the rest are left as file
+ * HOLES. Same apparent size, a fraction of the blocks. Copying the info section wholesale is also what
+ * makes this safe -- no re-serialisation, so no chance of writing subtly different metadata.
+ *
+ * The holes read as zeros, which is fine ONLY because ork substitutes those tensors from the pack before
+ * anything looks at them -- and dangerous if that ever stops being true, which is why the loader-side
+ * guard (ork_stub_verify) refuses to run a stub whose packed tensors the pack cannot serve. Never ship a
+ * stub without its pack; it is not a model on its own. */
+static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed) {
+    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+    if (!gg) { fprintf(stderr, "[ORK STUB] cannot read %s — no stub written\n", src_path); return false; }
+
+    std::unordered_set<std::string> own;
+    for (const auto & kv : packed) own.insert(kv.first);
+
+    int sfd = open(src_path, O_RDONLY);
+    int dfd = open(stub_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (sfd < 0 || dfd < 0) { if (sfd>=0) close(sfd); if (dfd>=0) close(dfd); gguf_free(gg);
+        fprintf(stderr, "[ORK STUB] open failed for %s\n", stub_path); return false; }
+
+    const size_t data_off = gguf_get_data_offset(gg);
+    std::vector<char> buf(1u << 20);
+    bool ok = true;
+
+    /* 1. header + KV + tensor-info, verbatim */
+    for (size_t got = 0; got < data_off && ok; ) {
+        const size_t want = (data_off - got < buf.size()) ? (data_off - got) : buf.size();
+        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
+        if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, (off_t) got) != r) ok = false; else got += (size_t) r;
+    }
+
+    /* 2. full length up front, so the untouched ranges become holes rather than a short file */
+    const off_t total = lseek(sfd, 0, SEEK_END);
+    if (ok && ftruncate(dfd, total) != 0) ok = false;
+
+    /* 3. copy only what the pack does not own */
+    size_t kept = 0, dropped = 0; uint64_t kept_b = 0, dropped_b = 0;
+    const int64_t nt = gguf_get_n_tensors(gg);
+    for (int64_t i = 0; i < nt && ok; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        const size_t sz = gguf_get_tensor_size(gg, i);
+        const off_t  at = (off_t) (data_off + gguf_get_tensor_offset(gg, i));
+        if (own.count(nm)) { dropped++; dropped_b += sz; continue; }        /* served from the pack -> hole */
+        kept++; kept_b += sz;
+        for (size_t got = 0; got < sz && ok; ) {
+            const size_t want = (sz - got < buf.size()) ? (sz - got) : buf.size();
+            ssize_t r = pread(sfd, buf.data(), want, at + (off_t) got);
+            if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, at + (off_t) got) != r) ok = false; else got += (size_t) r;
+        }
+    }
+    close(sfd); close(dfd); gguf_free(gg);
+    if (!ok) { unlink(stub_path); fprintf(stderr, "[ORK STUB] write failed — stub removed\n"); return false; }
+
+    struct stat st; long long blocks_b = (stat(stub_path, &st) == 0) ? (long long) st.st_blocks * 512 : -1;
+    fprintf(stderr, "[ORK STUB] %s: kept %zu tensors (%.2f GiB), left %zu to the pack (%.2f GiB of holes)\n"
+                    "[ORK STUB]   apparent %.2f GiB, on disk %.2f GiB — run with THIS gguf + the .orkpack\n",
+            stub_path, kept, kept_b/1073741824.0, dropped, dropped_b/1073741824.0,
+            total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
+    return true;
+}
+
+/* A stub's holes read as ZEROS. That is correct only while every hole is covered by the pack, so check it
+ * once at load instead of discovering it as a mysteriously bad perplexity -- the exact failure this session
+ * produced four separate ways. A tensor whose data is entirely zero AND which the pack cannot serve is the
+ * signature of a stub run without (or with the wrong) pack; refuse rather than emit confident garbage.
+ * Only tensors ork would claim are checked: a genuinely zero norm/bias in a real model is not our business. */
+static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, const void * data, size_t nbytes) {
+    if (ctx->persist_mode != 1) return;                 /* only meaningful when a pack is being read */
+    if (!data || nbytes < 4096) return;
+    const unsigned char * p = (const unsigned char *) data;   /* sample, don't scan gigabytes */
+    bool zero = true;
+    for (size_t i = 0; i < nbytes; i += 4096) if (p[i]) { zero = false; break; }
+    if (!zero) return;
+    if (ctx->persist_idx.count(name)) {
+        /* The pack owns it, so a hole is EXPECTED -- but only SAFE if ork serves this tensor on EVERY
+         * path. It does not: supports_op declines dense MUL_MAT at M==1, and ggml then computes decode
+         * from this hole. MEASURED on Qwen3.6-27B, same pack, only the source differing:
+         *   source gguf : "github.com/sgl-project/sglang/blob/main/LICENSE"
+         *   stub gguf   : "githubFromFile崇仓orchirit斗μβα broynek涯柴"
+         * Perplexity does not catch it -- PPL is teacher-forced over the M>1 prefill path and reads
+         * 10.6780 either way. So record that the source is a stub; supports_op then refuses to decline
+         * anything the pack owns. */
+        if (!ctx->source_is_stub) {
+            ctx->source_is_stub = 1;
+            fprintf(stderr, "[ORK STUB] source is a STUB (packed tensors are holes) — ork will claim every "
+                            "pack-owned matmul, including M=1 decode, since declining would hand ggml a hole\n");
+        }
+        return;
+    }
+    fprintf(stderr,
+        "[ORK STUB] FATAL: %s reads as all zeros and the .orkpack does not contain it.\n"
+        "           This looks like a STUB gguf run without its pack (or with a pack built from a\n"
+        "           different model). A stub is not a model on its own -- its packed tensors are file\n"
+        "           holes. Point ORK_ORKPACK_PATH at the matching pack, or use the full gguf.\n", name);
+    abort();
+}
+
+/* ---- v6 EMBEDDED GGUF METADATA -----------------------------------------------------------------
+ * Stage 2 of Tier 15: make the pack self-sufficient. The stub GGUF already solved the duplication problem
+ * (a packed run otherwise holds the source weights twice: 28.6 GiB GGUF + 12 GiB pack = 40.8 GiB on a
+ * 31 GiB board) but it is a SECOND FILE that must travel with the pack and match it. Embedding its content
+ * makes the pack the whole artifact.
+ *
+ * Only the non-hole content is stored -- the header/KV/tensor-info block plus the tensors the pack does NOT
+ * own (embeddings, norms, output head). The packed tensors are holes in the stub, so storing them here
+ * would duplicate exactly what the pack already holds.
+ *
+ * Layout:  u64 gguf_total | u64 data_off | data_off bytes (header+KV+tensor-info)
+ *          u32 n_kept | n_kept x { u64 abs_off, u64 size, size bytes }
+ */
+static bool ork_write_pack_meta(FILE * out, const char * src_path,
+                                const std::vector<std::pair<std::string, orkpack_entry>> & packed,
+                                uint64_t * bytes_written) {
+    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+    if (!gg) { fprintf(stderr, "[ORK META] cannot read %s — pack will carry no metadata\n", src_path); return false; }
+    std::unordered_set<std::string> own;
+    for (const auto & kv : packed) own.insert(kv.first);
+
+    int sfd = open(src_path, O_RDONLY);
+    if (sfd < 0) { gguf_free(gg); return false; }
+    const uint64_t data_off = (uint64_t) gguf_get_data_offset(gg);
+    const uint64_t total    = (uint64_t) lseek(sfd, 0, SEEK_END);
+    uint64_t w = 0; bool ok = true;
+    std::vector<char> buf(1u << 20);
+
+    ok = ok && fwrite(&total, 8, 1, out) == 1;    w += 8;
+    ok = ok && fwrite(&data_off, 8, 1, out) == 1; w += 8;
+    for (uint64_t got = 0; got < data_off && ok; ) {
+        const size_t want = (size_t) std::min<uint64_t>(data_off - got, buf.size());
+        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
+        if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
+        else { got += (uint64_t) r; w += (uint64_t) r; }
+    }
+    const int64_t nt = gguf_get_n_tensors(gg);
+    uint32_t n_kept = 0;
+    for (int64_t i = 0; i < nt; i++) if (!own.count(gguf_get_tensor_name(gg, i))) n_kept++;
+    ok = ok && fwrite(&n_kept, 4, 1, out) == 1; w += 4;
+    uint64_t kept_b = 0;
+    for (int64_t i = 0; i < nt && ok; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        if (own.count(nm)) continue;
+        const uint64_t sz = (uint64_t) gguf_get_tensor_size(gg, i);
+        const uint64_t at = data_off + (uint64_t) gguf_get_tensor_offset(gg, i);
+        ok = ok && fwrite(&at, 8, 1, out) == 1; w += 8;
+        ok = ok && fwrite(&sz, 8, 1, out) == 1; w += 8;
+        for (uint64_t got = 0; got < sz && ok; ) {
+            const size_t want = (size_t) std::min<uint64_t>(sz - got, buf.size());
+            ssize_t r = pread(sfd, buf.data(), want, (off_t) (at + got));
+            if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
+            else { got += (uint64_t) r; w += (uint64_t) r; }
+        }
+        kept_b += sz;
+    }
+    close(sfd); gguf_free(gg);
+    if (!ok) { fprintf(stderr, "[ORK META] write failed — pack will carry no metadata\n"); return false; }
+    *bytes_written = w;
+    fprintf(stderr, "[ORK META] embedded %u non-packed tensors (%.2f GiB) + %.1f MiB of header/KV; "
+                    "pack is now self-sufficient\n", n_kept, kept_b/1073741824.0, data_off/1048576.0);
+    /* A PARTIAL pack must not look finished. The metadata section embeds whatever the pack does NOT own,
+     * so a run that died early packs a handful of weights and then embeds nearly the whole model as
+     * "non-packed" -- observed: a 27B build that failed at weight 73 of 400 produced a 24.34 GiB pack that
+     * orkpack_info still reported as "ok — loads". Loud, because the file is superficially valid. */
+    if (packed.size() * 4 < (size_t) n_kept)
+        fprintf(stderr, "[ORK META] *** WARNING: only %zu tensors are PACKED against %u embedded — this pack is "
+                        "almost certainly PARTIAL (a failed/aborted build). Delete it and rebuild; it will "
+                        "load and silently serve most weights from the embedded copies at source precision.\n",
+                packed.size(), n_kept);
+    return true;
+}
+
+/* Rebuild a loadable (sparse) GGUF from a pack's embedded metadata. The packed tensors stay holes -- ork
+ * serves them -- so the result is small on disk and identical in layout to the source, which is what lets
+ * stock llama.cpp load it with no loader change. Returns false if the pack carries no metadata. */
+extern "C" bool ggml_backend_ork_extract_gguf(const char * pack_path, const char * out_path) {
+    int pfd = open(pack_path, O_RDONLY);
+    if (pfd < 0) return false;
+    const off_t psz = lseek(pfd, 0, SEEK_END);
+    if (psz < (off_t) sizeof(orkpack_footer)) { close(pfd); return false; }
+    orkpack_footer f;
+    if (pread(pfd, &f, sizeof f, psz - (off_t) sizeof f) != (ssize_t) sizeof f ||
+        memcmp(f.magic, ORKPACK_MAGIC, 8) != 0 || !ork_pack_version_ok(f.version)) { close(pfd); return false; }
+    uint64_t meta_off = 0, meta_size = 0;
+    if (pread(pfd, &meta_off, 8, (off_t) f.index_off) != 8 ||
+        pread(pfd, &meta_size, 8, (off_t) f.index_off + 8) != 8 || meta_size == 0) { close(pfd); return false; }
+
+    uint64_t total = 0, data_off = 0; off_t at = (off_t) meta_off;
+    if (pread(pfd, &total, 8, at) != 8) { close(pfd); return false; } at += 8;
+    if (pread(pfd, &data_off, 8, at) != 8) { close(pfd); return false; } at += 8;
+    int ofd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ofd < 0) { close(pfd); return false; }
+    bool ok = ftruncate(ofd, (off_t) total) == 0;     /* full length first: untouched ranges become holes */
+    std::vector<char> buf(1u << 20);
+    for (uint64_t got = 0; got < data_off && ok; ) {
+        const size_t want = (size_t) std::min<uint64_t>(data_off - got, buf.size());
+        ssize_t r = pread(pfd, buf.data(), want, at + (off_t) got);
+        if (r <= 0 || pwrite(ofd, buf.data(), (size_t) r, (off_t) got) != r) ok = false; else got += (uint64_t) r;
+    }
+    at += (off_t) data_off;
+    uint32_t n_kept = 0;
+    if (ok && pread(pfd, &n_kept, 4, at) != 4) ok = false; at += 4;
+    for (uint32_t i = 0; i < n_kept && ok; i++) {
+        uint64_t off = 0, sz = 0;
+        if (pread(pfd, &off, 8, at) != 8) { ok = false; break; } at += 8;
+        if (pread(pfd, &sz, 8, at) != 8)  { ok = false; break; } at += 8;
+        for (uint64_t got = 0; got < sz && ok; ) {
+            const size_t want = (size_t) std::min<uint64_t>(sz - got, buf.size());
+            ssize_t r = pread(pfd, buf.data(), want, at + (off_t) got);
+            if (r <= 0 || pwrite(ofd, buf.data(), (size_t) r, (off_t) (off + got)) != r) ok = false;
+            else got += (uint64_t) r;
+        }
+        at += (off_t) sz;
+    }
+    close(pfd); close(ofd);
+    if (!ok) { unlink(out_path); return false; }
+    struct stat st; long long blocks_b = (stat(out_path, &st) == 0) ? (long long) st.st_blocks * 512 : -1;
+    fprintf(stderr, "[ORK META] extracted %s from the pack: apparent %.2f GiB, on disk %.2f GiB\n",
+            out_path, total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
+    return true;
+}
+
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
 static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     if (ctx->persist_mode != 2 || !ctx->persist_out) return;
     if (ctx->persist_built.empty()) {
         fclose(ctx->persist_out); ctx->persist_out = nullptr; unlink(ctx->persist_tmp.c_str()); return;
     }
+    /* v6: embed the GGUF metadata BEFORE the index, so the pack is a complete artifact. */
+    uint64_t meta_off = 0, meta_size = 0;
+    if (!getenv("ORK_NO_META")) {
+        const std::string msrc = ork_find_model_path();
+        if (!msrc.empty()) {
+            const uint64_t at = ctx->persist_off;
+            uint64_t w = 0;
+            if (ork_write_pack_meta(ctx->persist_out, msrc.c_str(), ctx->persist_built, &w)) {
+                meta_off = at; meta_size = w; ctx->persist_off += w;
+            }
+        } else fprintf(stderr, "[ORK META] source model path unknown — pack will carry no metadata\n");
+    }
     uint64_t index_off = ctx->persist_off;
+    fwrite(&meta_off, 8, 1, ctx->persist_out);
+    fwrite(&meta_size, 8, 1, ctx->persist_out);
     for (auto & kv : ctx->persist_built) {
         uint32_t nl = (uint32_t) kv.first.size();
         fwrite(&nl, 4, 1, ctx->persist_out);
@@ -1529,6 +2777,7 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
         fwrite(&kv.second, sizeof(orkpack_entry), 1, ctx->persist_out);
     }
     orkpack_footer f; memset(&f, 0, sizeof f);
+    f.calib_off = 0; f.calib_n = 0;   // producer is the ork_calibrate tool, written in afterwards
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
     f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
     f.quant_sig = ork_build_sig();           // stamp the build-config precision signature (authoritative on read)
@@ -1536,6 +2785,13 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     fwrite(&f, sizeof f, 1, ctx->persist_out);
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
     rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
+    /* Companion stub GGUF, so the next run does not have to carry the source model as well as the pack.
+     * Written AFTER the rename so a stub never exists without the pack it depends on. ORK_NO_STUB=1 skips. */
+    if (!getenv("ORK_NO_STUB")) {
+        const std::string src = ork_find_model_path();
+        if (!src.empty()) ork_write_stub_gguf(src.c_str(), (ctx->persist_final + ".gguf").c_str(), ctx->persist_built);
+        else fprintf(stderr, "[ORK STUB] source model path unknown — no stub written\n");
+    }
     // Unconditional success line: report the full path (directory + filename) and weight count so the user sees
     // exactly where the pack landed. Split dir/file for clarity when the path is absolute.
     {
@@ -1606,6 +2862,15 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     const double _r0 = ctx->profile ? ork_now_us_e() : 0;
     const char * x = (const char *) src0->data + (expert >= 0 ? (size_t) expert * src0->nb[2] : 0);   // MoE: per-expert slice key
     auto it = ctx->wcache.find(x);
+    /* The OTHER direction of the fused/per-tensor key collision: a prefill group stored its K x Ntot
+     * concatenation under this same pointer, and the unfused path (decode) must not run against it.
+     * Rebuild rather than trust the key. See ork_wcache_shape_ok. */
+    if (it != ctx->wcache.end() && expert < 0 && !ork_wcache_shape_ok(it->second, K, N)) {
+        ctx->wcache_bytes -= it->second.bytes;
+        ork_w_free(it->second.w);
+        ctx->wcache.erase(it);
+        it = ctx->wcache.end();
+    }
     if (it != ctx->wcache.end()) {
         if (ctx->spool && it->second.se && !ork_stream_entry_mapped(it->second.se)) {
             // STREAM-POOL hit, but IOVA-unmapped (evicted from the hot tier): re-map (cheap, ~170us;
@@ -1637,7 +2902,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
             }
             ork_weight ow;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
-            int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
+            int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
             ork_npu_set_pack_domain(ctx->npu, _dom);
             if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack/load after fill = churn (must be 0)
             for (;;) {                                             // retry in the next domain on IOVA exhaustion
@@ -1711,6 +2976,12 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     if (expert >= 0) { if (ctx->profile) ctx->s_resolve += ork_now_us_e() - _r0; return ctx->wcache.end(); }
     // pack-miss: dequant -> per-channel int8 quant -> pack -> (write mode) persist
     if (ctx->persist_mode) ctx->persist_misses++;
+    /* Fatal FIRST when the pack actually has this weight: the warning below is for a weight that is
+     * genuinely absent (slow, but correct), whereas an unloadable-but-present entry silently swaps the
+     * tier and is not correct at all. Expert keys are looked up under ork_expert_key, so a dense-name
+     * lookup finds nothing for them and this stays silent -- deliberately conservative. */
+    { static const uint32_t serves[] = { ORKPACK_DT_I8, ORKPACK_DT_I4 };
+      ork_pack_miss_check(ctx, src0->name, K, N, serves, 2); }
     if (ctx->persist_mode == 1) {   // READ mode + miss = the SILENT slow-path trap: the .orkpack lacks this
         // weight (name/shape/dtype mismatch or incomplete pack) so we fall back to live Q8_0->int8-tile
         // conversion (~25x the orkpack load — measured 16.7s vs 0.66s resolve on the 1.7B). Make it LOUD
@@ -1774,7 +3045,7 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
         else            ork_wcache_evict(ctx, (size_t) K * N);
     }
     const double _p0 = ctx->profile ? ork_now_us_e() : 0;
-    int _dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
+    int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
     ork_npu_set_pack_domain(ctx->npu, _dom);
     if (!ctx->load_phase) ctx->mem_create_runtime++;       // any pack after fill = churn (must be 0)
     ow.w = ork_i8_mm_pack(ctx->npu, K, N, bi);
@@ -1948,6 +3219,9 @@ static inline int ork_submit_sync(ggml_backend_ork_context * ctx, std::vector<or
 }
 static inline int ork_submit_end(ork_dyn_chain * h) { return h ? (ork_dyn_end(h) < 0 ? -1 : 0) : 0; }
 
+static void ork_mm_check(const char * name, const float * d, const float * y,
+                         const char * xsrc, size_t nb01, enum ggml_type stype, int M, int K, int N);
+static void ork_act_trace(const char * name, const float * y, const float * d, int M, int K, int N);
 static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -2161,6 +3435,8 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
             }
+            ork_mm_check(src0->name, d, (const float *) src1->data, x, nb01, src0->type, M, K, N);
+            ork_act_trace(src0->name, (const float *) src1->data, d, M, K, N);
         }
 
         if (ctx->profile) {
@@ -2329,13 +3605,598 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
 }
 
 
+/* ORK_GPTQ (pack-time, native-W4A4 only). GPTQ needs a calibration Hessian H = A^T A over the SAME input
+ * space the weights live in — under QuaRot that is the ROTATED space, so A here is the rotated activation
+ * batch (A*R), matching the rotated weight columns. The weight is quantized on FIRST USE inside the forward
+ * pass, so the calibration batch is simply whatever prompt the pack pass runs.
+ *
+ * RANK: H is K*K but a batch contributes only M samples, so rank(H) <= M. With M < K the Hessian is
+ * rank-deficient, damping dominates the null space and GPTQ degenerates toward RTN there — not wrong, just
+ * weak. Use a calibration prompt with M >= K for the full benefit; we warn when it is not.
+ * Cost: O(M*K^2) here plus ork_i4_gptq's three O(K^3) factorisations — a heavy ONE-TIME pack step. */
+static void ork_gptq_hessian(int M, int K, int b, const float * y, float * H) {
+    memset(H, 0, (size_t)K*K*sizeof(float));
+    std::vector<float> a((size_t)K);
+    for (int m = 0; m < M; m++) {
+        memcpy(a.data(), y + (size_t)m*K, (size_t)K*sizeof(float));
+        for (int off = 0; off < K; off += b) ork_fwht_norm(a.data() + off, b);   // same rotation as the weights
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < K; i++) {
+            const float ai = a[i];
+            if (ai == 0.0f) continue;
+            float * hr = H + (size_t)i*K;
+            for (int j = 0; j < K; j++) hr[j] += ai * a[j];
+        }
+    }
+}
+
+/* MSE-optimal symmetric int4 scale for one row/column.
+ *
+ * absmax/7 is a poor choice at 4 bits. After the Hadamard rotation a row is ~Gaussian, so the absmax over
+ * K samples lands ~3.6 sigma (K=3584); the step is then ~0.51 sigma and most of the 16 levels are spent
+ * representing tails that essentially never occur, while the bulk near zero is coarsely quantized.
+ * Clipping trades a few saturated outliers for a smaller step everywhere else, which is a large net win in
+ * squared error.
+ *
+ * Rather than assume Gaussian and hard-code the optimal ratio, search a small grid of clip fractions and
+ * take the true minimum — the rotation makes rows approximately Gaussian but not exactly, and the search
+ * costs one pass per candidate. alpha=1.0 (plain absmax) is always in the grid, so this can never be worse
+ * than the previous behaviour on any row. */
+#define ORK_I4_CLIP_N 8
+static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") == nullptr; return e; }
+
+/* ORK_I4_NOROT=1 — build and run the native-W4A4 tier WITHOUT the Hadamard rotation.
+ *
+ * Rotation exists so a SINGLE PER-CHANNEL scale can cope with outliers: R spreads each outlier across the
+ * FWHT block so no one scale is dominated by it. Per-group scales solve the same problem a different way,
+ * by localising the outlier to 32 weights. The two may therefore be ANTAGONISTIC — rotating first smears an
+ * outlier across a block of up to 1024, destroying exactly the locality that grouping provides. Measured
+ * evidence for suspecting it: G=32 + W4A8 still sits 1.84x above CPU Q4_0 on excess error, and Q4_0 has no
+ * rotation, no error feedback and a coarser scale.
+ *
+ * This is a MEASUREMENT knob, not a shipping mode: section 3 established rotation is not optional in the
+ * PER-CHANNEL regime, and that result is not in question. What is in question is whether it still helps
+ * once groups are fine.
+ *
+ * It gates every W4A4 rotation site — weight pack, activation quant (grouped and not), the GPTQ Hessian
+ * accumulate and the GPTQ finalize re-rotate — through this ONE predicate, because a pack rotated at build
+ * and run unrotated (or vice versa) is not a degraded result, it is noise. The flag is also folded into
+ * ork_build_sig so a mismatched pack is REFUSED rather than silently scored. */
+static bool ork_i4_norot(void) { static const int e = env_enabled("ORK_I4_NOROT"); return e; }
+static inline void ork_w4a4_rot(float * v, int n) { if (!ork_i4_norot()) ork_fwht_norm(v, n); }
+
+static inline float ork_i4_scale_mse(const float * a, int K) {
+    float mx = 1e-9f;
+    for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
+    float best_s = mx / 7.0f; double best_e = -1.0;
+    for (int t = 0; t < ORK_I4_CLIP_N; t++) {
+        const float alpha = 1.0f - 0.0625f * (float) t;        /* 1.000 .. 0.5625 */
+        const float s = alpha * mx / 7.0f;
+        if (s <= 0.0f) continue;
+        const float inv = 1.0f / s;
+        double e = 0.0;
+        for (int k = 0; k < K; k++) {
+            int q = (int) lrintf(a[k] * inv); q = q > 7 ? 7 : (q < -8 ? -8 : q);
+            const double d = (double) a[k] - (double) q * s;
+            e += d * d;
+        }
+        if (best_e < 0.0 || e < best_e) { best_e = e; best_s = s; }
+    }
+    return best_s;
+}
+
+/* ORK_MM_DUMP=<name-substring> — hash every intermediate of ONE matmul so two machines can be compared
+ * stage by stage. Five candidate causes were eliminated one at a time by inference; this replaces that with
+ * a byte diff that cannot be ambiguous. The FIRST stage whose hash differs is the culprit: weight bytes ->
+ * the pack or its loader; ai/as -> activation quantisation; ci -> the MAC; d -> the dequant. If every hash
+ * matches then the outputs are identical and the error metric itself is what disagrees. */
+static uint64_t ork_fnv(const void * p, size_t n) {
+    const uint8_t * b = (const uint8_t *) p; uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+static void ork_mm_dump(const char * name, ork_w * w, const int8_t * ai, const float * as,
+                        const float * bscale, size_t nbs, const int32_t * ci, const float * d,
+                        int K, int N) {
+    static const char * want = getenv("ORK_MM_DUMP");
+    static int done = 0;
+    if (!want || !*want || !name || !strstr(name, want) || done++) return;
+    /* ORK_MM_DUMP_ROW: row 0 is the WRONG row to check alone. The NPU M-tiles (orki_i4_hcap is 4 rows at
+     * K=2048, so M=256 is 64 tiles) while a CPU emulation computes every row in one pass — so a tiling
+     * defect shows up in later rows while row 0 matches perfectly. Row 0 agreeing was taken as "this matmul
+     * is bit-exact" for both the dense and chain paths; the activation trace, which averages 4 rows,
+     * disagreed. */
+    const int R = getenv("ORK_MM_DUMP_ROW") ? atoi(getenv("ORK_MM_DUMP_ROW")) : 0;
+    ai += (size_t) R * K; ci += (size_t) R * N; d += (size_t) R * N; as += R;
+    std::vector<char> wb;
+    size_t wn = w ? ork_w_dump(w, nullptr, 0) : 0;
+    if (wn) { wb.resize(wn); ork_w_dump(w, wb.data(), wn); }
+    fprintf(stderr,
+        "[ORK MM-DUMP] %s K=%d N=%d ROW=%d\n"
+        "  weight  %zu B  fnv=%016llx\n"
+        "  ai row  %d B   fnv=%016llx  [%d %d %d %d %d %d %d %d]\n"
+        "  as[0]   %.9g\n"
+        "  bscale  %zu f  fnv=%016llx  [%.6g %.6g %.6g %.6g]\n"
+        "  ci row  %d i32 fnv=%016llx  [%d %d %d %d]\n"
+        "  d  row  %d f   fnv=%016llx  [%.6g %.6g %.6g %.6g]\n",
+        name, K, N, R,
+        wn, (unsigned long long) (wn ? ork_fnv(wb.data(), wn) : 0),
+        K, (unsigned long long) ork_fnv(ai, (size_t) K),
+        ai[0], ai[1], ai[2], ai[3], ai[4], ai[5], ai[6], ai[7],
+        as[0],
+        nbs, (unsigned long long) ork_fnv(bscale, nbs * sizeof(float)),
+        bscale[0], bscale[1], bscale[2], bscale[3],
+        N, (unsigned long long) ork_fnv(ci, (size_t) N * sizeof(int32_t)),
+        ci[0], ci[1], ci[2], ci[3],
+        N, (unsigned long long) ork_fnv(d, (size_t) N * sizeof(float)),
+        d[0], d[1], d[2], d[3]);
+    fflush(stderr);
+}
+
+/* ORK_OP_STATS also tallies WHICH HANDLER each MUL_MAT takes. supports_op says 1058 matmuls are claimed,
+ * but the activation trace only ever saw 102 — the dense weights. The rest go through chain/group/attention
+ * handlers that were never instrumented, so "all matmuls agree between board and offline" was really "all
+ * 102 dense matmuls agree". A per-handler count makes the whole 1058 visible and shows immediately if the
+ * two machines route the same graph differently. */
+static void ork_route_stat(const char * handler) {
+    static int on = -1;
+    if (on < 0) on = getenv("ORK_OP_STATS") ? 1 : 0;
+    if (!on) return;
+    struct RT { std::map<std::string,long> m;
+        ~RT() { fprintf(stderr, "[ORK ROUTE-STATS] handler                 calls\n");
+                for (const auto & kv : m) fprintf(stderr, "[ORK ROUTE-STATS] %-24s %8ld\n", kv.first.c_str(), kv.second); } };
+    static RT t;
+    t.m[handler]++;
+}
+
+/* ORK_ACT_TRACE=<path> — fingerprint the residual stream ENTERING and LEAVING every matmul.
+ *
+ * ORK_MM_CHECK validates a matmul against its OWN inputs, so it is structurally blind to a matmul that
+ * computed faithfully from activations that were already wrong. That blindness is why a mixed-precision
+ * regression survived every per-matmul test while each matmul measured fine. This closes it: dumping the
+ * INPUT fingerprint per matmul makes the residual stream itself observable, so two configurations can be
+ * diffed layer by layer and the FIRST point of divergence located — rather than inferring from a single
+ * end-of-run perplexity that something, somewhere, got worse.
+ *
+ * Cheap on purpose (a few rows, RMS only): the goal is to localise WHERE, then point a precise instrument
+ * at that one layer. */
+static void ork_act_trace(const char * name, const float * y, const float * d, int M, int K, int N) {
+    static int on = -1; static FILE * f = nullptr;
+    if (on < 0) { const char * p = getenv("ORK_ACT_TRACE"); on = (p && *p) ? 1 : 0; if (on) f = fopen(p, "w"); }
+    if (!on || !f) return;
+    const int MS = M < 4 ? M : 4;
+    double sy = 0, sd = 0;
+    for (int m = 0; m < MS; m++) for (int k = 0; k < K; k++) sy += (double) y[(size_t) m*K+k] * y[(size_t) m*K+k];
+    for (int m = 0; m < MS; m++) for (int n = 0; n < N; n++) sd += (double) d[(size_t) m*N+n] * d[(size_t) m*N+n];
+    fprintf(f, "%-34s M=%-4d K=%-5d N=%-5d in_rms=%.6e out_rms=%.6e\n", name, M, K, N,
+            sqrt(sy / ((double) MS*K)), sqrt(sd / ((double) MS*N)));
+    fflush(f);
+}
+
+/* ORK_MM_CHECK=<name-substring> — verify ONE matmul's actual output against an exact fp32 reference.
+ *
+ * Full-model PPL can only say "something got worse"; it cannot say WHICH value is wrong, and chasing a
+ * mixed-precision regression with it produced several confident wrong diagnoses. This measures the thing
+ * directly: dequantised output vs the exact product of the SOURCE weight and the real activations, on a
+ * subsample, reported as relative error. Tier-agnostic, so the same weight can be compared as W4A4 and as
+ * int8 and the broken one identified rather than inferred. */
+static void ork_mm_check(const char * name, const float * d, const float * y,
+                         const char * xsrc, size_t nb01, enum ggml_type stype, int M, int K, int N) {
+    static const char * want = getenv("ORK_MM_CHECK");
+    if (!want || !*want || !name || !strstr(name, want)) return;
+    const int MS = M < 8 ? M : 8, NS = N < 64 ? N : 64;
+    if (MS < 1 || NS < 1) return;
+    const auto * tt = ggml_get_type_traits(stype);
+    if (!tt || !tt->to_float) return;
+    std::vector<float> wcol((size_t) K);
+    double num = 0, den = 0, sum_e = 0, sum_r = 0; long cnt = 0;
+    for (int n = 0; n < NS; n++) {
+        if (stype == GGML_TYPE_F32) memcpy(wcol.data(), xsrc + (size_t) n*nb01, (size_t) K*sizeof(float));
+        else tt->to_float((const char *) xsrc + (size_t) n*nb01, wcol.data(), K);
+        for (int m = 0; m < MS; m++) {
+            double ref = 0;
+            for (int k = 0; k < K; k++) ref += (double) y[(size_t) m*K + k] * (double) wcol[k];
+            const double got = (double) d[(size_t) m*N + n];
+            num += (got - ref) * (got - ref); den += ref * ref;
+            sum_e += (got - ref); sum_r += fabs(ref); cnt++;   /* BIAS: rotation should give a zero-mean
+                                                                * error; an unrotated tier's error is aligned
+                                                                * with the weight and accumulates coherently
+                                                                * down the residual stream. */
+        }
+    }
+    const double rms = cnt ? sqrt(num/cnt) : 0.0, bias = cnt ? sum_e/cnt : 0.0;
+    fprintf(stderr, "[ORK MM-CHECK] %-34s M=%-4d K=%-5d N=%-5d  rel %.5f  bias/rms %+.4f  (mean|ref| %.4g)\n",
+            name, M, K, N, den > 0 ? sqrt(num/den) : 0.0, rms > 0 ? bias/rms : 0.0, cnt ? sum_r/cnt : 0.0);
+}
+
+/* ORK_W4A4_DIAG — split the W4A4 error into its WEIGHT and ACTIVATION halves.
+ *
+ * Everything invested in W4A4 quality so far (Hadamard, GPTQ) touches only W. A is still plain per-row
+ * absmax/7, and in W4A4 the activation term is usually the DOMINANT one — so before paying for a
+ * pack-format change to get per-group weight scales, measure which half actually owns the error.
+ *
+ * On a subsample (rows x channels, so it is cheap enough to run inline) computes the exact rotated
+ * product and three perturbations of it, and reports relative Frobenius error:
+ *     W-only : quantized W, exact A     — what GPTQ/grouping can improve
+ *     A-only : exact W, quantized A     — what NOTHING currently improves
+ *     both   : the real W4A4 product
+ * Uses the SAME rules the runtime uses (rotate, absmax/7, clamp [-8,7]) so the numbers are the real
+ * ones, not a model of them. Measured against RTN weights, which makes it a CONSERVATIVE read on A's
+ * share: GPTQ shrinks the W term, so A's dominance can only grow from here. */
+static void ork_w4a4_diag(const char * name, int M, int K, int N, int b,
+                          const float * y, const float * Wrot, const std::vector<float> & ws) {
+    const int MS = M < 32 ? M : 32;                       /* subsample: rows */
+    const int NS = N < 128 ? N : 128;                     /*            output channels */
+    if (MS < 1 || NS < 1) return;
+
+    std::vector<float> A((size_t)MS*K), Aq((size_t)MS*K), Ac((size_t)MS*K), A8((size_t)MS*K);
+    for (int m = 0; m < MS; m++) {                        /* rotate + quantize A exactly as the runtime does */
+        float * a = A.data() + (size_t)m*K;
+        memcpy(a, y + (size_t)m*K, (size_t)K*sizeof(float));
+        for (int off = 0; off < K; off += b) ork_fwht_norm(a + off, b);
+        float mx = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(a[k]); if (v > mx) mx = v; }
+        const float s = mx / 7.0f;
+        float * aq = Aq.data() + (size_t)m*K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s); q = q>7?7:(q<-8?-8:q); aq[k] = q*s; }
+        /* ROTATED i4a8: the SAME Hadamard-rotated activations, quantised to int8 (127 levels) instead of
+         * int4 (7). Isolating this is the whole point — the shipped i4a8 route drops the rotation, so
+         * comparing it against W4A4 moves two variables at once and says nothing about the tier itself. */
+        float * a8 = A8.data() + (size_t)m*K;
+        { float mx8 = 1e-9f; for (int k = 0; k < K; k++) { float v = fabsf(a[k]); if (v > mx8) mx8 = v; }
+          const float s8 = mx8 / 127.0f;
+          for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/s8); q = q>127?127:(q<-127?-127:q); a8[k] = q*s8; } }
+        const float sc = ork_i4_scale_mse(a, K);               /* same rows, MSE-optimal clip */
+        float * ac = Ac.data() + (size_t)m*K;
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k]/sc); q = q>7?7:(q<-8?-8:q); ac[k] = q*sc; }
+    }
+    /* PER-GROUP weight scales (the deferred pack-format change): instead of one scale per output channel,
+     * one per (channel, K-group). Measured here BEFORE paying for the format change and the K/G submits it
+     * costs at runtime, because the diagnostic is what told us per-channel weights were already the
+     * well-served half. G=128 is the conventional choice. */
+    const int GS = 128;
+    const int NGRP = (K + GS - 1) / GS;
+    double e_ref = 0, e_w = 0, e_a = 0, e_b = 0, e_ac = 0, e_wg = 0, e_i4a8 = 0;
+    #pragma omp parallel for schedule(static) reduction(+:e_ref,e_w,e_a,e_b,e_ac,e_wg,e_i4a8)
+    for (int n = 0; n < NS; n++) {
+        const float * w  = Wrot + (size_t)n*K;
+        const float sw = ws[n];
+        std::vector<float> wq((size_t)K), wg((size_t)K);
+        for (int k = 0; k < K; k++) { int q = (int) lrintf(w[k]/sw); q = q>7?7:(q<-8?-8:q); wq[k] = q*sw; }
+        /* per-group: an independent absmax scale per K-group of GS */
+        for (int g0 = 0; g0 < K; g0 += GS) {
+            const int g1 = (g0 + GS < K) ? g0 + GS : K;
+            float gmx = 1e-9f;
+            for (int k = g0; k < g1; k++) { const float v = fabsf(w[k]); if (v > gmx) gmx = v; }
+            const float sg = gmx / 7.0f;
+            for (int k = g0; k < g1; k++) { int q = (int) lrintf(w[k]/sg); q = q>7?7:(q<-8?-8:q); wg[k] = q*sg; }
+        }
+        for (int m = 0; m < MS; m++) {
+            const float * a  = A.data()  + (size_t)m*K;
+            const float * aq = Aq.data() + (size_t)m*K;
+            const float * ac = Ac.data() + (size_t)m*K;
+            const float * a8 = A8.data() + (size_t)m*K;
+            double r = 0, dw = 0, da = 0, db = 0, dc = 0, dg = 0, d8 = 0;
+            for (int k = 0; k < K; k++) { r += (double)a[k]*w[k]; dw += (double)a[k]*wq[k];
+                                          da += (double)aq[k]*w[k]; db += (double)aq[k]*wq[k];
+                                          dc += (double)ac[k]*w[k]; dg += (double)a[k]*wg[k];
+                                          d8 += (double)a8[k]*wq[k]; }   /* rotated i4a8: int8 A, int4 W */
+            e_ref += r*r; e_w += (dw-r)*(dw-r); e_a += (da-r)*(da-r); e_b += (db-r)*(db-r);
+            e_ac += (dc-r)*(dc-r); e_wg += (dg-r)*(dg-r); e_i4a8 += (d8-r)*(d8-r);
+        }
+    }
+    if (e_ref <= 0) return;
+    const double nrm = sqrt(e_ref);
+    fprintf(stderr, "[W4A4-DIAG] %-28s K=%-5d N=%-6d | W %.4f  A %.4f  both %.4f | A/W %.2f | "
+                    "A-clipped %.4f (%+.1f%%) | W-group%d %.4f (%+.1f%%) | ROT-i4a8 %.4f (%+.1f%% vs W4A4)\n", name, K, N,
+            sqrt(e_w)/nrm, sqrt(e_a)/nrm, sqrt(e_b)/nrm, sqrt(e_w) > 0 ? sqrt(e_a)/sqrt(e_w) : 0.0,
+            sqrt(e_ac)/nrm, sqrt(e_a) > 0 ? 100.0*(sqrt(e_ac)-sqrt(e_a))/sqrt(e_a) : 0.0,
+            GS, sqrt(e_wg)/nrm, sqrt(e_w) > 0 ? 100.0*(sqrt(e_wg)-sqrt(e_w))/sqrt(e_w) : 0.0,
+            sqrt(e_i4a8)/nrm, sqrt(e_b) > 0 ? 100.0*(sqrt(e_i4a8)-sqrt(e_b))/sqrt(e_b) : 0.0);
+}
+
+/* ---- TWO-PHASE GPTQ CALIBRATION ----------------------------------------------------------------
+ * GPTQ wants H accumulated over MANY calibration batches; ork-driver quantizes a weight on FIRST USE,
+ * when exactly one batch has been seen. rank(H) <= samples, so single-shot calibration leaves H rank-4
+ * (the convert pass's M) against a K of 1024..3584 and GPTQ collapses to round-to-nearest. Hence two
+ * phases:
+ *   PHASE 1 (calibrate) — every native-W4A4 weight-miss registers here and keeps accumulating
+ *     H += (A*R)^T (A*R) on EVERY subsequent forward. The forward still needs a weight, so it uses the
+ *     RTN codes as usual, and persist is SKIPPED so no RTN codes reach the .orkpack.
+ *   PHASE 2 (finalize) — ggml_backend_ork_gptq_finalize() re-reads each source tensor, re-rotates it,
+ *     runs ork_i4_gptq against the accumulated H, re-packs, and persists THAT.
+ * The rotated weight is re-derived at finalize rather than stored: it is O(N*K) to recompute and
+ * O(N*K) floats to keep, and the recompute is noise next to GPTQ's three O(K^3) factorisations.
+ * H is the memory driver: K*K doubles per weight (103 MB at K=3584), freed as each weight finalizes. */
+struct ork_gptq_cal {
+    const ggml_tensor * src = nullptr;    // re-read + re-rotate at finalize
+    int K = 0, N = 0, b = 0;              // b = Hadamard block (largest pow2 dividing K)
+    long samples = 0;                     // rows accumulated; rank(H) <= samples
+    std::vector<double> H;                // K*K
+};
+static std::unordered_map<const void *, ork_gptq_cal> g_gptq_cal;
+static bool ork_gptq_on(void)  { static const int e = getenv("ORK_GPTQ") != nullptr; return e; }
+
+/* ---- WINDOWED GPTQ CALIBRATION -------------------------------------------------------------------
+ * The Hessian is K*K doubles and it is NOT disk-backed: unlike a weight, an evicted H cannot be paged
+ * back, only rebuilt by replaying the whole calibration corpus. So it is a bounded REDUCTION, not a
+ * cache, and the window is sized to minimise the number of corpus passes rather than to maximise a hit
+ * rate. Registering every weight in one pass costs sum(K^2*8) resident, which at 27B (64 layers, 64
+ * ffn_down at K=17408 = 2.42 GiB each) is ~236 GiB — it simply does not fit.
+ *
+ * So calibrate a LAYER RANGE per pass: the caller sets a window, runs the corpus, finalizes, repeats.
+ * Peak residency becomes the window's Hessians instead of the model's.
+ *
+ * This also upgrades the ALGORITHM, which is the part worth keeping. Finalize writes the quantised
+ * weight back into the wcache, so once a window is finalized its weights STAY quantised for the
+ * remaining passes (they are pinned below). Window W+1's Hessian is therefore accumulated from
+ * activations that already passed through window W's quantised weights — i.e. sequential GPTQ, where
+ * each layer compensates for the upstream error, rather than the one-shot variant where every H comes
+ * from the unquantised model. Sequential is the original formulation and is strictly better.
+ *
+ * Layer index comes from the "blk.<i>." name prefix. A weight with no layer index (embeddings, output)
+ * is calibrated in the FIRST window so it is never silently skipped. */
+static int  g_gptq_win_lo = -1, g_gptq_win_hi = -1;    /* [lo,hi); -1/-1 = unwindowed (all layers) */
+static std::unordered_set<const void *> g_gptq_done;   /* finalized in an earlier window — do not redo */
+
+static int ork_blk_index(const char * name) {
+    const char * p = name ? strstr(name, "blk.") : nullptr;
+    return p ? atoi(p + 4) : -1;
+}
+/* THREE states, and conflating the first two is what made the first two attempts silently do one-shot work:
+ *   UNSET (lo < 0)  -- the DISCOVERY pass. Registers metadata and packs RTN, claims NOTHING. This is what
+ *                      keeps discovery free; claiming here allocated all 102 Hessians before window 1 ran,
+ *                      so window 1 swept the whole model and windows 2-3 found nothing left to do.
+ *   RANGE [lo,hi)   -- a real window. Only these layers allocate a Hessian this pass.
+ *   ALL             -- the single-pass case, expressed as the range [0, n_layer). No special case needed.
+ * The caller must therefore ALWAYS set a window before calibrating, even when there is only one. */
+static bool ork_gptq_in_window(const char * name) {
+    if (g_gptq_win_lo < 0) return false;                      /* discovery: claim nothing */
+    const int b = ork_blk_index(name);
+    if (b < 0) return g_gptq_win_lo == 0;                     /* non-layer weights ride the first window */
+    return b >= g_gptq_win_lo && b < g_gptq_win_hi;
+}
+/* Set the layer range calibrated by the NEXT pass. lo<0 restores unwindowed behaviour. */
+extern "C" void ggml_backend_ork_gptq_set_window(int lo, int hi) {
+    g_gptq_win_lo = lo; g_gptq_win_hi = hi;
+    fprintf(stderr, "[ORK GPTQ] calibration window = layers [%d,%d)\n", lo, hi);
+}
+/* Bytes of Hessian one weight of this K needs (K*K doubles). The caller uses it to size the window. */
+extern "C" double ggml_backend_ork_gptq_hessian_bytes(int K) { return (double) K * (double) K * 8.0; }
+
+/* accumulate H += (A*R)^T (A*R) for one batch of rotated activations.
+ *
+ * BLOCKED over rows, and that is the whole point. The obvious form — one rank-1 update per row — streams
+ * the ENTIRE H in and out once per row: at K=3584 that is 98 MiB x 512 rows = 50 GiB of traffic per weight
+ * per batch, and it made phase 1 memory-bound at ~4 min/batch. Accumulating B rows at a time turns it into
+ * a rank-B update (a small GEMM), touching H once per BLOCK instead of once per row — B-fold less traffic.
+ *
+ * The block is held TRANSPOSED (AbT[i][r], row i's B samples contiguous) so the inner dot product over r is
+ * unit-stride on both operands; the natural [r][i] layout would make it stride-K, which is the same cache
+ * mistake one level down. AbT is B*K floats — 917 KiB at K=3584, B=64 — so it stays in L2. */
+static void ork_gptq_accum(ork_gptq_cal & c, int M, const float * y) {
+    const int K = c.K;
+    const int B = 64;
+    std::vector<float> AbT((size_t)K*B);
+    std::vector<float> a((size_t)K);
+    for (int m0 = 0; m0 < M; m0 += B) {
+        const int nb = (M - m0 < B) ? (M - m0) : B;
+        for (int r = 0; r < nb; r++) {                            /* rotate the block, store transposed */
+            memcpy(a.data(), y + (size_t)(m0+r)*K, (size_t)K*sizeof(float));
+            for (int off = 0; off < K; off += c.b) ork_w4a4_rot(a.data() + off, c.b);
+            for (int i = 0; i < K; i++) AbT[(size_t)i*B + r] = a[i];
+        }
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < K; i++) {                             /* H[i][j] += <AbT[i], AbT[j]> over the block */
+            const float * ri = AbT.data() + (size_t)i*B;
+            double * hr = c.H.data() + (size_t)i*K;
+            for (int j = 0; j <= i; j++) {                        /* symmetric: fill lower, mirror after */
+                const float * rj = AbT.data() + (size_t)j*B;
+                double acc = 0.0;
+                for (int r = 0; r < nb; r++) acc += (double)ri[r] * (double)rj[r];
+                hr[j] += acc;
+            }
+        }
+    }
+    c.samples += M;   /* only the LOWER triangle is accumulated; finalize mirrors it once (see below) */
+}
+
 // int4 (W4A4) with PER-CHANNEL scales + a block-Hadamard rotation (implied by the int4 tier). Weights are
 // rotated (R·B) and per-channel int4-quantized once at load (cached); activations are rotated (A·R)
 // and per-row int4-quantized each matmul; the rotation cancels in fp32 (A·B = (A·R)·(R·B)) but lets
 // the coarse per-channel int4 quant stay accurate. Per-channel = full-K SINGLE submit (ork_i4_mm_run),
 // not the grouped path's K/G submits. The NPU int MAC is exact; the only loss is the int4 quant the
 // rotation tames. See ROADMAP Tier 4a/4b.
+/* ---- M=1 DECODE ON THE CPU, FROM THE PACK'S int4 ------------------------------------------------
+ * At M==1 the NPU loses to its own submit floor, so supports_op declines and ggml computes decode itself
+ * -- reading the SOURCE gguf, i.e. 28.6 GiB of q8 on a 27B, when the pack holds the same weights in
+ * 11.3 GiB of int4. Measured consequence: 0.09 tok/s decode, 11.6 s per token. And when the source is a
+ * stub those reads are HOLES, so decode emits token soup while perplexity still reads 10.6780 (PPL is
+ * teacher-forced over the M>1 prefill path and never exercises this).
+ *
+ * So compute it here instead, with ork's own NEON kernel over the pack's weights: ~2.5x less memory
+ * traffic per token, and correct against a stub because nothing reads the source at all.
+ *
+ * Activations are quantised to int8 rather than the int4 the NPU pairs with a W4A4 weight -- the CPU
+ * kernel takes int8 and the wider activation is strictly LESS quantisation error, so decode is not
+ * bit-identical to prefill here; it is slightly more accurate. The rotation must still match the weight's
+ * exactly (same FWHT block), or the dot products are meaningless. */
+static bool ork_cpu_decode_m1(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    if (!src0 || !src1 || dst->ne[1] != 1) return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (ctx->persist_mode != 1 || !ctx->persist_map || !src0->name[0]) return false;
+    const int K = (int) src0->ne[0], N = (int) src0->ne[1];
+    if (K % 32 || N % 64) return false;                     /* un-tiler's shape constraint */
+    auto pit = ctx->persist_idx.find(src0->name);
+    if (pit == ctx->persist_idx.end() || pit->second.dtype != ORKPACK_DT_I4_NATIVE ||
+        pit->second.K != (uint32_t) K || pit->second.N != (uint32_t) N) return false;
+    auto it = ctx->wcache.find(src0->data);
+    if (it == ctx->wcache.end()) return false;               /* not resident yet: let the normal path load it */
+    ork_weight & ow = it->second;
+    if (ow.bscale.size() < (size_t) N) return false;
+
+    if (ow.cpu_nib.empty()) {                                /* one-time per weight */
+        const size_t need = (size_t) N * (size_t) (K / 2);
+        ow.cpu_nib.resize(need);
+        const char * blob = (const char *) ctx->persist_map + pit->second.blob_off;
+        if (ork_i4_cpu_blob_from_tiled(ctx->npu, K, N, blob, pit->second.blob_size,
+                                       ow.cpu_nib.data(), need) != need) { ow.cpu_nib.clear(); return false; }
+        if (getenv("ORK_VERBOSE"))
+            fprintf(stderr, "[ork CPU-DEC] %s: built CPU-layout int4 (%.1f MiB) for M=1 decode\n",
+                    src0->name, need / 1048576.0);
+    }
+
+    std::vector<float> a((size_t) K);
+    memcpy(a.data(), (const char *) src1->data, (size_t) K * sizeof(float));
+    const int b = K & (-K);                                  /* same FWHT block the weight was rotated with */
+    for (int off = 0; off < K; off += b) ork_w4a4_rot(a.data() + off, b);
+    float mx = 1e-9f;
+    for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
+    const float ascale = mx / 127.0f, inv = 1.0f / ascale;
+    std::vector<int8_t> ai((size_t) K);
+    for (int k = 0; k < K; k++) { int q = (int) lrintf(a[k] * inv); ai[k] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); }
+
+    ork_cpu_w w; memset(&w, 0, sizeof w);
+    w.fmt = ORK_CPU_I4; w.nibble = ow.cpu_nib.data(); w.bscale = ow.bscale.data(); w.K = K; w.N = N;
+    ork_cpu_gemv_m1(&w, ai.data(), ascale, (float *) dst->data, 0, N);
+    ctx->cpu_dec_calls++;
+    return true;
+}
+
+/* Resolve the native-W4A4 (rotated int4) weight behind `x` into the wcache: load it from the .orkpack,
+ * or -- only when allow_cold_pack -- rotate/quantise/pack it cold and (in convert mode) persist it.
+ *
+ * ONE implementation, TWO callers: the op path (allow_cold_pack=true) and the op-less preload
+ * (false). It is a function rather than duplicated logic because duplicating it went wrong twice in a
+ * row -- a preload that routed every weight through the int8 resolve cold-packed the native-W4A4 ones
+ * as int8, filled domain 6 to the 3900 MiB IOVA cap and was OOM-killed. The routing lives here now, so
+ * the two paths cannot drift. Returns wcache.end() on failure. */
+static std::unordered_map<const void *, ork_weight>::iterator
+ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_tensor * src0,
+                            const void * x, int K, int N, bool allow_cold_pack,
+                            int M = 0, const float * y = nullptr) {
+    const int b = K & (-K);   /* largest pow2 block dividing K (FWHT block), as the op path computes it */
+    /* Re-derived here rather than passed: all of these are properties of ctx and src0, not of the op, so
+     * threading them through would only create two ways to compute the same thing. M/y are the exception --
+     * they belong to the current activation and feed one getenv-gated diagnostic, so they are optional. */
+    float  * f32 = ctx->f32.data();
+    int8_t * bi  = ctx->bi.data();
+    const enum ggml_type type = src0->type;
+    const struct ggml_type_traits * _tr = ggml_get_type_traits(type);
+    const ggml_to_float_t to_float = _tr ? _tr->to_float : nullptr;
+    const size_t nb01 = src0->nb[1];
+    (void) b; (void) f32; (void) bi; (void) type; (void) to_float; (void) nb01; (void) M; (void) y;
+        auto it = ctx->wcache.find(x);
+        if (it == ctx->wcache.end()) {
+            ork_weight ow;
+            if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
+                /* PRELOAD refuses the cold pack -- but only AFTER the pack load was attempted. Guarding
+                 * before the load (a first attempt did) means preload never reads the pack at all and
+                 * reports 0/400. Cold-packing here is not a fallback either: it writes int8 where the pack
+                 * holds int4, which filled domain 6 to the 3900 MiB IOVA cap and got the process
+                 * OOM-killed. Report the miss; the op path, which allows the cold pack, can still serve it. */
+                if (!allow_cold_pack) return ctx->wcache.end();
+                { static const uint32_t serves[] = { ORKPACK_DT_I4_NATIVE, ORKPACK_DT_I8_ROT, ORKPACK_DT_I4_ROT_A8 };
+                  ork_pack_miss_check(ctx, src0->name, K, N, serves, 3); }   /* in the pack but unloadable = bug */
+                const int GRP = ork_i4_group_for(src0->name);
+                const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+                /* ROTATED tier WIDTH. Promotion keeps the rotation and widens the quantiser instead of
+                 * leaving the rotated path — measurement said losing rotation costs ~7x what the extra
+                 * precision buys. QMAX is the only thing that differs downstream. */
+                const bool promo = (ctx->persist_mode == 2 && ork_i4_force_i8(src0->name));
+                ow.wbits = (promo && ork_promote_tier() == 0) ? 8 : 4;          /* rot8 widens the weight */
+                ow.abits = (promo && (ork_promote_tier() == 0 || ork_promote_tier() == 3)) ? 8 : 4;
+                const int QMAX = ow.wbits == 8 ? 127 : 7;
+                const int QMIN = ow.wbits == 8 ? -127 : -8;
+                ow.gsize = GRP;
+                ow.bscale.resize(GRP > 0 ? (size_t) NGP * N : (size_t) N);   // [g*N+n] grouped, else ws[n]
+                // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
+                // OpenMP iteration (each n is independent — disjoint f32/bi/bscale). This is the per-weight
+                // one-time conversion cost; threading it over N cuts the user's wait ~ncore-fold.
+                #pragma omp parallel for schedule(static)
+                for (int n = 0; n < N; n++) {
+                    float * col = f32 + (size_t) n*K;
+                    if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
+                    else                       to_float((const char *) x + (size_t) n*nb01, col, K);
+                    for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);   // rotate weight column R·B
+                    if (GRP > 0) {                       /* one scale per (channel, K-group), laid out [g*N+n] */
+                        for (int g = 0; g < NGP; g++) {
+                            const int k0 = g*GRP, k1 = (k0 + GRP < K) ? k0 + GRP : K;
+                            float mx = 1e-9f;
+                            for (int k = k0; k < k1; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                            const float s = mx / (float) QMAX;
+                            ow.bscale[(size_t) g*N + n] = s;
+                            for (int k = k0; k < k1; k++) {
+                                int q = (int) lrintf(col[k] / s);
+                                bi[(size_t) k*N + n] = (int8_t) (q > QMAX ? QMAX : q < QMIN ? QMIN : q);
+                            }
+                        }
+                    } else {
+                    float mx = 1e-9f;
+                    for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
+                    float s = mx / (float) QMAX; ow.bscale[n] = s;
+                    for (int k = 0; k < K; k++) {
+                        int q = (int) lrintf(col[k] / s);
+                        bi[(size_t) k*N + n] = (int8_t) (q > QMAX ? QMAX : q < QMIN ? QMIN : q);
+                    }
+                    }
+                }
+                /* ORK_GPTQ PHASE 1: register this weight for calibration and DO NOT persist — the
+                 * RTN codes below are only so the calibration forwards have something to compute with.
+                 * ggml_backend_ork_gptq_finalize() re-quantizes with the accumulated H and persists that. */
+                ow.w = ow.wbits == 8 ? ork_i8_mm_pack(ctx->npu, K, N, bi)        /* rotated int8 tier */
+                     : GRP > 0       ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi, GRP)
+                                     : ork_i4_mm_pack(ctx->npu, K, N, bi);   // offline: CPU-backed weight
+                if (!ow.w) return ctx->wcache.end();
+                if (getenv("ORK_W4A4_DIAG")) ork_w4a4_diag(src0->name, M, K, N, b, y, f32, ow.bscale);
+                /* A ROTATED INT8 weight does not go through the int4 quantiser. GPTQ's error feedback
+                 * is a 4-bit concern — at 8 bits the residual it compensates is already below the noise
+                 * it would introduce, and ork_i4_gptq emits [-8,7] codes against /7 scales, so running
+                 * it here would silently re-quantise the weight back down to int4. That is exactly what
+                 * happened before this branch existed: finalize re-packed unconditionally, the pack came
+                 * out byte-identical to pure int4, and the "rotated int8" measurement was meaningless.
+                 * So: persist it now, from phase 1, and let finalize leave it alone. */
+                if (ork_gptq_on() && ow.wbits == 8) {
+                    ork_persist_write_i4native(ctx, src0->name, K, N, ow);   /* writes DT_I8_ROT */
+                    if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] %s -> DT_I8_ROT (rotated int8, GPTQ skipped)\n", src0->name);
+                } else if (ork_gptq_on()) {
+                    /* REGISTER METADATA ONLY -- no Hessian here. This branch runs once per weight (the
+                     * forward that first packs it), so it cannot be where a window claims its weights:
+                     * by window 2 every weight is already cached and never comes back through here.
+                     * Keeping it free also makes the DISCOVERY pass cheap, which matters -- allocating
+                     * every H up front is exactly the ~236 GiB that windowing exists to avoid at 27B.
+                     * The claim + H allocation live on the every-forward path below. */
+                    ork_gptq_cal & c = g_gptq_cal[x];
+                    if (!c.src) {
+                        c.src = src0; c.K = K; c.N = N; c.b = b;
+                        /* PIN until finalize. In CONVERT mode ork_wcache_evict's budget is deliberately
+                         * ZERO (pack -> dump -> free each weight, so conversion fits any model size), so
+                         * ANY call to it evicts every unpinned entry. A pure-int4 build never calls it and
+                         * the entries happen to survive; the moment one weight takes the int8 route — i.e.
+                         * exactly a MIXED-tier pack, the thing this is all for — that call wipes the
+                         * entries GPTQ still needs, and finalize reports "wcache entry vanished" for most
+                         * of the model (measured: 78 of 96). GPTQ holds a reference across the whole
+                         * calibration, so it must say so rather than rely on nobody triggering eviction. */
+                    }
+                } else {
+                    ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
+                }
+            }
+            it = ctx->wcache.emplace(x, std::move(ow)).first;
+        }
+    return it;
+}
+
 static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    /* M=1: ork's own CPU kernel over the pack beats both alternatives -- the NPU (submit floor) and ggml
+     * (reads the source gguf, or holes if it is a stub). Opt-in, or automatic when the source is a stub
+     * because then it is the only correct option. */
+    {
+        static int on = -1;
+        if (on < 0) { const char * e = getenv("ORK_CPU_DECODE"); on = e ? (atoi(e) ? 1 : 0) : -2; }
+        if ((on == 1 || (on == -2 && ctx->source_is_stub)) && ork_cpu_decode_m1(ctx, dst)) return true;
+    }
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i4_hadamard\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -2373,38 +4234,33 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             // W4A4 (per-channel + Hadamard) profiling — t_quant = FWHT-rotate + weight/act int4-quant +
             // pack; t_run = ork_i4_mm_run (single full-K submit); t_deq = the per-channel fp32 scale-apply.
             double _t0 = ctx->profile ? ork_now_us() : 0.0;
-            auto it = ctx->wcache.find(x);
-            if (it == ctx->wcache.end()) {
-                ork_weight ow;
-                if (!ork_persist_load_i4native(ctx, src0->name, K, N, ow)) {   // .orkpack MISS -> cold rotate+quant+pack
-                    ow.gsize = 0; ow.bscale.resize((size_t) N);   // per-channel scale ws[n]
-                    // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
-                    // OpenMP iteration (each n is independent — disjoint f32/bi/bscale). This is the per-weight
-                    // one-time conversion cost; threading it over N cuts the user's wait ~ncore-fold.
-                    #pragma omp parallel for schedule(static)
-                    for (int n = 0; n < N; n++) {
-                        float * col = f32 + (size_t) n*K;
-                        if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
-                        else                       to_float((const char *) x + (size_t) n*nb01, col, K);
-                        for (int off = 0; off < K; off += b) ork_fwht_norm(col + off, b);   // rotate weight column R·B
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(col[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; ow.bscale[n] = s;
-                        for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(col[k] / s);
-                            bi[(size_t) k*N + n] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
-                        }
-                    }
-                    ow.w = ork_i4_mm_pack(ctx->npu, K, N, bi);
-                    if (!ow.w) return false;
-                    ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
-                }
-                it = ctx->wcache.emplace(x, std::move(ow)).first;
-            }
+            auto it = ork_resolve_weight_i4native(ctx, src0, x, K, N, /*allow_cold_pack=*/true, M, y);
+            if (it == ctx->wcache.end()) return false;
             const ork_weight & ow = it->second;
+            if (ork_gptq_on()) {                                   /* PHASE 1: keep accumulating H every forward */
+                auto ci = g_gptq_cal.find(x);
+                /* CLAIM for this window HERE, not in the wcache-miss branch above. Registration happens once
+                 * (the first forward, which packs the weight); every later window finds the weight already
+                 * cached and never re-enters that branch. Allocating H there meant only the FIRST window
+                 * ever got Hessians -- measured: window 1 finalized all 102 weights and windows 2-3 found
+                 * nothing, so the "windowed" pack was a one-shot pack with extra passes (16.9724 vs the
+                 * 15.9011 single-pass baseline). The window claim must live on the path every forward takes. */
+                if (ci != g_gptq_cal.end()) {
+                    ork_gptq_cal & c = ci->second;
+                    if (c.H.empty() && ork_gptq_in_window(src0->name) && !g_gptq_done.count(x)) {
+                        c.H.assign((size_t) c.K * c.K, 0.0);       /* the window's cost, paid only in its window */
+                        c.samples = 0;                             /* rows count for THIS window, not cumulative */
+                        ctx->wcache_pin.insert(x);
+                        if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK GPTQ] claim %s K=%d (H = %.0f MiB)\n",
+                                                          src0->name, c.K, (double) c.K*c.K*8/1048576.0);
+                    }
+                    if (!c.H.empty()) ork_gptq_accum(c, M, y);     /* out-of-window weights cost nothing */
+                }
+            }
             double _tw = ctx->profile ? ork_now_us() : 0.0;   /* split: weight-handling (_t0.._tw) vs act-quant (_tw.._t1) */
 
-            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 && !ctx->no_reuse);
+            bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 &&
+                          ctx->last_abits == ow.abits && !ctx->no_reuse);
             if (!reuse) {
                 // activations: rotate each row (A·R), per-row int4 quant with shape padding
                 #pragma omp parallel for if (M_padded >= 16)
@@ -2413,14 +4269,28 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                         float arow_local[K];
                         memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
                         for (int off = 0; off < K; off += b) {
-                            ork_fwht_norm(arow_local + off, b);
+                            ork_w4a4_rot(arow_local + off, b);
                         }
-                        float mx = 1e-9f;
-                        for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
-                        float s = mx / 7.0f; as[m] = s;
+                        /* MSE-optimal clip rather than absmax/7 — measured (ORK_W4A4_DIAG) to cut the
+                         * ACTIVATION half of the W4A4 error by 11-39% (mean ~26%) on every weight of
+                         * qwen3.5-0.8B. The two error halves are at parity and independent, so this is
+                         * roughly a 12% cut in total matmul error. The search runs inside this existing
+                         * per-row omp loop, so it costs passes, not parallelism. ORK_I4_NOCLIP=1 restores
+                         * plain absmax for A/B. */
+                        /* Activations take the SAME width as the weight tier: a rotated int8 weight is
+                         * pointless against int4 activations, since the activation half would then
+                         * dominate the error budget it was promoted to reduce. */
+                        const int AQMAX = ow.abits == 8 ? 127 : 7, AQMIN = ow.abits == 8 ? -127 : -8;
+                        float s;
+                        if (ow.abits == 4 && ork_i4_clip_on()) s = ork_i4_scale_mse(arow_local, K);
+                        else { float mx = 1e-9f;
+                               for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
+                               s = mx / (float) AQMAX; }
+                        as[m] = s;
+                        const float inv = 1.0f / s;
                         for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(arow_local[k] / s);
-                            ai[(size_t) m*K + k] = (int8_t) (q > 7 ? 7 : q < -8 ? -8 : q);
+                            int q = (int) lrintf(arow_local[k] * inv);
+                            ai[(size_t) m*K + k] = (int8_t) (q > AQMAX ? AQMAX : q < AQMIN ? AQMIN : q);
                         }
                     } else {
                         memset(ai + (size_t) m*K, 0, K);
@@ -2431,16 +4301,67 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->last_M = M;
                 ctx->last_K = K;
                 ctx->last_type = 3;
+                ctx->last_abits = ow.abits;
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
+            }
+
+            /* PER-GROUP: activations get one scale per (row, K-group) too, and run_grouped writes fp32
+             * directly (its drain does the per-group scale-accumulate), so the per-channel dequant below
+             * is skipped entirely. */
+            if (ow.gsize > 0) {
+                const int GRP = ow.gsize, SK = K / GRP;
+                std::vector<float> asg((size_t) M * SK);
+                #pragma omp parallel for schedule(static) if (M >= 16)
+                for (int m = 0; m < M; m++) {
+                    float arow[K];
+                    memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
+                    for (int off = 0; off < K; off += b) ork_w4a4_rot(arow + off, b);
+                    for (int g = 0; g < SK; g++) {
+                        const int k0 = g*GRP, k1 = k0 + GRP;
+                        /* ACTIVATION WIDTH follows the tier, as it does on the ungrouped path. This branch
+                         * used to hardcode 4 bits (mx/7, clamp [-8,7]), which made grouped scales and int8
+                         * activations mutually exclusive -- a grouped W4A8 pack built fine and then refused
+                         * at run, so the activation half of the W4A4-vs-Q4_0 gap could not be measured. */
+                        const int GQMAX = ow.abits == 8 ? 127 : 7, GQMIN = ow.abits == 8 ? -127 : -8;
+                        float s;
+                        if (ow.abits == 4 && ork_i4_clip_on()) s = ork_i4_scale_mse(arow + k0, GRP);
+                        else { float mx = 1e-9f;
+                               for (int k = k0; k < k1; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
+                               s = mx / (float) GQMAX; }
+                        asg[(size_t) m*SK + g] = s;
+                        const float inv = 1.0f / s;
+                        for (int k = k0; k < k1; k++) {
+                            int q = (int) lrintf(arow[k] * inv);
+                            ai[(size_t) m*K + k] = (int8_t) (q > GQMAX ? GQMAX : q < GQMIN ? GQMIN : q);
+                        }
+                    }
+                }
+                const int grc = (ow.wbits == 8)
+                    ? ork_i8_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d)
+                    : ork_i4_mm_run_grouped(ctx->npu, ow.w, M, ai, asg.data(), ow.bscale.data(), d);
+                if (grc) {
+                    fprintf(stderr, "[ORK] %s: grouped W4A%d run REFUSED (K=%d N=%d G=%d M=%d)\n",
+                            src0->name, ow.abits, K, N, GRP, M);
+                    return false;
+                }
+                /* The grouped branch returns before the ungrouped path's check, so ORK_MM_CHECK was blind to
+                 * precisely the configuration under investigation -- it silently printed nothing for every
+                 * grouped pack and looked like the probe simply had no findings. */
+                ork_mm_check(src0->name, d, y, (const char *) x, nb01, src0->type, M, K, N);
+                if (ctx->profile) { ctx->t_run += ork_now_us() - _t0; ctx->n_mm += 1; }
+                return true;
             }
 
             ork_mm_task_i4 task = { ow.w, M_padded, ai, ci };
             if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 chain hadamard: M_padded=%d (M=%d), K=%d, N=%d\n", M_padded, M, K, N);
             fflush(stderr);
             double _t1 = ctx->profile ? ork_now_us() : 0.0;
-            if (ork_i4_mm_run(ctx->npu, task.w, task.M, task.A, task.C)) return false;    // full-K single submit, int32 C
+            /* Same rotated datapath, wider MAC. int8 is also the FASTER MAC on this part, so the rotated
+             * int8 tier costs quality nothing and dispatch nothing relative to W4A4. */
+            if (ow.wbits == 8 ? ork_i8_mm_run(ctx->npu, task.w, task.M, task.A, task.C)
+                              : ork_i4_mm_run(ctx->npu, task.w, task.M, task.A, task.C)) return false;
             double _t2 = ctx->profile ? ork_now_us() : 0.0;
             #pragma omp parallel for if (M >= 16)
             for (int m = 0; m < M; m++) {
@@ -2448,6 +4369,9 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
                 }
             }
+            ork_mm_dump(src0->name, ow.w, ai, as, ow.bscale.data(), ow.bscale.size(), ci, d, K, N);
+            ork_mm_check(src0->name, d, y, (const char *) x, nb01, src0->type, M, K, N);
+            ork_act_trace(src0->name, y, d, M, K, N);
             if (ctx->profile) {
                 double _t3 = ork_now_us();
                 ctx->t_quant += _t1 - _t0; ctx->t_run += _t2 - _t1; ctx->t_deq += _t3 - _t2; ctx->n_mm += 1;
@@ -2459,6 +4383,215 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
         }
     }
     return true;
+}
+
+/* ORK_GPTQ PHASE 2. Called once after the calibration forwards (ork_bench does it). For every weight
+ * registered in phase 1: re-read + re-rotate the source tensor, run GPTQ against the H accumulated over
+ * ALL calibration batches, re-pack, swap the wcache entry, persist THAT, and free H.
+ *
+ * Re-deriving the rotated weight here (rather than stashing it in phase 1) trades O(N*K) recompute for
+ * O(N*K) floats per weight held across the whole calibration — the recompute is noise beside GPTQ's three
+ * O(K^3) factorisations, and it keeps peak memory to the H accumulators alone.
+ *
+ * Weights are finalized largest-K first so the biggest H is freed earliest, and the running log makes the
+ * K^3 cost visible while it happens rather than after. */
+/* How many calibration ROWS this model actually needs: the largest K among the registered weights.
+ * GPTQ's error feedback is weighted by H^-1, and rank(H) <= rows — so below K rows the damping term owns
+ * the null space, H^-1 ~ I/lambda there, the propagation row goes to zero and GPTQ SILENTLY degenerates to
+ * round-to-nearest in exactly those directions. That threshold is a property of the weight shapes, not a
+ * preference, so the caller derives the batch count from this instead of being told a number. Returns 0
+ * when nothing is registered (not a GPTQ run). */
+extern "C" int ggml_backend_ork_gptq_min_rows(void) {
+    int mx = 0;   /* largest K among the weights THIS window claimed -- feeding more rows than the window
+                   * needs just burns passes, and feeding fewer leaves H rank-deficient. */
+    for (const auto & kv : g_gptq_cal) if (!kv.second.H.empty() && kv.second.K > mx) mx = kv.second.K;
+    return mx;
+}
+/* Largest K over EVERY registered weight, claimed or not. Available after the discovery pass (which costs
+ * no Hessian memory) and used to size the window against a RAM budget. */
+extern "C" int ggml_backend_ork_gptq_max_k(void) {
+    int mx = 0;
+    for (const auto & kv : g_gptq_cal) if (kv.second.K > mx) mx = kv.second.K;
+    return mx;
+}
+
+/* Rows accumulated so far BY THIS WINDOW's claimed weights. Reading an arbitrary map entry was safe when
+ * every entry was claimed and saw every batch; with windowing the map also holds unclaimed weights (samples
+ * 0, so the row loop would run the corpus dry every pass) and retired ones (samples from THEIR window, so
+ * the loop would exit immediately and later windows would calibrate on the claim decode alone). Both are
+ * silent -- the pack still builds. Report the max over currently-claimed weights only. */
+extern "C" long ggml_backend_ork_gptq_rows(void) {
+    long mx = 0;
+    for (const auto & kv : g_gptq_cal) if (!kv.second.H.empty() && kv.second.samples > mx) mx = kv.second.samples;
+    return mx;
+}
+
+extern "C" void ggml_backend_ork_gptq_finalize(void) {
+    if (!ork_gptq_on() || g_gptq_cal.empty()) return;
+    ggml_backend_ork_context * ctx = g_ork_ctx;
+    if (!ctx) { fprintf(stderr, "[ORK GPTQ] finalize: no backend context\n"); return; }
+    /* Release the calibration pins on the way out (see the insert in phase 1): finalize is the last reader,
+     * and leaving them pinned would defeat convert mode's zero-residency policy for the rest of the run. */
+    /* WINDOWED: keep the pin. Finalize replaces ow.w in the wcache with the GPTQ weight, so holding the
+     * entry is what makes the NEXT window calibrate against already-quantised upstream layers (sequential
+     * GPTQ). Dropping it would let convert-mode eviction reclaim the entry, the next pass would re-pack it
+     * RTN, and every window would calibrate against the unquantised model — the one-shot variant, silently.
+     * Cost is the finalized weights staying resident (11.6 GiB for 27B); ORK_GPTQ_SEQ=0 opts out.
+     * UNWINDOWED: release, as before — finalize is the last reader and convert mode wants zero residency. */
+    const bool gptq_seq = !(getenv("ORK_GPTQ_SEQ") && atoi(getenv("ORK_GPTQ_SEQ")) == 0);
+    struct GptqPinRelease { ggml_backend_ork_context * c; bool keep; ~GptqPinRelease() {
+        if (keep) return;             /* windowed: pins stay, and only the CLAIMED weights are marked done
+                                       * (below) -- marking everything here would retire weights that have
+                                       * not had their window yet, and they would never be calibrated. */
+        for (const auto & kv : g_gptq_cal) c->wcache_pin.erase(kv.first); } }
+        _gptq_pins{ ctx, gptq_seq };
+
+    const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
+    std::vector<const void *> keys;
+    keys.reserve(g_gptq_cal.size());
+    for (auto & kv : g_gptq_cal) if (!kv.second.H.empty()) keys.push_back(kv.first);   /* this window's claims only */
+    std::sort(keys.begin(), keys.end(), [](const void * a, const void * b){
+        return g_gptq_cal[a].K > g_gptq_cal[b].K; });          // biggest H freed first
+
+    fprintf(stderr, "[ORK GPTQ] finalize: %zu weights, damp=%.3g\n", keys.size(), damp);
+    double all0 = ork_now_us(); size_t done = 0, failed = 0;
+
+    /* CHUNKED, parallel over WEIGHTS. ork_i4_gptq is internally OpenMP but its inner loops are short at
+     * small K, so the cores idle; weights are completely independent, so the outer loop is where the
+     * parallelism actually is. OpenMP nesting is off by default, which is exactly right here — each weight
+     * gets one thread and the inner regions run serially.
+     * Two-stage per chunk because ork_i4_mm_pack touches the NPU and is NOT thread-safe: compute all the
+     * codes in parallel, then pack + persist SERIALLY. Chunked rather than one big pass so peak memory stays
+     * bounded (holding every weight's codes at once would be the whole model in int8). */
+    /* CH was hardcoded to 4 — right for the RK3588's 4 big cores, and a 75% waste on any bigger host
+     * (an offline build on a 16-core box ran finalize on 4 threads). Derive it instead: weights are
+     * independent, so the ceiling is core count, bounded by MEMORY because each in-flight weight holds
+     * ork_i4_gptq's three K^2-ish doubles (Hd + H^-1 + W) plus its codes. Size that from the LARGEST K
+     * registered, since chunks are not sorted and a chunk may be all-large. ORK_GPTQ_CHUNK overrides. */
+    int CH;
+    if (const char * e = getenv("ORK_GPTQ_CHUNK")) CH = atoi(e);
+    else {
+        int kmax = 0, nmax = 0;
+        for (const auto & kv : g_gptq_cal) { if (kv.second.K > kmax) kmax = kv.second.K; if (kv.second.N > nmax) nmax = kv.second.N; }
+        const double per = 2.0*(double)kmax*kmax*sizeof(double)          /* Hd + H^-1            */
+                         + (double)kmax*nmax*sizeof(double)              /* W (double, N x K)    */
+                         + (double)kmax*nmax;                            /* int8 codes           */
+        double budget = 8.0*1024*1024*1024;                              /* stay well clear of the box */
+        #ifdef _SC_PHYS_PAGES
+        const long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
+        if (pg > 0 && ps > 0) budget = 0.25 * (double) pg * (double) ps;
+        #endif
+        int by_mem = per > 0 ? (int) (budget / per) : 4;
+        int by_cpu = 4;
+        #ifdef _OPENMP
+        by_cpu = omp_get_max_threads();
+        #endif
+        CH = by_cpu < by_mem ? by_cpu : by_mem;
+        if (CH < 1) CH = 1;
+        fprintf(stderr, "[ORK GPTQ] finalize chunk = %d (cores %d, memory allows %d @ %.0f MiB/weight, kmax=%d)\n",
+                CH, by_cpu, by_mem, per/1048576.0, kmax);
+    }
+    for (size_t base = 0; base < keys.size(); base += CH) {
+        const size_t n_ch = (keys.size() - base < (size_t)CH) ? keys.size() - base : (size_t)CH;
+        std::vector<std::vector<int8_t>> codes(n_ch);
+        std::vector<std::vector<float>>  scal(n_ch);
+        std::vector<int>                 rcs(n_ch, -1);
+        std::vector<float>               qerr(n_ch, 0.0f);   /* measured below, persisted in the pack entry */
+        std::vector<double>              secs(n_ch, 0.0);
+
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(CH)
+        for (int u = 0; u < (int)n_ch; u++) {
+            ork_gptq_cal & c = g_gptq_cal[keys[base + u]];
+            const ggml_tensor * src = c.src;
+            const int K = c.K, N = c.N, b = c.b;
+            double t0 = ork_now_us();
+
+            std::vector<float> W((size_t)N*K);                    /* re-read + re-rotate, as phase 1 did */
+            const auto * tt = ggml_get_type_traits(src->type);
+            ggml_to_float_t const to_float = tt->to_float;
+            const char * x = (const char *) src->data;
+            for (int n = 0; n < N; n++) {
+                float * col = W.data() + (size_t)n*K;
+                if (src->type == GGML_TYPE_F32) memcpy(col, x + (size_t)n*src->nb[1], (size_t)K*sizeof(float));
+                else                            to_float(x + (size_t)n*src->nb[1], col, K);
+                for (int off = 0; off < K; off += b) ork_w4a4_rot(col + off, b);
+            }
+            /* accum filled only the LOWER triangle (halving its inner loop); mirror once, here. */
+            std::vector<float> Hf((size_t)K*K);
+            for (int i = 0; i < K; i++) {
+                const double * lo = c.H.data() + (size_t)i*K;
+                for (int j = 0; j <= i; j++) { const float v = (float) lo[j];
+                    Hf[(size_t)i*K + j] = v; Hf[(size_t)j*K + i] = v; }
+            }
+            std::vector<double>().swap(c.H);                      /* free the accumulator as soon as it is copied */
+            codes[u].resize((size_t)N*K); scal[u].resize((size_t)N);
+            /* group = -1 -> per-channel (one group spanning K). ORK_I4_GROUP=G asks for one scale per
+             * (channel, K-group); ork_i4_gptq then emits [N x ng] as scal[n*ng+g]. */
+            const int GRP = ork_i4_group_for(src->name);
+            const int NGP = GRP > 0 ? (K + GRP - 1) / GRP : 1;
+            if (GRP > 0) scal[u].resize((size_t) N * NGP);
+            rcs[u]  = ork_i4_gptq(K, N, W.data(), Hf.data(), GRP > 0 ? GRP : -1,
+                                  codes[u].data(), scal[u].data(), damp);
+            /* MEASURE what this weight actually lost, and store it in the pack (entry.qerr).
+             *
+             * diag(H) weights each input channel by the activation energy that flows through it, which is
+             * why this predicts OUTPUT error far better than ||W-Q||: a large weight error on a channel the
+             * activations never excite costs nothing. The full H-weighted form is the exact GPTQ objective
+             * but O(N*K^2) — as expensive as the sweep itself — whereas the diagonal is O(N*K) and free
+             * beside work already done. Relative, so it is comparable ACROSS weights of different shapes,
+             * which is the entire point: ranking them is what re-tiering needs. */
+            if (rcs[u] == 0) {
+                const int NGe = (GRP > 0) ? (K + GRP - 1) / GRP : 1;
+                double num = 0.0, den = 0.0;
+                for (int n = 0; n < N; n++) for (int k = 0; k < K; k++) {
+                    const double hd = (double) Hf[(size_t) k*K + k];
+                    const double w  = (double) W[(size_t) n*K + k];
+                    const double sc = (double) scal[u][GRP > 0 ? (size_t) n*NGe + k/GRP : (size_t) n];
+                    const double d  = w - (double) codes[u][(size_t) n*K + k] * sc;
+                    num += hd * d * d; den += hd * w * w;
+                }
+                qerr[u] = (den > 0.0) ? (float) sqrt(num / den) : 0.0f;
+            }
+            secs[u] = (ork_now_us() - t0) / 1e6;
+        }
+
+        for (size_t u = 0; u < n_ch; u++) {                       /* SERIAL: the NPU pack is not thread-safe */
+            ork_gptq_cal & c = g_gptq_cal[keys[base + u]];
+            const ggml_tensor * src = c.src;
+            const int K = c.K, N = c.N;
+            if (c.samples < K)
+                fprintf(stderr, "[ORK GPTQ] %s: %ld calibration rows < K=%d — H rank-deficient; GPTQ tends to "
+                                "RTN in the null space\n", src->name, c.samples, K);
+            if (rcs[u]) { fprintf(stderr, "[ORK GPTQ] %s: ork_i4_gptq rc=%d — leaving RTN codes\n", src->name, rcs[u]);
+                          failed++; continue; }
+            auto it = ctx->wcache.find(keys[base + u]);
+            if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
+            ork_weight & ow = it->second;
+            std::vector<int8_t> bi((size_t)K*N);
+            ow.qerr = qerr[u];
+            const int GQ = ow.gsize, NGq = GQ > 0 ? K / GQ : 1;
+            if (GQ > 0) ow.bscale.resize((size_t) NGq * N);
+            for (int n = 0; n < N; n++) {
+                /* ork_i4_gptq emits [n*ng+g]; run_grouped indexes [g*N+n]. Transpose here, once. */
+                if (GQ > 0) for (int g = 0; g < NGq; g++) ow.bscale[(size_t) g*N + n] = scal[u][(size_t) n*NGq + g];
+                else        ow.bscale[n] = scal[u][n];
+                for (int k = 0; k < K; k++) bi[(size_t)k*N + n] = codes[u][(size_t)n*K + k];
+            }
+            if (ow.w) { ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; }
+            ow.w = GQ > 0 ? ork_i4_mm_pack_grouped(ctx->npu, K, N, bi.data(), GQ)
+                          : ork_i4_mm_pack(ctx->npu, K, N, bi.data());
+            if (!ow.w) { fprintf(stderr, "[ORK GPTQ] %s: repack FAILED\n", src->name); failed++; continue; }
+            ork_persist_write_i4native(ctx, src->name, K, N, ow);
+            done++;
+            fprintf(stderr, "[ORK GPTQ] %s K=%d N=%d rows=%ld -> GPTQ (%.1f s)  [%zu/%zu, %.1f min]\n",
+                    src->name, K, N, c.samples, secs[u], done, keys.size(), (ork_now_us()-all0)/6e7);
+        }
+    }
+    /* WINDOWED: keep the metadata (later windows need K/N/src to claim their own weights) and free only
+     * this window's Hessians -- that release is the entire point of windowing. UNWINDOWED: clear, as before. */
+    for (const void * k : keys) { g_gptq_done.insert(k); std::vector<double>().swap(g_gptq_cal[k].H); }
+    fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min\n",
+            done, failed, (ork_now_us()-all0)/6e7);
 }
 
 // Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V
@@ -2476,6 +4609,14 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 
     const void * key = g[0]->src[0]->data;
     auto it = ctx->wcache.find(key);
+    /* A hit under this key may be the PER-TENSOR weight (preload, or an earlier unfused decode), which is
+     * not what this path is about to run. Drop it and rebuild the concatenation. See ork_wcache_shape_ok. */
+    if (it != ctx->wcache.end() && !ork_wcache_shape_ok(it->second, K, Ntot)) {
+        ctx->wcache_bytes -= it->second.bytes;
+        ork_w_free(it->second.w);
+        ctx->wcache.erase(it);
+        it = ctx->wcache.end();
+    }
     if (it == ctx->wcache.end()) {                       // load-or-(build+pack)+persist the fused weight once
         ork_weight ow; ow.bscale.resize(Ntot);
         // Synthetic name for the FUSED (concatenated) group weight — stable across runs (grouping is
@@ -2862,6 +5003,16 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     { struct ork_attn_sm & s = ctx->attn_sm;                     // per-context softmax scratch
       free(s.xi); free(s.ei); free(s.mx); free(s.ss); free(s.e); free(s.q8); free(s.invf);
       if (s.ones) ork_mm_free(ctx->npu, s.ones); s = (struct ork_attn_sm){}; }
+    for (auto & e : ctx->ffn_pc) {                               // precompiled FFN decode chains + their pinned buffers
+        if (e.second.gu) ork_pc_free(e.second.gu);
+        if (e.second.dn) ork_pc_free(e.second.dn);
+        free(e.second.xi); free(e.second.glu8); free(e.second.glf);
+        free(e.second.gm); free(e.second.um); free(e.second.dm);
+        if (e.second.gi) ork_dma_free(ctx->npu, e.second.gi);
+        if (e.second.ui) ork_dma_free(ctx->npu, e.second.ui);
+        if (e.second.di) ork_dma_free(ctx->npu, e.second.di);
+    }
+    ctx->ffn_pc.clear();
     for (auto & e : ctx->attn_kv) {                              // resident-KV decode buffers (ORK_ATTN_KV)
         for (ork_kv_resident * r : e.second.kv) if (r) ork_kv_resident_free(ctx->npu, r);
         if (e.second.ones) ork_mm_free(ctx->npu, e.second.ones);   // ORK_ATTN_FUSED resident ones[Lmax,32]
@@ -3143,6 +5294,19 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
             for (int n = 0; n < N; n++) dr[n] = rs * bs[n] * (float) cr[n];
 #endif
         }
+        /* Last ork-executed path with no instrumentation: 48 of the 150 matmuls this model runs on
+         * ork go through the chain handler, and "board and offline agree" was only ever verified for
+         * the other 102. On the board this is the NPU hardware chain; offline it is orki_cpu_chain_i4
+         * exact int32 GEMM — so if the hardware chain carries int16 partials (as the grouped path
+         * does) these 48 are systematically less precise and nothing upstream would reveal it. */
+        ork_act_trace(dst->src[0]->name, (const float *) dst->src[1]->data, d, M, (int) dst->src[0]->ne[0], N);
+        /* Same stage-by-stage dump the dense path has. The chain's activations live in chain_act_cache
+         * (quantised once and shared across the chained tasks) rather than ctx->ai, so pass that buffer —
+         * comparing the wrong one would show a spurious difference and send the next person chasing it. */
+        { auto ai_it = chain_act_cache.find(src1->data);
+          if (ai_it != chain_act_cache.end())
+              ork_mm_dump(dst->src[0]->name, ow.w, ai_it->second.first, task_as,
+                          ow.bscale.data(), ow.bscale.size(), ctr, d, (int) dst->src[0]->ne[0], N); }
     }
 
     if (ctx->profile) {
@@ -3502,6 +5666,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                         pit->second.K == (uint32_t) K && pit->second.N == (uint32_t) N) pe = &pit->second;
                 }
                 if (!pe) {                                        // cold quantize the plane -> bi + ow.bscale
+                    { static const uint32_t serves[] = { ORKPACK_DT_I4_NATIVE };
+                      ork_pack_miss_check(ctx, ork_expert_key(src0->name, e).c_str(), K, N, serves, 1); }
                     bi.resize((size_t) K * N); f32e.resize((size_t) N * K);
                     #pragma omp parallel for schedule(static)
                     for (int n = 0; n < N; n++) {
@@ -3520,7 +5686,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 // 2nd+ buffer (int8's run reads imported non-0 weights bit-exact — this is an int4-run-specific
                 // integration bug still to fix). Per-expert import also saturates IOMMU mappings (~2340/dom) at
                 // full scale. ORK_I4_ARENA consolidates to fewer chunks but hit a chunk-boundary read bug.
-                int _dom = ork_weight_domain(ctx, (size_t) K * N / 2, ork_layer_of(src0->name));
+                int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N / 2, ork_layer_of(src0->name));
                 ork_npu_set_pack_domain(ctx->npu, _dom);
                 auto mk = [&]() -> ork_w * {
                     if (!pe) return ork_i4_mm_pack(ctx->npu, K, N, bi.data());
@@ -3800,6 +5966,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             if (pit != ctx->persist_idx.end() && pit->second.K==(uint32_t)K && pit->second.N==(uint32_t)N &&
                 (pit->second.dtype==ORKPACK_DT_I8 || pit->second.dtype==ORKPACK_DT_I4)) pe = &pit->second;
         }
+        if (!pe) { static const uint32_t serves[] = { ORKPACK_DT_I8, ORKPACK_DT_I4 };
+                   ork_pack_miss_check(ctx, ork_expert_key(src0->name, e).c_str(), K, N, serves, 2); }
         std::vector<float> bsc(N);
         const double pk0 = ctx->profile ? ork_now_us() : 0;   // [VERIFY] time first-touch pack/load
         if (pe) {
@@ -4122,8 +6290,11 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
     // to the NON-BLOCKING async doorbell (ork_submit_async, which overlaps run_cold) instead of all-CPU. The
     // blocking #14 rendezvous lost net (profiled); the thread-free doorbell should overlap for free. Knob:
     //   ORK_SPLIT_FRAC (default 0.0) = CPU-only baseline;  0.5 = half the experts to the NPU async share.
-    // Prefill (max_Me >= batch_minM) admits all as before; ORK_M1_NPU forces all-decode-on-NPU (old A/B).
-    static const bool  m1_npu     = env_enabled("ORK_M1_NPU");
+    // Prefill (max_Me >= batch_minM) admits all as before; ORK_MOE_M1_NPU forces all-decode-on-NPU (old A/B).
+    // RENAMED from ORK_M1_NPU: that name used to ALSO gate dense-backbone M==1 routing, one env driving two
+    // unrelated decisions. Dense routing is now a published per-model recipe (see ork_recipe_lookup), and
+    // MoE expert admission is a separate question with its own closed verdict — so they get separate names.
+    static const bool  m1_npu     = env_enabled("ORK_MOE_M1_NPU");
     // ORK_MOE_CPU (task #54, NF4 route): force ALL experts to the CPU cold path (the batched int4/NF4 NEON
     // GEMM) instead of the NPU — the "prefill using only int4 from orkpack on CPU" A/B. The int4 weights stay
     // resident once (the mmap'd orkpack blob the ork-native cold path reads); the NPU IOVA copy is unused.
@@ -4617,7 +6788,7 @@ ork_resolve_pt_weight(ggml_backend_ork_context * ctx, const struct ggml_tensor *
     for (int n = 0; n < N; n++) { const float * frow = f32.data() + (size_t) n * K;
         for (int k = 0; k < K; k++) { int q = (int) lrintf(frow[k] * inv);
             bi[(size_t) k*N + n] = (int8_t) (q > 127 ? 127 : q < -127 ? -127 : q); } }
-    int dom = ork_weight_domain(ctx, (size_t) K * N, ork_layer_of(src0->name));
+    int dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));
     ork_npu_set_pack_domain(ctx->npu, dom);
     ork_w * w = ork_i8_mm_pack(ctx->npu, K, N, bi.data());
     while (!w && (dom = ork_domain_advance(ctx)) >= 0) w = ork_i8_mm_pack(ctx->npu, K, N, bi.data());
@@ -4946,9 +7117,84 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
     // suboptimally (K-slice re-reads, socket copies). run() time = socket + submit(5us) + HW + return.
     static int fprof=-1; if(fprof<0) fprof=getenv("ORK_FFN_PROF")?1:0;
     static double p_q=0,p_gu=0,p_host=0,p_dn=0,p_deq=0; static long p_n=0; double _t;
+    /* DOWN-ONLY doorbell split. The shared counters average q,k,v,o and down (5 calls/layer at route 2),
+     * so they cannot be compared with a single-shape probe run — which is exactly the trap noted in the
+     * roadmap. Reset immediately before the down call and read immediately after, isolating one shape. */
+    static double d_beg=0, d_end=0; static long d_bn=0, d_en=0;
+    /* Kernel-side per-job HARDWARE time (#patch74) around the SAME isolated down call. Userspace only
+     * sees hardware time plus detection latency; this separates them. */
+    static unsigned long long d_hw=0; static unsigned long d_hn=0; static double d_poll=0;
+    auto hw_zero = [](){ FILE*f; if((f=fopen("/sys/module/rknpu/parameters/hw_ns_sum","w"))){fputs("0",f);fclose(f);}
+                         if((f=fopen("/sys/module/rknpu/parameters/hw_n","w"))){fputs("0",f);fclose(f);} };
+    auto hw_read = [](unsigned long long*sum,unsigned long*n){ FILE*f; *sum=0; *n=0;
+        if((f=fopen("/sys/module/rknpu/parameters/hw_ns_sum","r"))){ if(fscanf(f,"%llu",sum)!=1)*sum=0; fclose(f);}
+        if((f=fopen("/sys/module/rknpu/parameters/hw_n","r"))){ if(fscanf(f,"%lu",n)!=1)*n=0; fclose(f);} };
     const float * xf = (const float *) x->data;
     float amx=1e-9f; for (int k=0;k<K;k++){ float a=fabsf(xf[k]); if(a>amx)amx=a; }
     const float a_scale=amx/127.0f, ainv=127.0f/amx;
+
+    /* PRECOMPILED FAST PATH. One-time per layer: persistent A buffers, DMA outputs, and two compiled
+     * chains ([gate,up] and [down]). Per call: quantise into the persistent A, run, host-silu, run,
+     * dequant — no regcmd synth, no validate, no K-slice accumulate. Falls through to the generic path
+     * below whenever compile refuses the shape (K%512, K>4096, Sn>1, no DMA output), so an unsupported
+     * model loses nothing. ORK_FFN_NO_PC forces the generic path for A/B. */
+    /* OPT-IN (ORK_FFN_PC=1) until proven safe. The first integration of this HARD-WEDGED the board — no
+     * ping, recovered only by a plug power-cycle — and although the cause was found elsewhere (task
+     * descriptors placed in on-chip SRAM, a kernel-read buffer; ork_pc now keeps its descriptors in DRAM),
+     * a path that has wedged the board once does not get to be the default on the strength of a single
+     * clean run. Flip it after it has survived repeated suite passes. */
+    if (getenv("ORK_FFN_PC")) {
+        auto & pcl = ctx->ffn_pc[(const void *) Wg->data];
+        if (!pcl.tried) {
+            pcl.tried = true; pcl.K = K; pcl.Nff = Nff; pcl.Kd = Kd;
+            pcl.xi   = (int8_t *)  malloc((size_t) K);
+            pcl.glu8 = (int8_t *)  malloc((size_t) Nff);
+            pcl.glf  = (float *)   malloc((size_t) Nff * 4);
+            pcl.gm   = (int32_t *) malloc((size_t) Nff * 4);
+            pcl.um   = (int32_t *) malloc((size_t) Nff * 4);
+            pcl.dm   = (int32_t *) malloc((size_t) Kd  * 4);
+            pcl.gi = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Nff * 4);
+            pcl.ui = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Nff * 4);
+            pcl.di = (int32_t *) ork_dma_alloc(ctx->npu, (size_t) Kd  * 4);
+            if (pcl.xi && pcl.glu8 && pcl.glf && pcl.gm && pcl.um && pcl.dm && pcl.gi && pcl.ui && pcl.di) {
+                memset(pcl.xi, 0, (size_t) K); memset(pcl.glu8, 0, (size_t) Nff);
+                ork_mm_task_i8 tgu[2] = { { wg, 1, pcl.xi, pcl.gi }, { wu, 1, pcl.xi, pcl.ui } };
+                ork_mm_task_i8 tdn    = { wd, 1, pcl.glu8, pcl.di };
+                pcl.gu = ork_pc_compile(ctx->npu, 2, tgu);
+                pcl.dn = ork_pc_compile(ctx->npu, 1, &tdn);
+            }
+            static int once = 0;
+            if (!once++) fprintf(stderr, "[ork-ffn-PC] precompiled decode chains %s (K=%d Nff=%d Kd=%d)\n",
+                                 (pcl.gu && pcl.dn) ? "COMPILED" : "REFUSED — using the generic path", K, Nff, Kd);
+        }
+        if (pcl.gu && pcl.dn && pcl.K == K && pcl.Nff == Nff && pcl.Kd == Kd) {
+            _t = fprof ? ork_now_us() : 0;
+            for (int k=0;k<K;k++){ int q=(int)lrintf(xf[k]*ainv); pcl.xi[k]=(int8_t)(q>127?127:q<-127?-127:q); }
+            if (fprof) { p_q += ork_now_us()-_t; _t = ork_now_us(); }
+            if (ork_pc_run(pcl.gu) < 0) goto pc_fail;
+            if (fprof) { p_gu += ork_now_us()-_t; _t = ork_now_us(); }
+            memcpy(pcl.gm, pcl.gi, (size_t) Nff * 4);      /* burst out of uncached DMA, then work cached */
+            memcpy(pcl.um, pcl.ui, (size_t) Nff * 4);
+            { float gmax=1e-9f;
+              for (int n=0;n<Nff;n++){ float g=(float)pcl.gm[n]*a_scale*bsg[n], u=(float)pcl.um[n]*a_scale*bsu[n];
+                  float v=(g/(1.0f+expf(-g)))*u; pcl.glf[n]=v; float av=fabsf(v); if(av>gmax)gmax=av; }
+              const float gs=gmax/127.0f, ginv=127.0f/gmax;
+              for (int n=0;n<Nff;n++){ int q=(int)lrintf(pcl.glf[n]*ginv); pcl.glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
+              if (fprof) { p_host += ork_now_us()-_t; _t = ork_now_us(); }
+              if (ork_pc_run(pcl.dn) < 0) goto pc_fail;
+              if (fprof) { p_dn += ork_now_us()-_t; _t = ork_now_us(); }
+              memcpy(pcl.dm, pcl.di, (size_t) Kd * 4);
+              float * dst=(float*)down_n->data;
+              for (int j=0;j<Kd;j++) dst[j]=(float)((double)pcl.dm[j]*gs*bsd[j]);
+              if (fprof) p_deq += ork_now_us()-_t;
+            }
+            if (fprof) { p_n++; if (p_n%64==0) fprintf(stderr,
+                "[ork-ffn-PC-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus host-silu %.0fus Down %.0fus deq %.0fus | %.0fus/layer\n",
+                p_n, p_q/p_n, p_gu/p_n, p_host/p_n, p_dn/p_n, p_deq/p_n, (p_q+p_gu+p_host+p_dn+p_deq)/p_n); }
+            return true;
+        }
+    }
+    pc_fail:;
     int8_t  *xi  =(int8_t*) malloc((size_t)K);
     int32_t *gi  =(int32_t*)malloc((size_t)Nff*4), *ui=(int32_t*)malloc((size_t)Nff*4);
     int8_t  *glu8=(int8_t*) malloc((size_t)Nff);
@@ -4967,8 +7213,13 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
       const float gs=gmax/127.0f, ginv=127.0f/gmax;
       for (int n=0;n<Nff;n++){ int q=(int)lrintf(glf[n]*ginv); glu8[n]=(int8_t)(q>127?127:q<-127?-127:q); }
       if(fprof){ p_host+=ork_now_us()-_t; _t=ork_now_us(); }
+      if(fprof){ ork_npu_db_reset(); hw_zero(); }
       if (ork_i8_mm_run(ctx->npu, wd, 1, glu8, di)) goto done;                                            // down: ONE submit (wide-K)
-      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us(); }
+      if(fprof){ p_dn+=ork_now_us()-_t; _t=ork_now_us();
+                 double _b=0,_e=0; long _bn=0,_en=0; ork_npu_db_timing(&_b,&_bn,&_e,&_en);
+                 d_beg+=_b; d_bn+=_bn; d_end+=_e; d_en+=_en;
+                 unsigned long long _hs=0; unsigned long _hn=0; hw_read(&_hs,&_hn); d_hw+=_hs; d_hn+=_hn;
+                 d_poll += ork_npu_db_poll(); }
       float * dst=(float*)down_n->data;
       for (int j=0;j<Kd;j++) dst[j]=(float)((double)di[j]*gs*bsd[j]);
       if(fprof) p_deq+=ork_now_us()-_t;
@@ -4976,6 +7227,15 @@ static bool ggml_backend_ork_ffn_decode_orkd(ggml_backend_ork_context * ctx,
     ok=true;
     if(fprof){ p_n++; if(p_n%64==0){ double T=p_q+p_gu+p_host+p_dn+p_deq; if(T<1)T=1;
         double gub=(double)2*K*Nff, dnb=(double)Nff*Kd;   // resident weight bytes streamed (int8)
+        /* DOORBELL PHASE SPLIT. The GB/s above is NOT pure DMA: a probe at the same shapes shows 62% of
+         * an M=1 call is host-side (regcmd synth + bsync + ioctl) and only 38% is the sentinel poll, i.e.
+         * ~19 GB/s of real hardware bandwidth already. So the handler's shortfall has to show up as
+         * either a bigger `begin` (host) or a bigger `end` (poll) — this prints which. */
+        if(d_bn) fprintf(stderr,"[ork-ffn-DOWN-ONLY] begin=%.1f  end(poll)=%.1f us/call | KERNEL hw=%.1f us/job over %lu jobs (%.1f jobs/call, hw/call=%.1f) | end split: WAIT=%.1f  post(drain+accum+writeback)=%.1f\n",
+                         d_beg/d_bn, d_en?d_end/d_en:0.0, d_hn?(double)d_hw/d_hn/1000.0:0.0, d_hn,
+                         (double)d_hn/d_bn, (double)d_hw/d_bn/1000.0,
+                         d_poll/d_bn, (d_end - d_poll)/d_bn);
+        d_beg=d_end=d_poll=0; d_bn=d_en=0; d_hw=0; d_hn=0;
         fprintf(stderr,"[ork-ffn-PROF] calls=%ld | Qquant %.0fus Gate+Up %.0fus(%.1fGB/s) host-silu %.0fus Down %.0fus(%.1fGB/s) deq %.0fus | %.0fus/layer\n",
             p_n, p_q/p_n, p_gu/p_n, gub/(p_gu/p_n*1e3), p_host/p_n, p_dn/p_n, dnb/(p_dn/p_n*1e3), p_deq/p_n, T/p_n); } }
     { static long n=0; if((n++%256)==0) fprintf(stderr,"[ork-ffn-dec] per-channel decode FFN on NPU (call %ld): K=%d Nff=%d Kd=%d\n", n,K,Nff,Kd); }
@@ -6176,7 +8436,77 @@ static struct ork_attn_pool * attn_pool_ensure(ggml_backend_ork_context * ctx, i
                 adom, DK, DV, N, nkvp, H, ctx->attnp.size());
     return P;
 }
-// Resident-KV variant of the int8 decode attention (ORK_ATTN_KV): instead of packing K^T/V every call
+// DECODE-ATTENTION GATE.
+//
+// The int8 decode attention path is AUTOMATIC now, not opt-in, but only above a live-KV-length
+// threshold, because below it the CPU genuinely wins. MEASURED on RK3588 (ork-driver
+// attn_decode_bench_probe for timing + chainrr_biased_probe for accuracy; 16 heads, HD=128, per-token
+// attention cost) against an fp32 *vectorisable* CPU reference:
+//
+//     L      CPU fp32   fused chain   ratio
+//     512      1.90        2.38       0.80x   CPU wins
+//     1024     3.72        2.71       1.37x
+//     1536     5.54        3.18       1.74x
+//     2048     7.38        3.52       2.10x
+//     3072    11.04        4.34       2.54x
+//
+// Two things to know before touching the threshold. (a) Compare against the fp32 reference, NOT the
+// naive scalar double loop the probe used to use -- that flatters the NPU about 2x and put the apparent
+// crossover at L~2400 when it is really ~760. (b) L is constrained to MULTIPLES OF 512: the chain's
+// K%512 rule applies to the reduce and e.V weights, whose K *is* L, and 768/1280/1792 all refuse with
+// rc=-3. So 1024 is the first legal winning length.
+//
+// The threshold is 1024 by deliberate choice, and its worst case is THIN. Resident KV runs the matmuls
+// at the ALLOCATED Lmax, not the live length, so just past a 512 boundary (live 1025 -> Lmax 1536) the
+// margin is ~1.17x rather than 1.37x. Gating at 1536 would hold >=1.57x everywhere; 1024 was chosen to
+// capture the 1024-1535 range, where the path still wins, just narrowly. It is one constant.
+//
+// The gate is applied to the LIVE kv length inside the handler, not in supports_op -- supports_op only
+// sees k->ne[1], the PADDED cache width, which stays constant as tokens fill the cache. Gating on that
+// would engage the NPU at a live length of 10 against a 2048-wide cache. When the handler declines,
+// graph_compute falls back to ork_cpu_delegate_node, which is the designed escape.
+static int ork_attn_dec_min_nkv(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ORK_ATTN_DEC_MIN"); v = e ? atoi(e) : 1024; if (v < 1) v = 1; }
+    return v;
+}
+// OPT-IN, and it must stay opt-in until something changes structurally. MEASURED END-TO-END on
+// qwen3-0.6b-f16 (28 layers, H=16, Hkv=8, HD=128), ork_bench decode tok/s, FA enabled both sides:
+//
+//     prompt   path off   path on
+//      1024      11.31      3.57   0.32x
+//      2048       7.69      1.37   0.18x
+//      4096       7.61      1.38   0.18x
+//
+// So this path is a 3-5x DECODE REGRESSION at every length, and it gets worse as context grows -- the
+// exact opposite of what the ork-driver microbenchmark predicted (attn_decode_bench_probe had the fused
+// chain at 1.36-2.84x from L=1024 up). Two reasons the microbenchmark was wrong, both worth knowing
+// before anyone re-derives this:
+//
+//   1. DISPATCH COUNT. The probe timed ONE dispatch of 16 chains and that got compared against one
+//      layer's attention. A real model needs one dispatch PER LAYER -- 28 of them per token here, with
+//      Hkv=8 chains of Nq=2 each -- because layer N's attention depends on layer N-1's output. The
+//      fixed per-dispatch cost is paid 28x per token and cannot be batched away.
+//   2. THE CPU REFERENCE WAS STILL TOO SLOW. Even the "honest" fp32 vectorisable loop in the probe is
+//      much slower than ggml's real attention kernels. The giveaway is in the baseline above: CPU
+//      decode is FLAT from 2048 to 4096 (7.69 -> 7.61), so attention is a small fraction of CPU decode
+//      time at these lengths. There was very little to win and a large dispatch tax to pay.
+//
+// The code is kept, correct, and default-off rather than deleted: the length gate, the resident-KV
+// append and the direct-mode chain route are all sound and independently useful, and the economics
+// could change with far more heads per layer, a much lower submit floor, or a fused path that spans
+// layers. But do NOT enable this expecting a win, and do not trust a single-dispatch microbenchmark
+// for a per-layer op again -- measure with ork_bench.
+//
+// Sense of the knob: ORK_ATTN_DEC=1 ENABLES. An earlier knob in this file got the inverse wrong (=0
+// still enabled it), so compare the value, never just presence.
+static bool ork_attn_dec_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("ORK_ATTN_DEC"); v = (e && e[0] != '0') ? 1 : 0; }
+    return v != 0;
+}
+
+// Resident-KV variant of the int8 decode attention (default): instead of packing K^T/V every call
 // (the O(nkv)/token repack tax that makes the default path perf-negative), pack ONCE per (layer, kv-head)
 // via ork_kv_resident_alloc, then append just the new key/value each token (ork_kv_append — one tile write,
 // no repack). Keyed on k->data (the per-layer K-cache view base, stable across decode steps). Per-head int8
@@ -6185,7 +8515,10 @@ static struct ork_attn_pool * attn_pool_ensure(ggml_backend_ork_context * ctx, i
 static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
     const int DK=(int)q->ne[0], H=(int)q->ne[2], nkv_pad=(int)k->ne[1], Hkv=(int)k->ne[2], DV=(int)v->ne[0];
-    const int rk2 = H/Hkv, Kp=512, LmaxCap=2048;   // cap matches the supports_op gate (nkv<=2048); RK3588 nmax=8192
+    // Cap is the hardware limit (ork_kv_resident_alloc requires Lmax<=soc->nmax, 8192 on RK3588), NOT
+    // 2048. It used to be 2048 to "match the supports_op gate", but that gate bounded the PADDED cache
+    // width, so any model with n_ctx>2048 could never reach this path at all.
+    const int rk2 = H/Hkv, Kp=512, LmaxCap=8192;
     if (DK!=DV || DK>Kp || nkv_pad>LmaxCap || nkv_pad<1) return false;   // API bundles ONE HD for K^T & V; single N-tile
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
@@ -6204,12 +8537,20 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
         nkv = 0; for (int j=0;j<nkv_pad;j++) if (mval(j) > -1e30f) nkv = j+1;
     }
     if (nkv < 1 || nkv > LmaxCap) return false;
+    // THE GATE. Below this the CPU is faster (see the table above); decline and let
+    // ork_cpu_delegate_node handle the node. This is the live length, so it engages mid-generation as
+    // the context grows and stops being used if the sequence is reset to something shorter.
+    if (nkv < ork_attn_dec_min_nkv()) return false;
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-kv] resident decode: live_nkv=%d (pad=%d) H=%d Hkv=%d DK=%d\n", nkv, nkv_pad, H, Hkv, DK); }
     auto & LY = ctx->attn_kv[(const void*)k->data];
     // ORK_ATTN_FUSED: run the whole attention core as Hkv fused chains fanned RR across cores in ONE orkd
     // round-trip (vs the 2-submit QK^T + host-softmax + e.V path). Needs GLOBAL K/Q scales (the RR dispatch
     // shares one exp LUT) + a resident ones[Lmax,32] reduce weight.
-    static int fused_env=-1; if(fused_env<0) fused_env=getenv("ORK_ATTN_FUSED")?1:0;
+    // Fused chain is the DEFAULT: measured 2.09-2.54x faster than the 2-submit host-softmax path,
+    // because it removes the host round-trip (read [1,L] scores back, softmax in fp, requantise,
+    // resubmit) rather than any FLOP saving. ORK_ATTN_FUSED=0 forces the 2-submit path for A/B.
+    static int fused_env=-1;
+    if(fused_env<0){ const char*e=getenv("ORK_ATTN_FUSED"); fused_env=(e&&e[0]=='0')?0:1; }
     // (re)alloc on first touch, a sequence reset (cache shrank), a head-count change, OR growth past the
     // current resident width. Lmax is sized to the live nkv rounded to a 512-chunk (NOT the 2048 cap) so the
     // QK^T/e.V matmuls stream only ~nkv-wide weights (weight-DMA-bound) instead of always 2048 — growth
@@ -6279,8 +8620,16 @@ static bool ggml_backend_ork_flash_attn_decode_kv(ggml_backend_ork_context * ctx
             for(int h=0;h<H;h++){ int hkv=h/rk2, qh=h%rk2; int8_t *dq=Qall+((size_t)hkv*rk2+qh)*Kp2;
                 for(int e=0;e<DK;e++) dq[e]=(int8_t)lrintf(rdf(q,e,0,h,0)*(float)qs); }
             _pt=aprof?ork_now_us():0;
-            int rc=ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
-                                       r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
+            // Pick the entrypoint that matches how we own the NPU. ork_mm_attn_rr_orkd is a transport
+            // shim: it REQUIRES ctx->npu->daemon and returns -3 without one. Calling it unconditionally
+            // meant in-process (direct) runs fell back to the 2-submit host-softmax path on every decode
+            // step — measured ~2.4x slower than the fused chain, which turned this whole path into a
+            // 3.3x end-to-end decode regression (11.31 -> 3.42 tok/s) while looking like it "worked".
+            int rc = ctx->via_orkd
+                   ? ork_mm_attn_rr_orkd(c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                         r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall)
+                   : ork_i8_attn_run_rr (c, Hkv, wkt.data(), LY.ones, wv.data(), Nq, Nk, Kp2, dv,
+                                         r_mult, r_shift, insc, out_scale, biasv, Qall, ssall, avall);
             if(aprof) a_qk+=ork_now_us()-_pt;
             if(rc==0){
                 double epad=exp((0.0-biasv)*insc)/out_scale; long ep=lround(epad); if(ep<0)ep=0; if(ep>127)ep=127;
@@ -6357,7 +8706,10 @@ static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, s
     { static long n=0; if ((n++ % 256)==0) fprintf(stderr,"[ork-attn-dec] NPU decode attention engaged (call %ld): H=%d Hkv=%d DK=%d DV=%d nkv=%d\n", n, H, Hkv, DK, DV, nkv); }
     // ORK_ATTN_KV: resident-KV (pack-once + append/token) — the perf path. ORK_ATTN_KV_REPACK forces the
     // per-call repack below (default) for A/B. Resident needs DK==DV (the ork_kv_* API bundles one HD).
-    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : (getenv("ORK_ATTN_KV") ? 1 : 0);
+    // Resident KV is the DEFAULT. The per-call repack below is kept only for A/B
+    // (ORK_ATTN_KV_REPACK=1) and is PERF-NEGATIVE: measured 169-308x the cost of an append, and
+    // 68-96% of the whole per-step cost, which is what made on-NPU decode attention lose outright.
+    static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : 1;
     if (kv_res && DK==DV) return ggml_backend_ork_flash_attn_decode_kv(ctx, dst);
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
@@ -6619,6 +8971,166 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     return true;
 }
 
+/* OP-LESS PRELOAD (Tier 15 stage 3). Materialise every pack-owned weight into its planned domain WITHOUT
+ * running a graph: no ops, no submits, no warmup decode. Call after model load; when it returns, the model
+ * is resident and a benchmark can start its clock.
+ *
+ * Why this exists: residence used to be a side effect of the first matmul that happened to touch a weight,
+ * so the load landed inside whatever the caller was timing. On Qwen3.6-27B G=512 that made a single-window
+ * perplexity run report 220 s "scored" of which essentially all was weight load (30/30 profiler frames in
+ * ork_i4a8_mm_load_tiled), compared against a CPU control that mmaps an already-native gguf and pays
+ * nothing equivalent.
+ *
+ * Loads in the PLANNED order (layer, name) rather than graph order, so residence walks domains the way the
+ * placement plan laid them out. Returns the number of weights made resident. */
+extern "C" int ggml_backend_ork_preload(void) {
+    ggml_backend_ork_context * ctx = g_ork_ctx;
+    if (!ctx || ctx->preload_done) return 0;
+    if (ctx->persist_mode != 1) return 0;   /* read mode only: nothing to preload while BUILDING a pack */
+    ctx->preload_done = 1;                       /* stop the registry growing while we walk it */
+    if (ctx->preload_reg.empty()) return 0;
+    const double t0 = ork_now_us_e();
+
+    std::vector<const struct ggml_tensor *> order = ctx->preload_reg;
+    std::sort(order.begin(), order.end(), [ctx](const struct ggml_tensor * a, const struct ggml_tensor * b) {
+        auto pa = ctx->placement.find(a->name), pb = ctx->placement.find(b->name);
+        const int da = pa == ctx->placement.end() ? 1 << 28 : pa->second;
+        const int db = pb == ctx->placement.end() ? 1 << 28 : pb->second;
+        if (da != db) return da < db;            /* domain-major: fill each domain before moving on */
+        return strcmp(a->name, b->name) < 0;
+    });
+
+    /* FUSION-AWARE: resolve what the OP PATH will ask for, not what the registry lists.
+     *
+     * The int8 op path concatenates same-input matmuls into one K x Ntot group weight and caches it under
+     * its FIRST MEMBER'S data pointer. Preloading that member per-tensor therefore populated the group's
+     * key with the wrong shape, and the group path used it -- silently, until the shape check above.
+     * With the check, a per-tensor preload of a fusible weight is merely WASTED (built, then discarded and
+     * rebuilt at first prefill), which throws away the residency preload exists to provide.
+     *
+     * The pack already records the grouping: the group path persists each fused weight under the synthetic
+     * name "<first-member>#grp<ng>x<Ntot>". So in READ mode the grouping is knowable BEFORE any graph runs
+     * -- map first-member name -> fused N, and preload the fused geometry under that member's pointer.
+     * Both routes then agree by construction, and the shape check stays as the backstop that made the
+     * disagreement visible in the first place. */
+    std::unordered_map<std::string, int> fused_n;      /* first-member name -> fused Ntot */
+    for (const auto & pe : ctx->persist_idx) {
+        const std::string & nm = pe.first;
+        const size_t h = nm.find("#grp");
+        if (h == std::string::npos) continue;
+        const size_t x = nm.find('x', h + 4);
+        if (x == std::string::npos) continue;
+        const int ntot = atoi(nm.c_str() + x + 1);
+        if (ntot > 0) fused_n[nm.substr(0, h)] = ntot;
+    }
+    if (!fused_n.empty()) fprintf(stderr, "[ork READY] %zu fused group weight(s) in the pack — preloading the CONCATENATED geometry\n", fused_n.size());
+
+    int n_ok = 0, n_fail = 0, n_fused = 0, n_skip = 0;
+    for (const struct ggml_tensor * w : order) {
+        const int K = (int) w->ne[0], N = (int) w->ne[1];
+        if (ctx->wcache.count(w->data)) { n_ok++; continue; }          /* already resident */
+        /* This weight is a group's first member: preload the FUSED entry under its pointer instead. */
+        auto fit = fused_n.find(w->name);
+        if (fit != fused_n.end()) {
+            char gname[256];
+            snprintf(gname, sizeof gname, "%s#grp", w->name);
+            std::string want;                                   /* find the full synthetic name again */
+            for (const auto & pe : ctx->persist_idx)
+                if (pe.first.compare(0, strlen(gname), gname) == 0) { want = pe.first; break; }
+            auto pg = want.empty() ? ctx->persist_idx.end() : ctx->persist_idx.find(want);
+            if (pg != ctx->persist_idx.end() && pg->second.dtype == ORKPACK_DT_I8) {
+                const orkpack_entry & e = pg->second;
+                const char * blob = (const char *) ctx->persist_map + e.blob_off;
+                ork_weight ow;
+                int _dom = ork_weight_domain(ctx, (size_t) e.K * e.N, ork_layer_of(w->name));
+                ork_npu_set_pack_domain(ctx->npu, _dom);
+                for (;;) {
+                    ow.w = ork_i8_mm_load_import(ctx->npu, (int) e.K, (int) e.N, blob, e.blob_size);
+                    if (!ow.w) ow.w = ork_i8_mm_load(ctx->npu, (int) e.K, (int) e.N, blob, e.blob_size);
+                    if (ow.w || (_dom = ork_domain_advance(ctx)) < 0) break;
+                }
+                if (ow.w) {
+                    const float * bs = (const float *) ((const char *) ctx->persist_map + e.bscale_off);
+                    ow.bscale.assign(bs, bs + e.bscale_n);
+                    ow.bytes = ork_w_bytes(ow.w); ctx->wcache_bytes += ow.bytes;
+                    if (ctx->n_domains > 1 && _dom < 64) ctx->domain_bytes[_dom] += ow.bytes;
+                    ctx->wcache.emplace(w->data, std::move(ow));
+                    n_ok++; n_fused++; continue;
+                }
+            }
+            /* Could not preload the fused form: leave the key EMPTY rather than fill it with the
+             * per-tensor weight the group path would have to throw away. */
+            n_skip++; continue;
+        }
+        auto pit = ctx->persist_idx.find(w->name);
+        if (pit == ctx->persist_idx.end()) { n_fail++; continue; }
+        const uint32_t dt = pit->second.dtype;
+        /* ROUTE BY STORED DTYPE, exactly as the op path does. Getting this wrong is not a slow path, it is
+         * a destructive one: a first version sent every weight through ork_resolve_weight_i8, so the
+         * native-W4A4 ones missed their loader and were COLD-PACKED as int8 instead of read from the pack
+         * -- twice the bytes, no pack reuse. It filled domain 6 to the 3900 MiB IOVA cap and the process
+         * was OOM-killed. On a miss, count it and move on; never cold-pack here, since preload runs before
+         * anything has asked for the weight and a 400-weight repack is not a fallback. */
+        if (dt == ORKPACK_DT_I4_NATIVE || dt == ORKPACK_DT_I8_ROT || dt == ORKPACK_DT_I4_ROT_A8) {
+            /* SAME function the op path uses (see ork_resolve_weight_i4native), with cold-packing refused:
+             * preload runs before anything asked for the weight, so a miss is a miss, not a repack. */
+            auto it = ork_resolve_weight_i4native(ctx, w, w->data, K, N, /*allow_cold_pack=*/false);
+            if (it == ctx->wcache.end()) n_fail++; else n_ok++;
+        } else {
+            const struct ggml_type_traits * tr = ggml_get_type_traits(w->type);
+            if (!tr || !tr->to_float) { n_fail++; continue; }
+            auto it = ork_resolve_weight_i8(ctx, w, K, N, w->nb[1], w->type, tr->to_float, /*allow_evict=*/false);
+            if (it == ctx->wcache.end()) n_fail++; else n_ok++;
+        }
+    }
+    const double secs = (ork_now_us_e() - t0) / 1e6;
+    size_t tot = 0; for (int d = 0; d < (ctx->n_domains > 0 ? ctx->n_domains : 1); d++) tot += ctx->domain_bytes[d];
+    fprintf(stderr, "[ork READY] preloaded %d/%zu pack-owned weights in %.1f s — %.2f GiB across %d domain(s)"
+                    " (%d fused-group, %d deferred to the op path)\n",
+            n_ok, order.size(), secs, tot / (1024.0*1024.0*1024.0), ctx->n_domains > 0 ? ctx->n_domains : 1,
+            n_fused, n_skip);
+    /* A miss is not cosmetic: that weight loads lazily inside the caller's timed region, which is the whole
+     * failure this pass removes. */
+    if (n_fail) fprintf(stderr, "[ork READY] WARNING: %d weights did not preload — they will load lazily "
+                                "inside your timed region and inflate it\n", n_fail);
+    fflush(stderr);
+    return n_ok;
+}
+
+// ---- RESIDENCE ACCOUNTING + READINESS QUERY (Tier 15 stage 3) ----------------------------------
+// Weights are still materialized lazily (see the note in buffer_set_tensor for why an eager hook is not
+// reachable until ork owns the weight buffers). What IS available now is honest accounting of what is
+// resident, so a benchmark can load, wait, query, and only then start its clock -- instead of timing
+// through a load. That distinction is not cosmetic: on Qwen3.6-27B G=512 a single-window run reported
+// 220 s "scored" of which essentially all was weight load and int4->int8 inflate (30/30 profiler frames in
+// ork_i4a8_mm_load_tiled), and it was compared against a CPU control that pays no such cost.
+//
+// The event rides GGML_LOG_INFO -- the ecosystem's existing log stream -- rather than a bespoke channel.
+// Once the orkpack-native loader lands, residence happens inside model load and llama_progress_callback
+// covers it, at which point this collapses into the standard path.
+// Answer from the wcache itself. Deliberately NOT per-site counters: the int8 resolve and the
+// i4/hadamard path keep separate find/emplace sites (and there are ~10 of them), so any hand-placed tally
+// under-reports the moment a path is added -- an early version of this reported "0 weights" on a run with
+// 400 resident, because it only instrumented the int8 resolve. The cache is the one structure every path
+// must update to work at all, so it cannot silently drift. Timing is the CALLER's business: it knows when
+// it started loading; the backend only knows what is resident now.
+extern "C" void ggml_backend_ork_residence(int * n_weights, size_t * bytes) {
+    const ggml_backend_ork_context * c = g_ork_ctx;
+    if (n_weights) *n_weights = c ? (int) c->wcache.size() : 0;
+    if (bytes)     *bytes     = c ? c->wcache_bytes : 0;
+}
+
+// Log what is resident, once, on request. Returns 1 if anything is.
+extern "C" int ggml_backend_ork_residence_report(void) {
+    const ggml_backend_ork_context * c = g_ork_ctx;
+    if (!c || c->wcache.empty()) return 0;
+    size_t tot = 0; for (int d = 0; d < (c->n_domains > 0 ? c->n_domains : 1); d++) tot += c->domain_bytes[d];
+    GGML_LOG_INFO("%s: ork READY — %d weights resident, %.2f GiB (%.2f GiB across %d domain(s))\n", __func__,
+                  (int) c->wcache.size(), c->wcache_bytes / (1024.0*1024.0*1024.0),
+                  tot / (1024.0*1024.0*1024.0), c->n_domains > 0 ? c->n_domains : 1);
+    return 1;
+}
+
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
@@ -6674,8 +9186,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // DECODE tg32 7.00->7.02 (neutral). It only pays off with enough work to amortize the wider
     // matmul+scatter: at M=1 decode that cost exceeds the saved submits (prior measurement: decode
     // 9.4->6.4), so we gate fusion to M>=32 (prefill) — decode stays unfused = bit-identical to baseline.
-    // Default-ON for prefill; ORK_NO_FUSE disables entirely; ORK_FUSE forces fusion at ALL M (experiments).
-    const bool fuse_force = getenv("ORK_FUSE") != nullptr;
+    // Default-ON for prefill; ORK_NO_FUSE disables entirely. (ORK_FUSE, which forced fusion at ALL M, is
+    // gone: it only bypassed the fuse_minm floor, which ORK_FUSE_MINM=1 already does, and the one thing it
+    // uniquely enabled -- fusing decode M=1 -- is measured WORSE (tg 9.4 -> 6.4). Two knobs for one job,
+    // the redundant one wired to a known-bad config.)
     // orkd: group fusion is daemon-routed — it packs a CONCATENATED weight via ork_i8_mm_pack and runs it as
     // ONE ork_i8_mm_run (host A/C), so it works through the daemon AND amortizes the per-matmul submit floor
     // (q/k/v, gate/up -> 1 submit). Enabled under orkd.
@@ -6686,7 +9200,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
     // orkd: the FFN SwiGLU chain stays disabled — it uses fd-local run_i8_silu / run_f16_silu + the GU_CHAIN
     // DMA scratch (not daemon-routed). The generic MUL_MAT chain (below) IS routed and stays on.
     const bool ffn_chain = ork_ffn_chain_on() && ctx->qbits == 8 && !ctx->via_orkd;
-    const bool ffn_dec = getenv("ORK_FFN_DEC") != nullptr && ctx->qbits == 8 && ctx->via_orkd;   // decode FFN via fused orkd chain
+    // ORK_FFN_DEC: the fused M==1 SwiGLU decode chain. It used to require ctx->via_orkd, which made it
+    // unreachable in the DEFAULT in-process mode — so the one M=1-optimised FFN path existed only under the
+    // multi-process arbitration daemon, which is not a performance mechanism. Nothing in the handler needs a
+    // daemon: it calls ork_i8_mm_run_chain / ork_i8_mm_run against ork_w* the wcache already holds, both
+    // mode-agnostic. (Its name still says _orkd; that is now a misnomer.) Same defect as the fused attention
+    // chain calling the daemon-only ork_mm_attn_rr_orkd unconditionally.
+    const bool ffn_dec = ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED && ctx->qbits == 8;
     if (getenv("ORK_VERBOSE")) { static int once = 0; if (!once++)
         fprintf(stderr, "[FFN-CHAIN gate] ffn_chain=%d (chain_on=%d qbits=%d n_domains=%d domain_layers=%d)\n",
                 ffn_chain, ork_ffn_chain_on(), ctx->qbits, ctx->n_domains, ctx->domain_layers); }
@@ -6715,7 +9235,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
         if (scan_ahead && !sa_done.empty() && sa_done.count(node)) continue;   // computed early by a scan-ahead group
         // ORK_FFN_DEC: DECODE (M==1) SwiGLU inner via the fused orkd chain (one submit against the resident
         // weights). Fires at the gate node; the matcher takes up from glu->src[1] and consumes glu/down.
-        if (ffn_dec && ctx->via_orkd && node->op == GGML_OP_MUL_MAT && node->src[0] &&
+        if (ffn_dec && node->op == GGML_OP_MUL_MAT && node->src[0] &&
             strstr(node->src[0]->name, "ffn_gate") && node->ne[1] == 1) {
             struct ggml_tensor *g,*u,*gl,*dn; int last;
             if (ork_ffn_chain_match(cgraph, i, &g, &u, &gl, &dn, &last) &&
@@ -6797,8 +9317,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 if (chain_nodes.size() >= 2) {
                     bool chain_ok = false;
                     if (type == ORK_CHAIN_I8) {
+                        ork_route_stat("chain_i8"); for (size_t z=1;z<chain_nodes.size();z++) ork_route_stat("chain_i8");
                         chain_ok = ggml_backend_ork_mul_mat_chain_i8(ctx, chain_nodes.data(), chain_nodes.size());
                     } else if (type == ORK_CHAIN_I4) {
+                        ork_route_stat("chain_i4"); for (size_t z=1;z<chain_nodes.size();z++) ork_route_stat("chain_i4");
                         chain_ok = ggml_backend_ork_mul_mat_chain_i4(ctx, chain_nodes.data(), chain_nodes.size());
                     }
                     if (!chain_ok) return GGML_STATUS_FAILED;
@@ -6815,8 +9337,12 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // at EVERY M>=2 — pp2 +10.8%, pp4 +10.5%, pp8 +8-9%, pp64 +12-17%. At M=1: pp1 is +1% but
                     // autoregressive tg-decode REGRESSES (prior: 9.4->6.4), so the floor is M>=2 (decode M=1 stays
                     // unfused). Covers all prefill + DFlash's M=block batched-verify. ORK_FUSE_MINM overrides.
-                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM")) : 2;
-                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && (fuse_force || node->ne[1] >= fuse_minm)) {
+                    // Default floor 2 keeps decode out; the FUSED route lowers it to 1 so q,k,v and
+                    // gate/up batch at M==1 too (measured +2.8% there). ORK_FUSE_MINM still overrides
+                    // explicitly, for prefill sweeps that have nothing to do with the decode route.
+                    static const int fuse_minm = getenv("ORK_FUSE_MINM") ? atoi(getenv("ORK_FUSE_MINM"))
+                                               : (ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED ? 1 : 2);
+                    if (fuse && node->ne[2] == 1 && node->ne[3] == 1 && node->ne[1] >= fuse_minm) {
                         if (scan_ahead) {
                             // Step 1: scan the WHOLE remaining subgraph for INDEPENDENT same-input matmuls,
                             // skipping past the movable ops (RoPE/reshape/norm) that interleave q/k/v in graph
@@ -6841,7 +9367,30 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             }
                         }
                     }
+                    // STUB SAFETY: group fusion builds ONE fused weight, and on a read pass it either loads a
+                    // fused ".. #grpNxM" entry from the pack or falls back to BUILDING it from the members'
+                    // src[0]->data. On a stub gguf those bytes are file holes that read as zeros, so a missing
+                    // fused entry silently yields an all-zero weight and a subtly wrong model — greedy decoding
+                    // still looks perfect because only the distribution flattens. This is the M>1 twin of the
+                    // hole-leak ork_stub_verify already guards at M==1; that comment even notes perplexity does
+                    // not catch it. The members ARE in the pack individually, so decline the fusion and let each
+                    // node take the single mul_mat path, which resolves from the pack. Non-stub sources and packs
+                    // that do contain the fused entry are untouched, so this costs nothing in the normal case.
+                    if (ng >= 2 && ctx->source_is_stub && ctx->persist_mode == 1) {
+                        int _Ntot = 0; for (int z = 0; z < ng; z++) _Ntot += (int) grp[z]->src[0]->ne[1];
+                        char _gname[256];
+                        snprintf(_gname, sizeof _gname, "%s#grp%dx%d", grp[0]->src[0]->name, ng, _Ntot);
+                        if (!ctx->persist_idx.count(_gname)) {
+                            static std::unordered_set<std::string> _said;
+                            if (_said.insert(_gname).second)
+                                fprintf(stderr, "[ORK STUB] no fused pack entry '%s' and the source is a STUB — "
+                                                "declining group fusion so the members resolve from the pack "
+                                                "(building it from src->data would read holes as zeros)\n", _gname);
+                            ng = 1;   // fall through to the single-node path, which pack-loads each member
+                        }
+                    }
                     if (ng >= 2) {
+                        for (int z = 0; z < ng; z++) ork_route_stat(grp_tier == 4 ? "group_i4" : "group_i8");
                         bool grp_ok = (grp_tier == 4) ? ggml_backend_ork_mul_mat_group_i4(ctx, grp, ng)
                                                       : ggml_backend_ork_mul_mat_group_i8(ctx, grp, ng);
                         if (!grp_ok) return GGML_STATUS_FAILED;
@@ -6879,6 +9428,70 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         // (int4 weights inflated int4->int8 on the NPU — robust, no wedge); compact i4a8 STORAGE is
                         // chosen separately at persist (ork_orkpack_tier).
                         bool native_w4a4 = (target_qbits == 4) && ctx->hadamard;
+                        /* UNROTATED promotion: leave the rotated path entirely so the weight is written
+                         * as plain DT_I8 (mul_mat_i8 quantises from source per-channel, no Hadamard). */
+                        if (native_w4a4 && ctx->persist_mode == 2 && !ork_promote_rotated() && ork_i4_force_i8(name))
+                            native_w4a4 = false;
+
+                        /* BUILD side only (persist_mode 2 = convert). A promoted weight STAYS on the
+                         * rotated path and is written as DT_I8_ROT — it does not leave the rotated regime,
+                         * which is the whole point (see ORKPACK_DT_I8_ROT). At run time the pack decides. */
+
+                        /* THE PACK DECIDES THE ROUTE, per weight.
+                         *
+                         * ORK_QUANT / ORK_MIXED_W4A4 describe what to BUILD. They must not decide how to RUN
+                         * a weight that already exists on disk at a definite precision — when the two
+                         * disagree the weight is served as one tier and computed as another, which is how a
+                         * strictly-higher-precision config scored WORSE than the tier it was meant to beat.
+                         *
+                         * The format already carries the route per entry, so use it:
+                         *   DT_I4_NATIVE -> W4A4  (rotated int4 weights + int4 activations; the rotation is
+                         *                          intrinsic to the stored bytes, not to an env flag)
+                         *   DT_I4        -> i4a8  (int4 storage inflated to int8; int8 activations, so the
+                         *                          ACTIVATION half of the error is gone at no disk cost)
+                         *   DT_I8        -> W8A8  (int8 weights + int8 activations)
+                         * This is what makes a MIXED-tier pack work: per-layer precision becomes a build
+                         * decision recorded in the file, and scoring needs no env at all. A homogeneous pack
+                         * is unaffected — every entry maps to the route it already took. */
+                        if (ctx->persist_mode == 1) {
+                            auto pit = ctx->persist_idx.find(name);
+                            /* A MISS is the dangerous case: routing silently does nothing and the env decides
+                             * after all, which looks identical to "routing agreed" on a homogeneous pack.
+                             * Say so once, or this cannot be distinguished from working. */
+                            if (pit == ctx->persist_idx.end()) {
+                                static int warned_miss = 0;
+                                if (!warned_miss++) fprintf(stderr,
+                                    "[ORK ROUTE] WARNING: '%s' not in the pack index — falling back to the env "
+                                    "tier. Pack-driven routing is NOT in effect for it.\n", name);
+                            }
+                            if (pit != ctx->persist_idx.end()) {
+                                const uint32_t dt = pit->second.dtype;
+                                /* ROTATED tiers belong on the hadamard path, not mul_mat_i8. DT_I8_ROT and
+                                 * DT_I4_ROT_A8 store a Hadamard-ROTATED weight, and a rotated weight is only
+                                 * correct against rotated ACTIVATIONS -- which only mul_mat_i4_hadamard
+                                 * applies. mul_mat_i8 re-quantises from the SOURCE tensor instead, so it
+                                 * silently ignored the pack's rotated bytes entirely; with a stub gguf that
+                                 * source is a file hole, which is how the 27B rot-i4a8 arm scored 136986.
+                                 * The hadamard path already handles the widened tiers (it dispatches
+                                 * ork_i8_mm_run when ow.wbits == 8), so this is the routing it always
+                                 * needed. */
+                                const bool want_i4n = (dt == ORKPACK_DT_I4_NATIVE ||
+                                                       dt == ORKPACK_DT_I8_ROT   ||
+                                                       dt == ORKPACK_DT_I4_ROT_A8);
+                                static int n_route[3] = {0,0,0}, n_override = 0;
+                                n_route[dt == ORKPACK_DT_I4_NATIVE ? 0 : dt == ORKPACK_DT_I4 ? 1 : 2]++;
+                                if (want_i4n != native_w4a4) n_override++;
+                                native_w4a4 = want_i4n;
+                                static int said = 0;
+                                if (!said++ && (getenv("ORK_ROUTE_STATS") || getenv("ORK_VERBOSE")))
+                                    fprintf(stderr, "[ORK ROUTE] pack-driven routing ACTIVE (first: %s -> %s)\n",
+                                            name, want_i4n ? "W4A4" : dt == ORKPACK_DT_I4 ? "i4a8" : "W8A8");
+                                if (getenv("ORK_ROUTE_STATS") && ((n_route[0]+n_route[1]+n_route[2]) % 100) == 0)
+                                    fprintf(stderr, "[ORK ROUTE] pack-driven: W4A4=%d i4a8=%d W8A8=%d (env overridden %d)\n",
+                                            n_route[0], n_route[1], n_route[2], n_override);
+                            }
+                        }
+                        ork_route_stat(native_w4a4 ? "mul_mat_i4_hadamard" : "mul_mat_i8");
                         bool mm_ok = native_w4a4 ? ggml_backend_ork_mul_mat_i4_hadamard(ctx, node)
                                                  : ggml_backend_ork_mul_mat_i8(ctx, node);
                         if (!mm_ok) return GGML_STATUS_FAILED;
@@ -7066,10 +9679,25 @@ ggml_backend_t ggml_backend_ork_init(void) {
         // and drags prefill (measured: 136 -> 213 t/s at M=228, i.e. faster than orkd's 168 once unpinned). orkd
         // doesn't hit this — its NPU threads live in a separate process. So default direct mode to no-affinity;
         // overwrite=0 leaves an explicit user ORK_NO_AFFINITY untouched.
+        //
+        // REGIME-DEPENDENT, and measured 2026-09-04: this is right for PREFILL and wrong for M=1 DECODE.
+        // The M=1 doorbell runs its host half AND its spin-poll on the calling thread, so leaving it
+        // unpinned cost 1.13x on decode (4.93 -> 5.58 tok/s) and nearly doubled the doorbell's host phase
+        // (655 -> 350us). ork-driver now handles that itself with a SCOPED save/widen/restore around the
+        // doorbell (orki_big_core_mask, which deliberately ignores this flag because a scoped placement
+        // cannot oversubscribe a threadpool the way a lifetime pin does). So this setenv stays as-is — but
+        // do not read it as "affinity never helps"; it means "do not PIN WORKERS for life here".
         setenv("ORK_NO_AFFINITY", "1", 0);
+        if (ork_offline()) {
+            npu = ork_npu_init_offline(ork_offline_soc());   // pack-only: SoC caps, no device
+            if (!npu) { GGML_LOG_ERROR("%s: ORK_OFFLINE=%s is not a known SoC id\n", __func__, ork_offline_soc()); return NULL; }
+            GGML_LOG_INFO("%s: OFFLINE pack mode (soc=%s) — no NPU; int4 compute runs an exact CPU GEMM\n",
+                          __func__, ork_offline_soc());
+        } else {
         npu = ork_npu_init();       // DEFAULT: direct in-process NPU
         if (!npu) { GGML_LOG_ERROR("%s: ork_npu_init failed (no NPU / no perms)\n", __func__); return NULL; }
         GGML_LOG_INFO("%s: in-process lib NPU path (direct — default; single-stream, no concurrent NPU procs)\n", __func__);
+        }
     }
     ggml_backend_ork_context * ctx = new ggml_backend_ork_context;
     ctx->npu = npu;
@@ -7087,13 +9715,14 @@ ggml_backend_t ggml_backend_ork_init(void) {
               if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK FFN-GMAX] loaded %zu-layer gmax profile from %s\n", ctx->gmax_loaded.size(), sp.c_str()); } } }
     // Weight tier. The .orkpack is the normal source of truth: ork_persist_init (above) decoded the tier the
     // pack was BUILT at into persist_qbits, so loading an int4 pack selects the int4 path with nothing set.
-    // ORK_QUANT stays as a DEVELOPMENT OVERRIDE — it forces the tier for a run with no pack yet (the build
-    // pass that CREATES an int4 pack) or to deliberately rebuild at a different tier. With no pack and no
-    // override the default is W8A8.
-    const char * q = getenv("ORK_QUANT");
-    ctx->qbits = (q && *q)         ? ((q[0] == '4') ? 4 : 8)
-               : ctx->persist_qbits ? ctx->persist_qbits
-                                    : 8;
+    // --pack-bits (else ORK_QUANT, the older development spelling) FORCES the tier for a run with no pack
+    // yet (the build pass that CREATES an int4 pack) or to deliberately rebuild at a different tier. With
+    // no pack and no override the default is W8A8. Both spellings arrive via ork_forced_qbits so this
+    // agrees with the signature stamped into the pack — they disagreed, and that was #4.
+    const int fq = ork_forced_qbits();          /* --pack-bits, else ORK_QUANT; 0 = neither */
+    ctx->qbits = fq                    ? fq
+               : ctx->persist_qbits    ? ctx->persist_qbits
+                                       : 8;
     ctx->profile = getenv("ORK_PROFILE") != nullptr;
     if (ctx->profile) atexit(ork_profile_atexit);   // LEVER3: dump under llama-bench (no backend free)
     ctx->no_reuse = getenv("ORK_NOREUSE") != nullptr;
@@ -7171,10 +9800,33 @@ ggml_backend_t ggml_backend_ork_init(void) {
           size_t base = 0, bf_extra = 0;
           for (const auto & kv : ctx->persist_idx) {
               const int K = (int) kv.second.K, N = (int) kv.second.N;
-              size_t tile = (ctx->qbits == 4) ? ((size_t) K * N / 2)   // W4A4: native int4 nibble tile
-                                              : ((size_t) K * N);      // W8A8: int8 tile (incl. inflated q4)
-              base += tile;
-              if (K <= 4096) bf_extra += tile;                         // full-K Bf rebuild (decode fast path only)
+              /* ASK THE DRIVER what this weight will occupy; do not model it here.
+               *
+               * The pack dtype -> RESIDENT WIDTH mapping is ours (it is a pack-format concern, and it is the
+               * same mapping ork_persist_load_i4native applies): DT_I4_NATIVE stays int4 nibbles, everything
+               * else is int8-resident -- DT_I4 and DT_I4_ROT_A8 are int4 ON DISK but INFLATE to int8
+               * containers at load. What those bytes then cost in IOVA -- tile geometry, per-tile page
+               * padding, and whether a full-K Bf companion gets built -- is the DRIVER's business, and
+               * ork_w_resident_bytes is the authority for it.
+               *
+               * This used to be re-derived here, and it drifted twice at once: every entry in a MIXED pack
+               * was sized at one global ctx->qbits (missing the 2x on inflated entries, ~3 GiB on the 27B
+               * ra8 pack), and Bf was gated at K<=4096 where the loaders use K<=10752 (missing a companion
+               * on every 4096<K<=10752 weight, and a 27B is full of K=5120). The consequence is not a
+               * mis-plan: the overflowing domain's IOVA allocation fails, and a failed allocation leaks a
+               * mapping the kernel cannot reclaim until reboot. */
+              const uint32_t dt = kv.second.dtype;
+              const bool i8_resident = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
+                                        dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
+                                       (dt == 0 && ctx->qbits == 8);   /* dt==0: pre-dtype pack, fall back */
+              const int    wbits = i8_resident ? 8 : 4;
+              const size_t tile  = (size_t) K * N / (i8_resident ? 1 : 2);   /* Bb only, for the fp16/chain deltas below */
+              /* Ask both ways: base is the always-resident set, bf_extra the optional full-K companion the
+               * adaptive-Bf decision below weighs against the RAM budget. Both include page padding. */
+              const size_t with_bf = ork_w_resident_bytes(ctx->npu, K, N, wbits, 1);
+              const size_t no_bf_b  = ork_w_resident_bytes(ctx->npu, K, N, wbits, 0);
+              base     += no_bf_b;
+              bf_extra += (with_bf > no_bf_b) ? (with_bf - no_bf_b) : 0;
               if (f16route && (kv.first.find("ffn_gate") != std::string::npos ||
                                kv.first.find("ffn_up")   != std::string::npos ||
                                kv.first.find("ffn_down") != std::string::npos))
@@ -7208,11 +9860,100 @@ ggml_backend_t ggml_backend_ork_init(void) {
            * domains is fine and keeps each domain's IOVA window mostly free for the run scratch. 1 GiB/domain. */
           const size_t cap = (size_t) 1000 * 1024 * 1024;
           long nd = (long) ((inflated + cap - 1) / cap);
-          ctx->n_domains = nd < 1 ? 1 : (nd > 63 ? 63 : (int) nd);   // 63 = owned_dom bitmask ceiling (~155 GiB)
+          /* HARD KERNEL CEILING: RKNPU_MAX_IOMMU_DOMAIN_NUM is 16 (drivers/rknpu/include/rknpu_drv.h), so
+           * valid domain ids are 0..15 and rknpu_iommu_switch_domain() returns -EINVAL for anything above.
+           * The old clamp used 63 -- the orkd owned_dom BITMASK ceiling, which is a different limit -- and
+           * the "many light domains are fine, count limit >> 8" premise above is simply wrong. A 27B pack
+           * (22.66 GiB inflated) asked for 23 domains at 1 GiB each, filled 0..15, then walked off the end:
+           * every allocation past 15 came back EINVAL, which ork_domain_advance reads as "domain full" and
+           * answers by advancing to the NEXT invalid id. Kernel log: "invalid iommu domain id: 16, reuse
+           * domain id: 15". Clamping the COUNT also fixes the fill: n_domains feeds domain_fill_cap below,
+           * so 22.66 GiB over 16 domains targets ~1.48 GiB each -- still far under the ~2.9 GiB IOVA edge
+           * that the headroom clamp protects. */
+          const long ORK_KERNEL_MAX_DOMAINS = 16;   /* RKNPU_MAX_IOMMU_DOMAIN_NUM */
+          if (nd > ORK_KERNEL_MAX_DOMAINS) {
+              fprintf(stderr, "[ORK] footprint %.2f GiB wants %ld domains; the rknpu driver has %ld "
+                              "(ids 0..%ld) — packing %.2f GiB/domain instead\n",
+                      inflated/(1024.0*1024*1024), nd, ORK_KERNEL_MAX_DOMAINS, ORK_KERNEL_MAX_DOMAINS-1,
+                      inflated/(double)ORK_KERNEL_MAX_DOMAINS/(1024.0*1024*1024));
+              nd = ORK_KERNEL_MAX_DOMAINS;
+          }
+          ctx->n_domains = nd < 1 ? 1 : (int) nd;
+          /* ORK_DOMAINS_FORCE — DEBUG ONLY, clamp UP. The multi-domain teardown leak (Tier 17) is invisible
+           * on a single-domain model, so reproducing it used to require a 12 GiB / 27B pack and ~20 minutes
+           * per run. Forcing a small pack across several domains reproduces the DOMAIN SWITCHING, which is
+           * what the bug actually needs -- gigabytes are incidental. A 155 MiB 0.8B pack across 3 domains
+           * runs in seconds, which is the difference between a bisect that is worth running and one that is
+           * not. Clamp-UP only: it can never make the auto count unsafe, only more fragmented. This is a
+           * reproducer knob, NOT a tuning knob -- the auto count remains the sole authority for real runs. */
+          if (const char * fd_ = getenv("ORK_DOMAINS_FORCE")) {
+              const int f = atoi(fd_);
+              if (f > ctx->n_domains && f <= 16) {   /* 16 = RKNPU_MAX_IOMMU_DOMAIN_NUM */
+                  fprintf(stderr, "[ORK] ORK_DOMAINS_FORCE=%d (auto was %d) — DEBUG reproducer, clamp-up only\n",
+                          f, ctx->n_domains);
+                  ctx->n_domains = f;
+              }
+          }
           if (ctx->n_domains > 0) ctx->domain_fill_cap = inflated / (size_t) ctx->n_domains + (size_t) 64 * 1024 * 1024;
           // Hard headroom clamp: never target a fill so high that fill + a full-layer overshoot could approach the
           // ~2.9 GiB hard IOVA edge and starve the run scratch (protects models the byte-balance leaves lumpy).
           if (ctx->domain_fill_cap > (size_t) 1900 * 1024 * 1024) ctx->domain_fill_cap = (size_t) 1900 * 1024 * 1024;
+          /* ---- DETERMINISTIC PLACEMENT PLAN (Tier 15) --------------------------------------------
+           * Assign every weight a domain HERE, over the complete index, instead of letting
+           * ork_weight_domain fill incrementally in graph-visit order. Two things this buys:
+           *   - Reproducibility. The incremental fill depends on the order weights happen to be touched,
+           *     which is why the same 9B W4A8 pack has resided as 5 domains (46 t/s) and 7 (4.3 t/s).
+           *   - Failure at OPEN, not at layer 48. The 27B overflow (a 22.66 GiB footprint asking for 24
+           *     domains against the driver's 16, filling 0..15, then EINVAL'ing off the end and leaking a
+           *     mapping per attempt) is a single up-front check once the whole plan is known.
+           * The plan is NOT written to the pack: a domain id depends on domain count, IOVA width and RAM,
+           * so storing it would demand one artifact per memory configuration. It is derived locally and is
+           * a pure function of (index, hardware). Canonical order is (layer, name) so it never depends on
+           * unordered_map iteration order. Same layer-boundary rule as the fallback, so a layer's matmuls
+           * stay co-domain. */
+          {
+              std::vector<std::pair<std::string, size_t>> ents;
+              ents.reserve(ctx->persist_idx.size());
+              for (const auto & kv : ctx->persist_idx) {
+                  const int K = (int) kv.second.K, N = (int) kv.second.N;
+                  const uint32_t dt = kv.second.dtype;
+                  const bool i8r = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
+                                    dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
+                                   (dt == 0 && ctx->qbits == 8);
+                  ents.emplace_back(kv.first, ork_w_resident_bytes(ctx->npu, K, N, i8r ? 8 : 4, want_bf ? 1 : 0));
+              }
+              std::sort(ents.begin(), ents.end(), [](const std::pair<std::string,size_t> & a,
+                                                     const std::pair<std::string,size_t> & b) {
+                  int la = ork_layer_of(a.first.c_str()), lb = ork_layer_of(b.first.c_str());
+                  if (la < 0) la = 1 << 28;                 /* non-layer tensors (embeddings, output) last */
+                  if (lb < 0) lb = 1 << 28;
+                  if (la != lb) return la < lb;
+                  return a.first < b.first;
+              });
+              int d = 0, last_layer = -2; size_t used = 0, worst = 0;
+              for (const auto & e : ents) {
+                  const int L = ork_layer_of(e.first.c_str());
+                  const bool new_layer = (L != last_layer);
+                  if (d < ctx->n_domains - 1 && used + e.second > ctx->domain_fill_cap && new_layer) {
+                      if (used > worst) worst = used;
+                      d++; used = 0;
+                  }
+                  ctx->placement[e.first] = d;
+                  used += e.second; last_layer = L;
+              }
+              if (used > worst) worst = used;
+              /* A plan that does not fit is a BUILD-time-visible fact; say so now rather than discovering
+               * it mid-forward as an EINVAL that leaks IOVA on every retry. ~2.9 GiB is the measured
+               * usable IOVA per domain (domain_probe says ~4.16; the margin covers Bf + one overshoot). */
+              const size_t hard = (size_t) 2900 * 1024 * 1024;
+              if (worst > hard)
+                  fprintf(stderr, "[ORK] WARNING: planned placement puts %.2f GiB in one domain (usable ~%.2f GiB) "
+                                  "across %d domains — expect an IOVA failure; reduce the resident set\n",
+                          worst / (1024.0*1024*1024), hard / (1024.0*1024*1024), ctx->n_domains);
+              if (getenv("ORK_VERBOSE"))
+                  fprintf(stderr, "[ORK] placement planned: %zu weights over %d domains, worst domain %.2f GiB\n",
+                          ents.size(), d + 1, worst / (1024.0*1024*1024));
+          }
           ctx->residence_footprint = inflated;
           ctx->residence_ram_budget = budget;
           ctx->residence_stream = (inflated > budget) ? 1 : 0;       // even Bb-only overflows -> stream by layer
@@ -7344,7 +10085,14 @@ static ggml_backend_t ggml_backend_ork_device_init_backend(ggml_backend_dev_t de
 static void * ggml_backend_ork_buffer_get_base(ggml_backend_buffer_t buffer) { return buffer->context; }
 static void   ggml_backend_ork_buffer_free_buffer(ggml_backend_buffer_t buffer) { free(buffer->context); }
 static void   ggml_backend_ork_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    memcpy((char *) tensor->data + offset, data, size); GGML_UNUSED(buffer);
+    if (g_ork_ctx && offset == 0) ork_stub_verify(g_ork_ctx, tensor->name, data, size);   /* stub without its pack? */
+    memcpy((char *) tensor->data + offset, data, size);
+    /* NOTE (Tier 15 stage 3): this is NOT a per-weight load event for ork. An attempt to record pack-owned
+     * weights here fired ZERO times on Qwen3.6-27B: the ORK_Weights buffer holds only the ~11 MiB compute
+     * buffer, while the model's 400 weights live in CPU buffers and ork merely reads them. llama.cpp does
+     * deliver a per-tensor event, but to whichever backend OWNS the tensor — so tapping it requires ork to
+     * claim the weight tensors via its buffer type, i.e. the orkpack-native loader (stage 2), not a hook. */
+    GGML_UNUSED(buffer);
 }
 static void   ggml_backend_ork_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     memcpy(data, (const char *) tensor->data + offset, size); GGML_UNUSED(buffer);
@@ -7404,9 +10152,60 @@ static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_b
 }
 
 
-static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+/* ORK_OP_STATS=1 — tally which ops this backend CLAIMS, dumped at exit.
+ *
+ * Two builds can agree on every matmul and still produce different perplexity if they disagree about which
+ * NON-matmul ops they take: an op claimed here runs on ork's primitives (reduced precision), an op declined
+ * falls to ggml's fp32 CPU kernels. That asymmetry is invisible in a matmul-level trace and is the leading
+ * explanation for a board-vs-offline gap that survived verifying the model, the pack, the text, the
+ * activations and the MAC output as bit-identical. */
+static void ork_op_stat(const char * name, bool claimed) {
+    static int on = -1;
+    if (on < 0) on = getenv("ORK_OP_STATS") ? 1 : 0;
+    if (!on) return;
+    struct Tally {
+        std::map<std::string, std::pair<long,long>> m;   /* op -> (claimed, declined) */
+        ~Tally() {
+            fprintf(stderr, "[ORK OP-STATS] op                      claimed   declined\n");
+            for (const auto & kv : m)
+                fprintf(stderr, "[ORK OP-STATS] %-22s %8ld %10ld\n", kv.first.c_str(), kv.second.first, kv.second.second);
+        }
+    };
+    static Tally t;
+    auto & e = t.m[name ? name : "?"];
+    if (claimed) e.first++; else e.second++;
+}
+
+static bool ork_supports_op_inner(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     static const int ork_off = getenv("ORK_OFF") != nullptr;   // CPU baseline: force everything to CPU
-    if (ork_off) return false;
+    if (ork_off) {
+        /* ORK_OFF over a STUB source is not a CPU baseline, it is a garbage generator: the weights ggml
+         * would read are holes. Say so rather than producing plausible-looking nonsense. */
+        if (g_ork_ctx && g_ork_ctx->source_is_stub) {
+            static int warned = 0;
+            if (!warned) { warned = 1;
+                fprintf(stderr, "[ORK] *** ORK_OFF=1 with a STUB source: every packed tensor reads as ZERO. "
+                                "Output will be garbage. Use the full source gguf for a CPU baseline.\n"); }
+        }
+        return false;
+    }
+    /* CLAIM a pack-owned matmul that we would otherwise decline, in two cases:
+     *   - STUB SOURCE: declining hands ggml a HOLE, not a weight. Nobody else can compute it.
+     *   - ORK_CPU_DECODE: we intend to serve M==1 with ork's own NEON kernel over the pack's int4, which
+     *     beats letting ggml read the source gguf's q8 (2.5x the bytes per token on a 27B).
+     * Either way the claim must happen HERE -- the handler that implements it only runs if supports_op
+     * said yes, so gating only inside the handler is a no-op (measured: decode unchanged at 0.09 tok/s). */
+    if (g_ork_ctx && op->op == GGML_OP_MUL_MAT && op->src[0] && op->src[0]->name[0] &&
+        !g_ork_ctx->preload_done && op->src[0]->data &&
+        g_ork_ctx->persist_idx.count(op->src[0]->name) &&
+        g_ork_ctx->preload_seen.insert(op->src[0]->data).second)
+        g_ork_ctx->preload_reg.push_back(op->src[0]);
+    if (g_ork_ctx && op->op == GGML_OP_MUL_MAT && op->src[0] && op->src[0]->name[0]) {
+        static int cpudec = -1;
+        if (cpudec < 0) { const char * e = getenv("ORK_CPU_DECODE"); cpudec = (e && atoi(e)) ? 1 : 0; }
+        if ((g_ork_ctx->source_is_stub || cpudec) && g_ork_ctx->persist_idx.count(op->src[0]->name))
+            return true;
+    }
     // orkd: only MUL_MAT is daemon-routed (ork_i8_mm_pack + ork_i8_mm_run). The other NPU ops here — MoE
     // (MUL_MAT_ID), attention (SOFT_MAX/FLASH_ATTN), SDP activations (GLU/UNARY/MUL/ADD), SSM_SCAN — run on
     // fd-local primitives (run_i8_silu, doorbell, dom_activate, DMA scratch) that break when the daemon owns
@@ -7425,13 +10224,13 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
                 // other fd-local primitives this gate declines. Let it through ONLY under ORK_ATTN_DEC so
                 // the real FLASH_ATTN_EXT case below applies the full decode gate (N==1 + shape). Off by
                 // default: without ORK_ATTN_DEC this still declines to CPU, preserving orkd safety.
-                if (getenv("ORK_ATTN_DEC")) break;
+                if (ork_attn_dec_enabled()) break;
                 return false;
             case GGML_OP_GLU:
                 // ORK_FFN_DEC: the fused DECODE FFN chain (ggml_backend_ork_ffn_decode_orkd) needs the SwiGLU
                 // node in the ORK split so the matcher keeps the gate/up/glu/down subgraph whole. The node's
                 // own compute is consumed (skipped) by the chain; it only needs to be scheduled to ORK.
-                if (getenv("ORK_FFN_DEC")) break;
+                if ((ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) break;
                 return false;
             default:
                 return false;
@@ -7495,7 +10294,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // ACCEPTS the sub-5-bit tensors and runs them native-W4A4 (per-tensor dispatch in graph_compute),
             // keeping the >4-bit tensors on W8A8 — the mixed-precision q4 NPU path.
             {
-                static const int i4_env = ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4')
+                static const int i4_env = (ork_forced_qbits() == 4
                     || getenv("ORK_HYBRID") || getenv("ORK_ORKPACK_TIERMAP")) ? 1 : 0;
                 // Read the ctx live rather than folding it into the static: supports_op can be reached
                 // before backend init has published g_ork_ctx, and a cached 0 would stick for the run.
@@ -7524,8 +10323,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // opposite: M>1 amortizes the floor over many rows, so NPU wins (39.6 vs 13.6 tok/s).
             // Gate on M (the token/batch dim) ONLY — NOT N. The old `M>=min || N>=min` always passed
             // because every weight has a large N, dragging M=1 decode onto the NPU. ORK_MINM tunes it.
-            static const int min_m = getenv("ORK_MINM") ? atoi(getenv("ORK_MINM")) : 32;
-            int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : ((getenv("ORK_QUANT") && getenv("ORK_QUANT")[0] == '4') ? 4 : 8);
+            /* DEFAULT 8, MEASURED end-to-end. The old 32 was inherited and never re-derived; an ork_ppl
+             * sweep puts the crossover between M=4 and M=8 on BOTH tiers (int8 1.22x/1.05x at M=4/8,
+             * int4 1.13x/1.21x), so 32 forced M in [8,31] onto the CPU and gave up 1.05-1.64x there. 32 was
+             * also, unluckily, the single worst M for the NPU in that sweep. Precedence: an explicit
+             * override (a sweep in progress) > ORK_MINM > a pack's measured value > this default. */
+            static const char * minm_env = getenv("ORK_MINM");
+            int min_m = 8;
+            if (g_min_m_override > 0)      min_m = g_min_m_override;
+            else if (minm_env)             min_m = atoi(minm_env);
+            else if (g_ork_ctx && g_ork_ctx->calib_global > 0) min_m = g_ork_ctx->calib_global;
+            int target_qbits = g_ork_ctx ? g_ork_ctx->qbits : (ork_forced_qbits() == 4 ? 4 : 8);
             bool hybrid = g_ork_ctx ? g_ork_ctx->hybrid : (g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr);
             const char * name_src = src0->name;
             bool is_expert = ork_is_expert(name_src);
@@ -7563,7 +10371,8 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // CPU 20/7. Route single-domain serving decode to CPU too (threshold stays min_m); ORK_M1_NPU
             // restores the old always-NPU behavior for the dense-single-domain case it was tuned for.
             if (g_ork_ctx && g_ork_ctx->persist_mode == 2) threshold = 1;   // WRITE/convert: force M>=1 on NPU for EVERY dtype (int8 AND int4) so every weight packs — else int4 FFN falls to CPU and packs ZERO
-            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) && env_enabled("ORK_M1_NPU")) threshold = 1;
+            else if (target_qbits == 8 && (!g_ork_ctx || g_ork_ctx->n_domains <= 1) &&
+                     ork_decode_route_resolved() >= ORK_DECODE_NPU) threshold = 1;
             // EXPERIMENT #1 (ORK_MOE_PHASE_EVICT): at DECODE (M==1) DECLINE the dense backbone matmuls so
             // the scheduler routes them to CPU (bandwidth-bound, cheap at M=1) — this frees the ~2.8 GiB of
             // IOVA the backbone otherwise pins, handing it to the MoE hot-expert cache. Experts go through
@@ -7580,7 +10389,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // subgraph is ONE contiguous ORK split (a CPU-side up would fragment it and the matcher couldn't
             // span the splits). The gate-anchored matcher fuses all 4 (i=last skips up/GLU/down — up never
             // runs standalone). Scoped by weight name so other decode matmuls (attention proj) stay on CPU.
-            if (getenv("ORK_FFN_DEC") && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
+            if ((ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED) && g_ork_ctx && g_ork_ctx->via_orkd && M == 1 &&
                 op->ne[2] == 1 && op->ne[3] == 1 && src0->name &&
                 (strstr(src0->name, "ffn_gate") || strstr(src0->name, "ffn_up") || strstr(src0->name, "ffn_down"))) {
                 const char * mn = getenv("ORK_FFN_DEC_MIN");   // diagnostic: only fire FFN-dec for layer >= MIN
@@ -7723,7 +10532,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GLU: {
             // SwiGLU (split form: silu(gate=src0) * up=src1) on the NPU. EXPERIMENTAL, ORK_PPU_GLU.
             // ORK_FFN_CHAIN also needs GLU on ork so the FFN's 4 nodes land in one ork subgraph (fused there).
-            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !getenv("ORK_FFN_DEC")) return false;
+            if (!ork_ppu_glu_on() && !ork_ffn_chain_on() && !(ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) return false;
             { const char * mn = getenv("ORK_FFN_DEC_MIN");   // match the FFN-matmul layer gate (src0=gate MM node -> its weight)
               if (mn && src0 && src0->src[0] && ork_layer_of(src0->src[0]->name) < atoi(mn)) return false; }
             if (ggml_get_glu_op(op) != GGML_GLU_OP_SWIGLU) return false;
@@ -7737,7 +10546,7 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             // FFN's gate/up/GLU/down land in ONE ork subgraph and the chain matcher can fuse them — otherwise
             // the 7B's Nff=18944 GLU is rejected, the scheduler splits the FFN across backends, and the 4
             // nodes never share a graph_compute (chain can never fire). Standalone GLU (ORK_PPU_GLU) keeps cap.
-            if (ork_ffn_chain_on() || getenv("ORK_FFN_DEC")) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
+            if (ork_ffn_chain_on() || (ork_decode_route_resolved() >= ORK_DECODE_NPU_FUSED)) return N >= 16 && (N & 15) == 0 && M >= 1 && M <= 8192;
             return N >= 16 && N <= 8192 && (N & 15) == 0 && M >= ork_ppu_minm() && M <= 8192;
         }
         case GGML_OP_SSM_SCAN: {
@@ -7770,9 +10579,17 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
             const int nkv=(int)k->ne[1];
             { static int nq=0; if (getenv("ORK_ATTN_DEC") && nq++ < 8) fprintf(stderr,"[ork-fa-supp] FLASH_ATTN_EXT queried: N=%d nkv=%d DK=%d DV=%d Hkv=%d\n", N, nkv, DK, DV, Hkv); }
             if (Hkv<1 || H%Hkv || DK%32 || DV%16) return false;
-            if (N == 1) {                                            // DECODE -> int8 orkd path (ggml_backend_ork_flash_attn_decode)
-                if (getenv("ORK_ATTN_DEC") == nullptr) return false;
-                if (DK > 512 || nkv < 256 || ((nkv+511)&~511) > 2048) return false;  // sched floor .. single-N-tile
+            if (N == 1) {                                            // DECODE -> int8 path (ggml_backend_ork_flash_attn_decode)
+                if (!ork_attn_dec_enabled()) return false;
+                // DK==DV because the resident-KV bundle carries ONE head dim for both K^T and V. Without
+                // this the handler would fall through to the per-call repack, which is perf-negative --
+                // better to leave those shapes on the CPU than to "support" them into a regression.
+                if (DK != DV) return false;
+                if (DK > 512) return false;                          // K^T is packed [512, Lmax]
+                // Bound the PADDED width by the hardware limit only. The live-length threshold is
+                // applied in the handler (see ork_attn_dec_min_nkv) because nkv here is the padded
+                // cache width, which does not tell us how many tokens are actually live.
+                if (((nkv+511)&~511) > 8192) return false;
                 return true;
             }
             if (getenv("ORK_ATTN") == nullptr) return false;
@@ -7787,6 +10604,14 @@ static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const st
 
 static bool ggml_backend_ork_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     return ggml_backend_buft_is_host(buft); GGML_UNUSED(dev);
+}
+
+/* Thin wrapper so every accept/decline is tallied (ORK_OP_STATS). The decision logic stays in
+ * ork_supports_op_inner. */
+static bool ggml_backend_ork_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    const bool r = ork_supports_op_inner(dev, op);
+    ork_op_stat(ggml_op_name(op->op), r);
+    return r;
 }
 
 // This is a buffer-less (BLAS-style) backend: weights live on the CPU buffer, so the scheduler only
