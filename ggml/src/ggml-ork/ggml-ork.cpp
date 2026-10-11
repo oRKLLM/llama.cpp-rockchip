@@ -11200,11 +11200,56 @@ static const struct ggml_backend_buffer_i ggml_backend_ork_buffer_i = {
     /* .clear         = */ ggml_backend_ork_buffer_clear,
     /* .reset         = */ NULL,
 };
+/* MMAP-BACKED variant of the same buffer. Identical in every respect except that it does NOT own its
+ * memory: the pointer is a window into llama.cpp's mmap of the GGUF, so freeing it would unmap the
+ * model out from under every other view of it. Only `.free_buffer` differs.
+ *
+ * It exists because the two halves of weight ownership have to agree. `buffer_from_host_ptr` used to
+ * return ggml_backend_cpu_buffer_from_ptr(), whose buft reports CPU -- so even once the loader stops
+ * rewriting ork's buft away (see .get_host_buffer_type), the zero-copy mmap path would hand the
+ * weights back to the CPU backend anyway and the scheduler would still lose weight-locality.
+ * Returning an ORK-buft buffer here is what makes that path actually land on ork.
+ *
+ * The alternative -- letting weights arrive through ggml_backend_ork_buffer_type_alloc_buffer -- is
+ * posix_memalign + a set_tensor memcpy of the whole model, which over a STUB source copies gigabytes
+ * of holes (zeros) into anonymous RAM. That is why the two changes are one change and not two. */
+static const struct ggml_backend_buffer_i ggml_backend_ork_buffer_mapped_i = {
+    /* .free_buffer   = */ NULL,          /* borrowed mapping -- never free(), never munmap() */
+    /* .get_base      = */ ggml_backend_ork_buffer_get_base,
+    /* .init_tensor   = */ NULL,
+    /* .memset_tensor = */ ggml_backend_ork_buffer_memset_tensor,
+    /* .set_tensor    = */ ggml_backend_ork_buffer_set_tensor,
+    /* .get_tensor    = */ ggml_backend_ork_buffer_get_tensor,
+    /* .set_tensor_2d = */ NULL,
+    /* .get_tensor_2d = */ NULL,
+    /* .cpy_tensor    = */ ggml_backend_ork_buffer_cpy_tensor,
+    /* .clear         = */ ggml_backend_ork_buffer_clear,
+    /* .reset         = */ NULL,
+};
+
+/* WEIGHT-OWNERSHIP OBSERVABILITY. Whether a model's weights landed on ork or were handed to the CPU
+ * backend was inferable only from the ABSENCE of an "ORK_Weights model buffer size" line in llama.cpp's
+ * per-buffer report -- a signal that is a thing NOT being printed, which is the kind nobody notices.
+ * State it positively, and name the MECHANISM, because "owned" via a multi-GiB memcpy and "owned" via
+ * an mmap window are not the same outcome even though both say ORK_Weights. */
+static void ork_buf_report(const char * how, size_t size) {
+    static long   n_copy = 0, n_mapped = 0;
+    static size_t b_copy = 0, b_mapped = 0;
+    if (how[0] == 'm') { n_mapped++; b_mapped += size; } else { n_copy++; b_copy += size; }
+    fprintf(stderr, "[ORK BUFTYPE] weights on ORK_Weights via %s: %.2f MiB "
+                    "(cumulative: mapped %ld/%.2f MiB, copied %ld/%.2f MiB)\n",
+            how, size / (1024.0 * 1024.0),
+            n_mapped, b_mapped / (1024.0 * 1024.0), n_copy, b_copy / (1024.0 * 1024.0));
+}
+
 static const char * ggml_backend_ork_buffer_type_get_name(ggml_backend_buffer_type_t buft) { return "ORK_Weights"; GGML_UNUSED(buft); }
 static ggml_backend_buffer_t ggml_backend_ork_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * data = NULL;
     if (posix_memalign(&data, 64, size ? size : 64) != 0) return NULL;
     g_ork_weight_bytes += size;   // (diagnostic only; ork weights live on CPU buffers so this stays ~0)
+    /* Only report buffers big enough to BE weights; the per-graph compute buffer is small and constant,
+     * and reporting it every graph would bury the one line that matters. */
+    if (size >= (size_t) 64 * 1024 * 1024) ork_buf_report("copy (posix_memalign + set_tensor)", size);
     return ggml_backend_buffer_init(buft, ggml_backend_ork_buffer_i, data, size);
 }
 static size_t ggml_backend_ork_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) { return 64; GGML_UNUSED(buft); }
@@ -11228,8 +11273,14 @@ static ggml_backend_buffer_type_t ggml_backend_ork_buffer_type(void) {
 static ggml_backend_buffer_type_t ggml_backend_ork_device_get_buffer_type(ggml_backend_dev_t dev) {
     return ggml_backend_ork_buffer_type(); GGML_UNUSED(dev);
 }
+/* Zero-copy weight load: llama.cpp hands us a window into its mmap of the GGUF (llama-model.cpp's
+ * `use_mmap && buffer_from_host_ptr_supported && is_default_buft` branch). Wrap it in a buffer carrying
+ * OUR buffer type, not the CPU one -- the buft is what the scheduler reads for weight-locality, so
+ * returning a CPU-buft buffer here silently disowns every weight while still looking like it worked. */
 static ggml_backend_buffer_t ggml_backend_ork_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
-    return ggml_backend_cpu_buffer_from_ptr(ptr, size); GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
+    if (size >= (size_t) 64 * 1024 * 1024) ork_buf_report("mmap (zero-copy, borrowed)", size);
+    return ggml_backend_buffer_init(ggml_backend_ork_buffer_type(), ggml_backend_ork_buffer_mapped_i, ptr, size);
+    GGML_UNUSED(dev); GGML_UNUSED(max_tensor_size);
 }
 
 
@@ -11714,7 +11765,17 @@ static const struct ggml_backend_device_i ggml_backend_ork_device_i = {
     /* .get_props            = */ ggml_backend_ork_device_get_props,
     /* .init_backend         = */ ggml_backend_ork_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_ork_device_get_buffer_type,
-    /* .get_host_buffer_type = */ ggml_backend_ork_device_get_buffer_type,
+    /* NO host buffer type. This used to alias get_buffer_type, which DISOWNED every weight whenever
+     * mmap was on: llama_model_loader::create_tensor rewrites any buft equal to the device's HOST
+     * buffer type to CPU under mmap (that rule exists so a pinned-host staging buffer is not used as
+     * model storage), and ork's buft compared equal to its own host buft, so the rule fired on ork's
+     * REAL buffer type. Measured on Qwen3-1.7B-BF16: 311 tensors moved to CPU before this, 115 after.
+     * The iface also contradicted this device's own props, which already declare host_buffer = false
+     * (ggml_backend_ork_device_get_props) -- and the loader trusts the iface, not the props. NULL is
+     * the honest answer and ggml_backend_dev_host_buffer_type() handles it (returns NULL).
+     * Pairs with ggml_backend_ork_device_buffer_from_host_ptr: without that returning an ORK-buft
+     * buffer, this change alone sends weights through alloc_buffer's posix_memalign + memcpy. */
+    /* .get_host_buffer_type = */ NULL,
     /* .buffer_from_host_ptr = */ ggml_backend_ork_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_ork_device_supports_op,
     /* .supports_buft        = */ ggml_backend_ork_device_supports_buft,
