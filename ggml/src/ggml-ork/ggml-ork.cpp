@@ -182,6 +182,90 @@ extern "C" {
 #include <omp.h>
 #endif
 
+/* ---- the schedule every ggml-ork work loop runs under -------------------------------------------
+ *
+ * RK3588 is 4x A76 + 4x A55 and OpenMP's default schedule is STATIC, so an even row split hands a
+ * quarter of the work to cores that are several times slower on this code and the A76s then idle at
+ * the barrier. A loop that splits rows (or columns, or heads) over all eight cores therefore runs
+ * schedule(runtime) and takes its kind from here, so the whole stack is steered by one ICV and ONE
+ * binary serves both A/B arms (no two-tree build hazard). The loops that instead run on the big cores
+ * only carry an explicit schedule + num_threads -- see ork_omp_nt_mem for why they differ.
+ *
+ * ORK_OMP_SCHED=<static|dynamic|guided|auto>[,<chunk>] overrides; OMP_SCHEDULE, if set, wins over
+ * both (it is the standard's own knob and A/B scripts already use it). Default dynamic,1.
+ *
+ * Bit-exactness: these loops' iterations are independent (disjoint output slices) or reduce with an
+ * order-independent operator (max/min), so the schedule cannot change a single output bit. Do NOT
+ * convert a loop with a floating-point SUM reduction -- that one is order-dependent. */
+static void ork_omp_sched_init(void) {
+#ifdef _OPENMP
+    static const int once = [](){
+        if (getenv("OMP_SCHEDULE")) return 1;                   /* the standard knob wins */
+        const char * s = getenv("ORK_OMP_SCHED");
+        omp_sched_t kind = omp_sched_dynamic; int chunk = 1;
+        if (s && *s) {
+            const char * c = strchr(s, ',');
+            if (c) chunk = atoi(c + 1);
+            if      (!strncasecmp(s, "static",  6)) { kind = omp_sched_static;  if (!c) chunk = 0; }
+            else if (!strncasecmp(s, "guided",  6)) { kind = omp_sched_guided;  if (!c) chunk = 1; }
+            else if (!strncasecmp(s, "auto",    4)) { kind = omp_sched_auto;    chunk = 0; }
+        }
+        omp_set_schedule(kind, chunk);
+        return 1;
+    }();
+    (void) once;
+#endif
+}
+
+/* ORK_ACTQ_SUM=1 — running hash of every quantised activation a run produces, over the int8 and the
+ * W4A4 paths alike. Two builds that print the same digest produced byte-identical activations, which a
+ * PPL compare cannot establish on its own. Verification only: it reads the whole buffer back. */
+static uint64_t g_actq_digest = 1469598103934665603ull; static double g_actq_nelem = 0;
+static bool ork_actq_sum(void);
+static void ork_actq_digest_add(const int8_t * a, const float * as, size_t nelem, int nrow) {
+    uint64_t h = g_actq_digest;
+    const uint64_t * p64 = (const uint64_t *) a;
+    const size_t n64 = nelem / 8;
+    for (size_t i = 0; i < n64; i++) { h ^= p64[i]; h *= 1099511628211ull; h ^= h >> 29; }
+    for (size_t i = n64*8; i < nelem; i++) { h ^= (uint8_t) a[i]; h *= 1099511628211ull; }
+    const uint32_t * ps = (const uint32_t *) as;
+    for (int i = 0; i < nrow; i++) { h ^= ps[i]; h *= 1099511628211ull; }
+    g_actq_digest = h; g_actq_nelem += (double) nelem;
+}
+
+/* How many threads a MEMORY-BOUND ggml-ork work loop runs on: the big cores only.
+ *
+ * The two regimes do not want the same thing. The W4A4 clip search is pure ALU, so every core it can
+ * get is worth having and the A55 straggler is a scheduling problem (ork_omp_sched_init). The streaming
+ * loops -- per-row activation quantise, per-row dequantise, both already NEON -- are bandwidth- and
+ * cache-bound, and there the A55 cluster is a NET NEGATIVE whatever the schedule: measured on a
+ * 2048-token int8 prefill, the activation-quant term is 783 ms on 8 threads static, 601 ms on 8 threads
+ * dynamic, and 380 ms on 4 threads static. Half the cores, 2.06x faster, and dynamic recovers only part
+ * of the loss. So these loops take the big-core count instead.
+ *
+ * Big cores = the cores at the highest cpuinfo_max_freq (4 A76 on RK3588), the same test
+ * ork_calib_provenance uses. ORK_OMP_NT_MEM=8 reproduces the pre-change arm exactly. */
+static int ork_omp_nt_mem(void) {
+    static const int n = [](){
+        const char * e = getenv("ORK_OMP_NT_MEM");
+        if (e && atoi(e) > 0) return atoi(e);
+        long best = 0; int nbig = 0;
+        for (int c = 0; c < 64; c++) {
+            char p[128]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            FILE * f = fopen(p, "r"); if (!f) continue;
+            long v = 0; if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f);
+            if (v > best) { best = v; nbig = 0; }
+            if (v == best && v > 0) nbig++;
+        }
+        if (nbig < 1) nbig = 1;
+#ifdef _OPENMP
+        if (nbig > omp_get_max_threads()) nbig = omp_get_max_threads();
+#endif
+        return nbig;
+    }();
+    return n;
+}
+
 // Truthy-VALUE env gate (not mere presence). Returns true only when the named var is set to one of
 // 1/true/yes/on (case-insensitive); UNSET or 0/false/off/empty -> false. Use this for any flag whose
 // "off" must be expressible as VALUE=0 (the obvious way to disable a feature on a command line), not
@@ -2959,7 +3043,7 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
             const std::string key = ork_expert_key(src0->name, e);
             if (ctx->persist_dumped.count(key)) continue;
             const char * x = (const char *) src0->data + (size_t) e * nb2;
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int n = 0; n < N; n++) {
                 float * col = f32.data() + (size_t) n * K;
                 if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
@@ -3985,7 +4069,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                 int8_t * ar = ai + t * M_padded * K;
                 float * asr = as + t * M_padded;
                 const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time pure act-quant arithmetic
-                #pragma omp parallel for if (M_padded >= 16)
+                #pragma omp parallel for schedule(static) num_threads(ork_omp_nt_mem()) if (M_padded >= 16)
                 for (int m = 0; m < M_padded; m++) {
                     if (m < M) {
                         const float * yr = y + (size_t) m*K;
@@ -4052,6 +4136,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
                     }
                 }
                 if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
+                if (ork_actq_sum()) ork_actq_digest_add(ar, asr, (size_t) M_padded * K, M_padded);
                 ctx->last_src1 = y;
                 ctx->last_M = M;
                 ctx->last_K = K;
@@ -4105,7 +4190,7 @@ static bool ggml_backend_ork_mul_mat_i8(ggml_backend_ork_context * ctx, struct g
             const float * asr = as + t * M_padded;
             const int32_t * ctr = ci + t * M_padded * N;
 
-            #pragma omp parallel for if (M >= 16)
+            #pragma omp parallel for schedule(static) num_threads(ork_omp_nt_mem()) if (M >= 16)
             for (int m = 0; m < M; m++) {
                 const float rs = asr[m];
                 const int32_t * cr = ctr + (size_t) m*N;
@@ -4249,7 +4334,7 @@ static bool ggml_backend_ork_mul_mat_i4(ggml_backend_ork_context * ctx, struct g
                           ctx->last_smooth == (const void *) ow.smooth.data() && !ctx->no_reuse);
             if (!reuse) {
                 // activations: per-row, per-group int4 quant with shape padding
-                #pragma omp parallel for if (M_padded >= 16)
+                #pragma omp parallel for schedule(runtime) if (M_padded >= 16)
                 for (int m = 0; m < M_padded; m++) {
                     if (m < M) {
                         for (int g = 0; g < NG; g++) {
@@ -4369,11 +4454,7 @@ static bool ork_actq_scalar(void) { static const int e = getenv("ORK_ACTQ_SCALAR
  * A76s on this code, so an even static split leaves the big cores idle for most of the loop -- measured
  * par-eff 4.79 of 8 threads, and a 2.5x WALL penalty. Dynamic scheduling lets the A76s take the rows the
  * A55s have not reached (par-eff 7.5). OMP_SCHEDULE still overrides, for A/B. */
-static void ork_actq_sched_default(void) {
-    static const int once = [](){ if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_dynamic, 1); return 1; }();
-    (void) once;
-}
-static uint64_t g_actq_digest = 1469598103934665603ull; static double g_actq_nelem = 0;
+static void ork_actq_sched_default(void) { ork_omp_sched_init(); }
 
 /* ORK_I4_NOROT=1 — build and run the native-W4A4 tier WITHOUT the Hadamard rotation.
  *
@@ -5185,7 +5266,7 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                 // PARALLEL convert pack: dequant + FWHT-rotate + per-channel int4-quant, one column per
                 // OpenMP iteration (each n is independent — disjoint f32/bi/bscale). This is the per-weight
                 // one-time conversion cost; threading it over N cuts the user's wait ~ncore-fold.
-                #pragma omp parallel for schedule(static)
+                #pragma omp parallel for schedule(runtime)
                 for (int n = 0; n < N; n++) {
                     float * col = f32 + (size_t) n*K;
                     if (type == GGML_TYPE_F32) memcpy(col, x + (size_t) n*nb01, (size_t) K*sizeof(float));
@@ -5292,7 +5373,17 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
     {
         static int on = -1;
         if (on < 0) { const char * e = getenv("ORK_CPU_DECODE"); on = e ? (atoi(e) ? 1 : 0) : -2; }
-        if ((on == 1 || (on == -2 && ctx->source_is_stub)) && ork_cpu_decode_m1(ctx, dst)) return true;
+        /* Timed at the call site rather than inside: the kernel has a dozen early returns that decline
+         * the shape, and only the caller knows the call actually ran. Without this the whole CPU M=1
+         * decode route -- the production decode path for a 4-bit pack -- was absent from ORK_PROFILE. */
+        if (on == 1 || (on == -2 && ctx->source_is_stub)) {
+            const double _d0 = ctx->profile ? ork_now_us() : 0;
+            if (ork_cpu_decode_m1(ctx, dst)) {
+                if (ctx->profile) { const double _d = ork_now_us() - _d0;
+                    ctx->t_run += _d; ctx->t_run_dec += _d; ctx->n_mm++; ctx->n_dec++; }
+                return true;
+            }
+        }
     }
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_i4_hadamard\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];
@@ -5431,19 +5522,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                 ctx->aq_wall += _w; ctx->aq_calls++;
                 if (reuse) ctx->aq_reuse++; else { ctx->t_actq += _w; ctx->n_actq++; }
             }
-            /* ORK_ACTQ_SUM=1 — running hash of every quantised activation the W4A4 path produces. Two
-             * builds that print the same digest produced byte-identical activations, which a PPL compare
-             * cannot establish on its own. Verification only: it reads back the whole buffer. */
-            if (ork_actq_sum() && !reuse) {
-                uint64_t h = g_actq_digest;
-                const uint64_t * p64 = (const uint64_t *) ai;
-                const size_t n64 = ((size_t) M_padded * K) / 8;
-                for (size_t i = 0; i < n64; i++) { h ^= p64[i]; h *= 1099511628211ull; h ^= h >> 29; }
-                for (size_t i = n64*8; i < (size_t) M_padded * K; i++) { h ^= (uint8_t) ai[i]; h *= 1099511628211ull; }
-                const uint32_t * ps = (const uint32_t *) as;
-                for (int i = 0; i < M_padded; i++) { h ^= ps[i]; h *= 1099511628211ull; }
-                g_actq_digest = h; g_actq_nelem += (double) M_padded * K;
-            }
+            if (ork_actq_sum() && !reuse) ork_actq_digest_add(ai, as, (size_t) M_padded * K, M_padded);
 
             /* ORK_A_DIAG: one line per W4A4 matmul describing exactly what is about to reach the NPU.
              * The arm-S doorbell miss is deterministic (always the 56th ffn_down) and data-dependent (a
@@ -6036,7 +6115,7 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
     ctx->last_src1 = nullptr; ctx->last_type = 0;        // group overwrote ctx->ai — kill reuse cache
     int8_t * ai = ctx->ai.data(); float * as = ctx->as.data(); int32_t * ci = ctx->ci.data();
     const float * y = (const float *) src1->data;
-    #pragma omp parallel for if (M_padded >= 16)
+    #pragma omp parallel for schedule(runtime) if (M_padded >= 16)
     for (int m = 0; m < M_padded; m++) {                 // rotate + int4-quant the shared activation ONCE
         if (m < M) {
             float arow[K]; memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
@@ -6055,7 +6134,7 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
     for (int i = 0; i < ng; i++) {
         const int Ni = (int) g[i]->src[0]->ne[1]; const int o = off[i];
         float * dbase = (float *) g[i]->data;
-        #pragma omp parallel for if (M >= 16)
+        #pragma omp parallel for schedule(runtime) if (M >= 16)
         for (int m = 0; m < M; m++) {
             const float rs = as[m]; const int32_t * cr = ci + (size_t) m*Ntot + o; float * dr = dbase + (size_t) m*Ni;
             for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
@@ -6446,7 +6525,7 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
         } else {
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
-            #pragma omp parallel for if (M_padded >= 16)
+            #pragma omp parallel for schedule(runtime) if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
                     if (ctx->hadamard) {
@@ -6539,7 +6618,7 @@ static bool ggml_backend_ork_mul_mat_chain_i4(ggml_backend_ork_context * ctx, st
         const int32_t * ctr = ci_base + ci_offset;
         ci_offset += (size_t)M_padded * N;
 
-        #pragma omp parallel for if (M >= 16)
+        #pragma omp parallel for schedule(runtime) if (M >= 16)
         for (int m = 0; m < M; m++) {
             const float rs = task_as[m];
             const int32_t * cr = ctr + (size_t) m*N;
@@ -6686,7 +6765,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
             task_A = ai_base + ai_offset;
             task_as = as_base + as_offset;
             const double _aq0 = ctx->profile ? ork_now_us() : 0;   // LEVER3: time chain-path act-quant (now NEON via ork_quant_row_i8)
-            #pragma omp parallel for if (M_padded >= 16)
+            #pragma omp parallel for schedule(static) num_threads(ork_omp_nt_mem()) if (M_padded >= 16)
             for (int m = 0; m < M_padded; m++) {
                 if (m < M) {
                     task_as[m] = ork_quant_row_i8(y + (size_t) m*K, K, task_A + (size_t) m*K);
@@ -6696,6 +6775,7 @@ static bool ggml_backend_ork_mul_mat_chain_i8(ggml_backend_ork_context * ctx, st
                 }
             }
             if (ctx->profile) { ctx->t_actq += ork_now_us() - _aq0; ctx->n_actq++; }   // LEVER3
+            if (ork_actq_sum()) ork_actq_digest_add(task_A, task_as, (size_t) M_padded * K, M_padded);
             chain_act_cache[src1->data] = {task_A, task_as};
             ai_offset += (size_t)M_padded * K;
             as_offset += (size_t)M_padded;
@@ -7004,7 +7084,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             const int Mp = (mpad <= 1) ? Mr : ((Mr + mpad - 1) / mpad) * mpad;
             co_ai.emplace_back((size_t) Mp * K); co_ci.emplace_back((size_t) Mp * N); co_as.emplace_back(Mp);
             std::vector<int8_t> & aiE = co_ai.back(); std::vector<float> & asE = co_as.back();
-            #pragma omp parallel for if (Mp >= 16)
+            #pragma omp parallel for schedule(runtime) if (Mp >= 16)
             for (int r = 0; r < Mp; r++) {                         // rotate + int4-quant each routed activation
                 if (r < Mr) {
                     const int t = rows[r].first, jj = rows[r].second;
@@ -8209,7 +8289,7 @@ static bool ork_ffn_prep(ggml_backend_ork_context * ctx, ggml_backend_ork_contex
     { const int NS = M < 32 ? M : 32; double smax = 1e-9, gm = 1e-9;   // calibrate s_silu + max|gate| (subset)
       const char* pe = getenv("ORK_FFN_SILU_PCT"); double pct = pe ? atof(pe) : 0.0;
       std::vector<float> sabs; if (pct > 0 && pct < 100) sabs.resize((size_t) Nff * NS);
-      #pragma omp parallel for reduction(max:smax,gm) if (Nff >= 64)
+      #pragma omp parallel for schedule(runtime) reduction(max:smax,gm) if (Nff >= 64)
       for (int n = 0; n < Nff; n++) { const float * gr = wgf.data() + (size_t) n*K;
           for (int m = 0; m < NS; m++) { const float * xr = xf + (size_t) m * K;
               double ag = 0; for (int k = 0; k < K; k++) ag += (double) gr[k]*xr[k];
@@ -10084,7 +10164,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             static int max_npu=-1; if(max_npu<0) max_npu = getenv("ORK_ATTN_MAX_CPU")?0:1;
             double _p=ork_now_us(); float lo=0.0f; const int MR2=H*N;
             // pass 1: scale+mask into scores (mask is data-dependent -> CPU)
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) {
                 const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
                 float *sc=P->scores+(size_t)h*N*nkvp;
@@ -10095,7 +10175,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             if (max_npu && MR2<=8192) {                          // per-row max on the NPU (coarse int8)
                 if (sm_cap2 < NB) { free(sm_q8); sm_q8=(int8_t*)malloc(NB); sm_cap2=NB; }
                 int8_t *maxq=sm_maxq;                             // MR2<=8192
-                #pragma omp parallel for schedule(static)
+                #pragma omp parallel for schedule(runtime)
                 for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; int8_t *q=sm_q8+(size_t)r*nkvp;
                     for (int j=0;j<nkv;j++){ float s=sc[j]; q[j]=(int8_t)(s<-127.f?-128:s>127.f?127:(int)lrintf(s)); }
                     for (int j=nkv;j<nkvp;j++) q[j]=-128; }
@@ -10103,7 +10183,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
                     for (int r=0;r<MR2;r++) sm_mx[r]=(float)maxq[r]; have_npu_max=1; }
             }
             if (!have_npu_max) {                                 // CPU max fallback (batch too big, or forced)
-                #pragma omp parallel for schedule(static)
+                #pragma omp parallel for schedule(runtime)
                 for (int r=0;r<MR2;r++){ float *sc=P->scores+(size_t)r*nkvp; float mx=-INFINITY;
                     for (int j=0;j<nkv;j++) if(sc[j]>mx)mx=sc[j]; sm_mx[r]=mx; }
             }
@@ -10115,7 +10195,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             double in_scale=(-lo)/32000.0; if(in_scale<=0) in_scale=1e-6; double out_scale=1.0/32000.0;
             // 2b: quantize (x-max) -> int16; masked/pad cols -> -32768 (exp ~ 0)
             double _q=ork_now_us();
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) for (int m=0;m<N;m++){ float *sc=P->scores+((size_t)h*N+m)*nkvp; int16_t *xi=sm_xi+((size_t)h*N+m)*nkvp; float mx=sm_mx[(size_t)h*N+m];
                 for (int j=0;j<nkv;j++){ long qv=lround((sc[j]-mx)/in_scale); if(qv<-32768)qv=-32768; if(qv>32767)qv=32767; xi[j]=(int16_t)qv; }
                 for (int j=nkv;j<nkvp;j++) xi[j]=-32768; }
@@ -10135,14 +10215,14 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
                     sm_ones=ork_f16_mm_pack(ctx->npu,nkvp,16,on); free(on); sm_ones_n=nkvp; }
                 double _r=ork_now_us();
                 // exp output ei (int16) -> fp16 e for the reduce matmul; pad cols already ~0 (exp of -32768)
-                #pragma omp parallel for schedule(static)
+                #pragma omp parallel for schedule(runtime)
                 for (size_t i=0;i<(size_t)MR*nkvp;i++) sm_e[i]=(ork_f16)((double)sm_ei[i]*out_scale);
                 if(sm_ones) rrc = ork_f16_mm_run(ctx->npu, sm_ones, MR, sm_e, sm_ss);   // sm_ss[MR,16], col0 = Sigma
                 if(prof) a_smr+=ork_now_us()-_r;
             }
             // 2d: normalize -> Pf (pad cols 0). Sigma from NPU reduce (sm_ss) if it ran, else CPU sum.
             double _n=ork_now_us();
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) for (int m=0;m<N;m++){ size_t r=(size_t)h*N+m; float *sc=P->scores+r*nkvp; int16_t *ei=sm_ei+r*nkvp; ork_f16 *Ph=P->Pf+r*nkvp; float mx=sm_mx[r];
                 double sum;
                 if(!rrc){ sum=sm_ss[r*16]; for (int j=0;j<nkv;j++) sc[j]=(float)((double)ei[j]*out_scale); }        // Sigma on NPU
@@ -10155,7 +10235,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
             if(prof) a_smn+=ork_now_us()-_n;
             tnorm_ok = tnorm && !erc && !rrc;   // transposed path needs unnormalized exp (sm_e) + Σ (sm_ss) from NPU
         } else {
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) {
                 const char * mbase = mask ? (const char*)mask->data + (h%(int)mask->ne[2])*mask->nb[2] + (b%(int)mask->ne[3])*mask->nb[3] : nullptr;
                 float *sc=P->scores+(size_t)h*N*nkvp; ork_f16 *Ph=P->Pf+(size_t)h*N*nkvp;
@@ -10193,7 +10273,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
           const int HN=H*N; const int batch=(HN<=8192 && (HN&7)==0);
           if (batch) {
             if (sm_invf_n < HN) { free(sm_invf); sm_invf=(ork_f16*)malloc((size_t)HN*2); sm_invf_n=HN; }
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int d=0; d<DV; d++) for (int h=0;h<H;h++) for (int m=0;m<N;m++)
               P->Oh16[(size_t)d*HN + (size_t)h*N + m] = (ork_f16)P->outf[(size_t)h*DV*N + (size_t)d*N + m];
             for (int h=0;h<H;h++) for (int m=0;m<N;m++) sm_invf[(size_t)h*N+m]=(ork_f16)P->invS[(size_t)h*N+m];
@@ -10209,11 +10289,11 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
           // (4T) scatter: dst(d,h,m,b) = Ô_norm  (layout depends on batch vs per-head)
           _t=ork_now_us();
           if (batch) {
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
               ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)d*HN + (size_t)h*N + m];
           } else {
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(runtime)
             for (int h=0; h<H; h++) for (int d=0;d<DV;d++) for (int m=0;m<N;m++)
               ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+d] = (float)P->Oh16[(size_t)h*DV*N + (size_t)d*N + m];
           }
@@ -10232,7 +10312,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
         if(prof) a_av+=ork_now_us()-_t;
         // (4) scatter to dst [DV,H,N,B]: dst(dv,h,m,b) = out_h[m,dv]
         _t=ork_now_us();
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(runtime)
         for (int h=0; h<H; h++) for (int m=0;m<N;m++) for (int e=0;e<DV;e++)
             ((float*)dst->data)[(((size_t)b*N+m)*H+h)*DV+e] = P->outf[(size_t)h*N*DV + (size_t)m*DV + e];
         }
@@ -10911,6 +10991,7 @@ static ggml_guid_t ggml_backend_ork_guid(void) {
 }
 
 ggml_backend_t ggml_backend_ork_init(void) {
+    ork_omp_sched_init();   // every schedule(runtime) work loop below takes its kind from this ICV
     // PRODUCT CONFIG (2 load-time options -> internal validated defaults; see ggml-ork.h). Translated to the
     // internal mechanisms ONCE here, before any of them is read below. The user sets only the 2 options via
     // ggml_backend_ork_set_load_config(); everything else is hardcoded to the validated values (not a knob).
