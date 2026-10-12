@@ -1317,6 +1317,12 @@ struct ork_attn_sm {
     ork_w *ones=nullptr; int ones_n=0;
 };
 
+/* FLASH_ATTN_EXT sub-paths, for the per-path profile buckets below. They are separate kernels, not
+ * variants of one, so one bucket would average a prefill fp16 stream against a decode GEMV. */
+enum { FA_DECLINE = 0, FA_PREFILL, FA_DEC_KV, FA_DEC_REPACK, FA_NPATH };
+static const char * const g_fa_name[FA_NPATH] = {
+    "declined -> CPU delegate", "prefill (fp16 stream)", "decode (resident KV)", "decode (per-call repack)" };
+
 struct ggml_backend_ork_context {
     ork_npu * npu = nullptr;
     bool via_orkd = false;     // true = NPU access routed through the orkd daemon (ork_npu_uses_orkd). In this
@@ -1526,6 +1532,15 @@ struct ggml_backend_ork_context {
     int last_abits = 0;
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
+    /* FLASH_ATTN_EXT accounting. The handler carried NO ORK_PROFILE counter of any kind, so every
+     * attention call made through it was invisible to the profile and fell in the unattributed
+     * remainder alongside the ops ork never claims. Timed at the CALL SITE, like the
+     * ork_cpu_decode_m1 fix above: the handler declines several shapes through early returns and
+     * only the caller knows the call actually did work. The sub-paths are separate kernels, not
+     * variants of one (prefill fp16 stream / decode resident-KV / decode per-call repack / declined
+     * to the CPU delegate), so each gets its own bucket. fa_path is the tag the handler sets at its
+     * point of no return and the call site reads back. */
+    double fa_us[FA_NPATH] = {0,0,0,0}; long fa_n[FA_NPATH] = {0,0,0,0}; int fa_path = FA_DECLINE;
     double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
     /* W4A4 activation prep (divide-by-smooth -> rotate -> scale search -> quantise). aq_wall is the
      * whole per-call block; the five stage timers are CPU time summed over the omp threads and only
@@ -5917,6 +5932,10 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
 // submit floor. All g[i] are 2D (ne2==ne3==1), same K and M. Weight cached by g[0]->src0->data.
 static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_group_i8 ng=%d\n", ng); fflush(stderr);
+    /* t_quant was never incremented on this path, so the weight resolve + shared-activation quant below
+     * landed in NO bucket at all -- not run, not quant, not even misc. Same window as mul_mat_i8: t0 to
+     * the submit. (The scatter+dequant after the submit goes to t_deq, as it does there.) */
+    const double _t0 = ctx->profile ? ork_now_us() : 0;
     const struct ggml_tensor * src1 = g[0]->src[1];
     const int K = (int) g[0]->src[0]->ne[0];
     const int M = (int) src1->ne[1];
@@ -6059,7 +6078,8 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 #endif
         }
     }
-    if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
+    if (ctx->profile) { const double t3 = ork_now_us();
+        ctx->t_quant += t1-_t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++;
         if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
     return true;
 }
@@ -6070,6 +6090,10 @@ static bool ggml_backend_ork_mul_mat_group_i8(ggml_backend_ork_context * ctx, st
 // same input in the per-node path), runs ONE W4A4 submit, scatters per-channel-dequant into each dst.
 static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, struct ggml_tensor ** g, int ng) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_group_i4 ng=%d\n", ng); fflush(stderr);
+    /* As in mul_mat_group_i8: without this the weight build + the shared FWHT-rotate-and-int4-quant of
+     * the activation were in no bucket at all. Here the untimed block is the BIGGER of the two, because
+     * the rotation is in it. */
+    const double _t0 = ctx->profile ? ork_now_us() : 0;
     const struct ggml_tensor * src1 = g[0]->src[1];
     const int K = (int) g[0]->src[0]->ne[0];
     const int M = (int) src1->ne[1];
@@ -6140,7 +6164,8 @@ static bool ggml_backend_ork_mul_mat_group_i4(ggml_backend_ork_context * ctx, st
             for (int n = 0; n < Ni; n++) dr[n] = rs * bs[o+n] * (float) cr[n];
         }
     }
-    if (ctx->profile) { ctx->t_run += t2-t1; ctx->n_mm++;
+    if (ctx->profile) { const double t3 = ork_now_us();
+        ctx->t_quant += t1-_t0; ctx->t_run += t2-t1; ctx->t_deq += t3-t2; ctx->n_mm++;
         if (M > 1) { ctx->t_run_pf += t2-t1; ctx->n_pf++; ctx->m_pf += M; } else { ctx->t_run_dec += t2-t1; ctx->n_dec++; } }
     return true;
 }
@@ -6151,10 +6176,19 @@ static const char * ggml_backend_ork_get_name(ggml_backend_t backend) { return "
 
 // LEVER3: profile dump, callable from backend free OR atexit (llama-bench never frees the backend).
 static int g_ork_prof_dumped = 0;
+static void ork_segtime_dump(const char * why);   // defined with the SEG table, below
 static void ork_profile_dump(ggml_backend_ork_context * ctx) {
     if (!ctx || g_ork_prof_dumped) return;
     if (ctx->profile) fprintf(stderr, "[ork DUMP] profile=%d n_mm=%ld t_quant=%.0fms t_run=%.0fms t_deq=%.0fms t_actq=%.0fms\n",
                               ctx->profile, ctx->n_mm, ctx->t_quant/1e3, ctx->t_run/1e3, ctx->t_deq/1e3, ctx->t_actq/1e3);
+    /* FLASH_ATTN_EXT, per sub-path. Printed outside the n_mm guard: the op has no matmul counter of its
+     * own, so gating it on n_mm would hide it in exactly the runs where attention is all there is. */
+    if (ctx->profile) { double fat = 0; for (int p = 0; p < FA_NPATH; p++) fat += ctx->fa_us[p];
+        if (fat > 0) { fprintf(stderr, "[ork FLASH-ATTN] %.0fms total\n", fat/1e3);
+            for (int p = 0; p < FA_NPATH; p++) if (ctx->fa_n[p])
+                fprintf(stderr, "  %-26s %9.1f ms (%5.1f%%) n=%ld, %.0f us/call\n", g_fa_name[p],
+                        ctx->fa_us[p]/1e3, 100.0*ctx->fa_us[p]/fat, ctx->fa_n[p], ctx->fa_us[p]/ctx->fa_n[p]); } }
+    ork_segtime_dump("final");
     if (ctx->profile && ctx->n_mm) {
         g_ork_prof_dumped = 1;
         double tot = ctx->t_quant + ctx->t_run + ctx->t_deq;
@@ -6902,6 +6936,20 @@ static void * ork_dma_grow(ork_npu * npu, void ** buf, size_t * sz, size_t need)
 // We GROUP tokens by their selected expert and run ONE M=count matmul per active expert (M-padded to 32
 // like the dense path) — for prefill (M>1) this amortizes the submit floor + the expert-weight read
 // across the routed tokens; for decode (M=1) it degenerates to one matmul per selected expert.
+/* MUL_MAT_ID exit accounting. Every exit of the handler below used to do `t_run += now - t0`, i.e. it
+ * attributed its WHOLE wall to t_run -- which the profile reports as NPU run time and most of it is not:
+ * the expert gather, the per-token activation quant and the scatter are host work, and one exit does no
+ * submit at all. t_quant was never incremented on this path, so there was no bucket for any of it. This
+ * splits the wall at the one boundary the handler already measures: `submit_us` is the part that really
+ * was submits, the rest joins the host-prep bucket the rest of the backend uses. submit_us == 0 is a
+ * statement about that exit (no submit happened), not a default to fall back on. */
+static inline void ork_mmid_account(ggml_backend_ork_context * ctx, double t0, double submit_us) {
+    if (!ctx->profile) return;
+    const double w = ork_now_us() - t0;
+    double s = submit_us < 0 ? 0 : submit_us; if (s > w) s = w;
+    ctx->t_run += s; ctx->t_quant += w - s; ctx->n_mm++;
+}
+
 static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
     if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] START mul_mat_id_i8\n"); fflush(stderr);
     const struct ggml_tensor * src0 = dst->src[0];   // experts [K, N, n_expert]
@@ -6948,7 +6996,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 }
             }
         }
-        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+        ork_mmid_account(ctx, t0, /*submit_us=*/0);   // convert mode computes on the CPU; nothing was submitted
         return true;
     }
 
@@ -7103,12 +7151,15 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         }
         // #54 pass 2: ONE coalesced doorbell for ALL this tensor's M>=2 experts (chained across cores), then
         // per-expert fp32 dequant scatter. Replaces the per-expert submit storm (~1152/layer -> ~nc/layer).
+        double _i4sub_us = 0;   // the submit share of this exit's wall (see ork_mmid_account)
         if (!co_tasks.empty()) {
             // #54 DEFAULT = per-expert via ork_i4_mm_run -> run_i4_bchain_db, which rides the PROVEN doorbell
             // recover (mc_recover_resubmit: RESET + re-seed + resubmit missed cores, domain-safe — the same path
             // Per-expert int4 submit (rides mc_recover_resubmit; multi-domain-safe). co_ci[q] feeds the dequant below.
+            const double _s0 = ctx->profile ? ork_now_us() : 0;
             for (size_t q = 0; q < co_tasks.size(); q++)
                 if (ork_i4_mm_run(ctx->npu, co_tasks[q].w, co_tasks[q].M, co_ai[q].data(), co_ci[q].data())) return false;
+            if (ctx->profile) _i4sub_us = ork_now_us() - _s0;
             for (size_t q = 0; q < co_tasks.size(); q++) {
                 const int32_t * ciq = co_ci[q].data(); const float * asq = co_as[q].data(); const float * bs = co_bs[q];
                 for (int r = 0; r < co_Mr[q]; r++) {
@@ -7119,7 +7170,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
                 }
             }
         }
-        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+        ork_mmid_account(ctx, t0, _i4sub_us);
         return true;
     }
 
@@ -7528,7 +7579,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             if (ctx->profile && ctx->moe_calls < 4)
                 fprintf(stderr,"[ORK PATH-B/PARK] K=%d N=%d Snpu=%d cpuE=%d park=%d npu=%.0fus cpu=%.0fus comb=%.0fus wall=%.0fus eff=%.2fx\n",
                     K,N,Snpu,(int)cpu_e.size(),park_e,npu_dt,cpu_dt,cb1-cb0,cb1-pb_t0,(npu_dt+cpu_dt)>0?(npu_dt+cpu_dt)/(cb1-pb_t0):0.0);
-            if (ctx->profile){ctx->t_run+=ork_now_us()-t0;ctx->n_mm++;ctx->moe_calls++;}
+            if (ctx->profile) ctx->moe_calls++;
+            ork_mmid_account(ctx, t0, npu_dt);
             return true;
         }
 
@@ -7632,7 +7684,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             fprintf(stderr, "[ORK PATH-B] K=%d N=%d S_act=%d Snpu=%d P=%d npu=%.0fus cpu=%.0fus comb=%.0fus wall=%.0fus eff=%.2fx\n",
                     K, N, S_act, Snpu, P, npu_dt, cpu_dt, cb1-cb0, cb1-pb_t0,
                     (npu_dt+cpu_dt)>0 ? (npu_dt+cpu_dt)/(cb1-pb_t0) : 0.0);
-        if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; ctx->moe_calls++; }
+        if (ctx->profile) ctx->moe_calls++;
+        ork_mmid_account(ctx, t0, npu_dt);
         return true;
     }
     // ========================== END PATH (b) ==========================================
@@ -7828,7 +7881,7 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
 
     if (ctx->profile && ctx->moe_calls < 4) fprintf(stderr, "[ork MoE-DIM] K=%d N=%d S=%d type=%d (chain-envelope K%%512==0&&K<=4096: %s)\n", K, N, (int)hot_e.size(), (int)type, (K%512==0&&K<=4096)?"YES":"no");
     const int S = (int) hot_e.size();
-    if (S == 0) { run_cold(); if (ctx->profile) { ctx->t_run += ork_now_us() - t0; ctx->n_mm++; } return true; }
+    if (S == 0) { run_cold(); ork_mmid_account(ctx, t0, /*submit_us=*/0); return true; }   // all-cold: CPU GEMV, no submit
 
     // Pack the hot experts' routed rows into one chained submit (run_chain_i8; per-task run_i8 fallback
     // for the K=1792 down-proj that sits outside the chain envelope).
@@ -7917,7 +7970,9 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
         t_npu.join();
         crc = crc_a.load();
     }
-    if (ctx->profile) { ctx->moe_chain += ork_now_us() - ch0; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
+    double _chain_us = 0;   // the submit share of this exit's wall (see ork_mmid_account)
+    if (ctx->profile) { _chain_us = ork_now_us() - ch0;
+        ctx->moe_chain += _chain_us; ctx->moe_calls++; ctx->moe_chain_S_sum += S; }
     if (crc) { if(getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK] mul_mat_id partition run FAIL rc=%d S=%d K=%d N=%d\n", crc, S, K, N); return false; }
 
     const double sc0 = ctx->profile ? ork_now_us() : 0;
@@ -7933,7 +7988,8 @@ static bool ggml_backend_ork_mul_mat_id_i8(ggml_backend_ork_context * ctx, struc
             for (int n = 0; n < N; n++) dr[n] = as * bs[n] * (float) cr[n];
         }
     }
-    if (ctx->profile) { ctx->moe_scatter += ork_now_us() - sc0; ctx->t_run += ork_now_us() - t0; ctx->n_mm++; }
+    if (ctx->profile) ctx->moe_scatter += ork_now_us() - sc0;
+    ork_mmid_account(ctx, t0, _chain_us);
     return true;
 }
 
@@ -9559,7 +9615,50 @@ static bool ggml_backend_ork_binop_npu(ggml_backend_ork_context * ctx, struct gg
     return true;
 }
 
+/* PER-OP-CATEGORY WALL ACCOUNTING (ORK_SEG_TIME, and ORK_PROFILE which implies it).
+ *
+ * The matmul counters (t_quant / t_run / t_deq) only ever see MUL_MAT handlers, so everything else ork
+ * does -- attention, softmax, norms, RoPE, residuals, the activation ops, and the nodes it hands to its
+ * own nested CPU backend -- was unattributed by construction. This table closes that: every arm of the
+ * graph_compute dispatch switch now lands in exactly one category, SEG_GRAPH holds the wall of the whole
+ * graph_compute call, and SEG_GRAPH minus the sum of the rest is ork's own dispatch/bookkeeping. What is
+ * left over after THAT -- benchmark wall minus SEG_GRAPH -- is by definition outside this backend: the
+ * other backends' graph splits plus the ggml scheduler.
+ *
+ * g_cpudel_* is an OVERLAPPING sub-measure, not a category: it is the part of some other category's time
+ * that went to the nested CPU backend. Reported as "of which", never summed into the total. */
+enum { SEG_QKV, SEG_QKT, SEG_SM, SEG_AV, SEG_O, SEG_FFN, SEG_OTH,
+       SEG_MMID, SEG_FA, SEG_NORM, SEG_ROPE, SEG_ADD, SEG_MUL, SEG_UNARY, SEG_GLU, SEG_SSM, SEG_N };
+static double g_seg_us[SEG_N]; static long g_seg_n[SEG_N]; static int g_segtime = -1;
+static const char * g_seg_name[SEG_N] = {
+    "QKV proj", "QK^T scores", "softmax", "A.V", "O proj", "FFN gate/up/GLU/down", "other mul_mat",
+    "MUL_MAT_ID (MoE)", "flash-attn", "RMSNorm", "RoPE", "ADD (residual)", "MUL", "UNARY", "GLU", "SSM scan" };
+static double g_seg_graph_us = 0; static long g_seg_graph_n = 0;      // wall of the whole graph_compute
+static double g_cpudel_us = 0;    static long g_cpudel_n = 0;          // of which: nested CPU-backend delegate
+static inline double ork_seg_t0(void) { return g_segtime > 0 ? (double) ggml_time_us() : 0.0; }
+static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_us[cat] += (double) ggml_time_us() - t0; g_seg_n[cat]++; } }
+
+/* The table. Percentages are of the graph_compute wall, NOT of the category sum, so the unattributed
+ * row is readable as what it is. Compare the graph total against the harness's own prefill wall: the
+ * difference is everything the scheduler ran on OTHER backends plus its own overhead, which no counter
+ * inside this file can see. */
+static void ork_segtime_dump(const char * why) {
+    if (g_segtime <= 0 || g_seg_graph_n == 0) return;
+    double tot = 0; for (int k = 0; k < SEG_N; k++) tot += g_seg_us[k];
+    const double G = g_seg_graph_us;
+    fprintf(stderr, "[ORK SEG-TIME] %s: %.1f ms inside ggml_backend_ork_graph_compute over %ld graphs\n",
+            why, G/1000.0, g_seg_graph_n);
+    for (int k = 0; k < SEG_N; k++) if (g_seg_n[k])
+        fprintf(stderr, "  %-24s %9.1f ms (%5.1f%%) n=%ld\n",
+                g_seg_name[k], g_seg_us[k]/1000.0, 100.0*g_seg_us[k]/(G+1e-9), g_seg_n[k]);
+    fprintf(stderr, "  %-24s %9.1f ms (%5.1f%%)   <- graph wall minus the categories above\n",
+            "ork dispatch/bookkeeping", (G-tot)/1000.0, 100.0*(G-tot)/(G+1e-9));
+    if (g_cpudel_n) fprintf(stderr, "  %-24s %9.1f ms (%5.1f%%) n=%ld  (OVERLAPS the rows above, not summed)\n",
+            "of which CPU-delegated", g_cpudel_us/1000.0, 100.0*g_cpudel_us/(G+1e-9), g_cpudel_n);
+}
+
 static bool ork_cpu_delegate_node(ggml_backend_ork_context * ctx, struct ggml_tensor * node) {
+    const double _cd0 = ork_seg_t0();
     if (!ctx->cpu_backend) { ctx->cpu_backend = ggml_backend_cpu_init(); if (ctx->cpu_backend) ggml_backend_cpu_set_n_threads(ctx->cpu_backend, 4); }
     if (!ctx->cpu_backend) return false;
     const size_t mo = ggml_tensor_overhead() * (GGML_MAX_SRC + 2) + ggml_graph_overhead();
@@ -9580,15 +9679,9 @@ static bool ork_cpu_delegate_node(ggml_backend_ork_context * ctx, struct ggml_te
     ggml_build_forward_expand(gf, op);
     enum ggml_status st = ggml_backend_graph_compute(ctx->cpu_backend, gf);
     ggml_free(g);
+    if (g_segtime > 0) { g_cpudel_us += (double) ggml_time_us() - _cd0; g_cpudel_n++; }
     return st == GGML_STATUS_SUCCESS;
 }
-
-// ORK_SEG_TIME: per-op-category wall-time accounting for the segment-map table (measured, not estimated).
-enum { SEG_QKV, SEG_QKT, SEG_SM, SEG_AV, SEG_O, SEG_FFN, SEG_OTH, SEG_N };
-static double g_seg_us[SEG_N]; static long g_seg_n[SEG_N]; static int g_segtime = -1;
-static const char * g_seg_name[SEG_N] = { "QKV proj", "QK^T scores", "softmax", "A.V", "O proj", "FFN gate/up/GLU/down", "other mul_mat" };
-static inline double ork_seg_t0(void) { return g_segtime > 0 ? (double) ggml_time_us() : 0.0; }
-static inline void ork_seg_add(int cat, double t0) { if (g_segtime > 0) { g_seg_us[cat] += (double) ggml_time_us() - t0; g_seg_n[cat]++; } }
 
 // ORK_STATIC_GRAPH (assembler, step 1 — the planner). Recognize a contiguous ork layer subgraph (only
 // possible once ORK_CLAIM_OPS pulls RMSNorm/RoPE/MUL/ADD into ork's hands) and classify each node into the
@@ -10064,7 +10157,8 @@ static bool ggml_backend_ork_flash_attn_decode(ggml_backend_ork_context * ctx, s
     // (ORK_ATTN_KV_REPACK=1) and is PERF-NEGATIVE: measured 169-308x the cost of an append, and
     // 68-96% of the whole per-step cost, which is what made on-NPU decode attention lose outright.
     static const int kv_res = getenv("ORK_ATTN_KV_REPACK") ? 0 : 1;
-    if (kv_res && DK==DV) return ggml_backend_ork_flash_attn_decode_kv(ctx, dst);
+    if (kv_res && DK==DV) { ctx->fa_path = FA_DEC_KV; return ggml_backend_ork_flash_attn_decode_kv(ctx, dst); }
+    ctx->fa_path = FA_DEC_REPACK;   // past every shape gate: this call will do the work (see fa_us)
     float scale=1.0f; memcpy(&scale,(char*)dst->op_params+0,4);
     ork_npu *c = ctx->npu;
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
@@ -10100,6 +10194,7 @@ done:
     return ok;
 }
 static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, struct ggml_tensor * dst) {
+    ctx->fa_path = FA_DECLINE;   // every early return below leaves it here; each path tags itself when it commits
     if ((int)dst->src[0]->ne[1] == 1) return ggml_backend_ork_flash_attn_decode(ctx, dst);   // decode -> int8 orkd path
     const struct ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
     const int DK=(int)q->ne[0], N=(int)q->ne[1], H=(int)q->ne[2], Bt=(int)q->ne[3];
@@ -10113,6 +10208,7 @@ static bool ggml_backend_ork_flash_attn_ext(ggml_backend_ork_context * ctx, stru
     if (DK%32 || DV%16) return false;
     struct ork_attn_pool * P = attn_pool_ensure(ctx, DK, DV, N, nkvp, H);   // co-domain with the active domain
     if (!P) return false;
+    ctx->fa_path = FA_PREFILL;   // past every shape gate + the pool alloc: this call will do the work
     auto rdf = [](const struct ggml_tensor * t, int64_t i0,int64_t i1,int64_t i2,int64_t i3) -> float {
         const char * p=(const char*)t->data + i0*t->nb[0]+i1*t->nb[1]+i2*t->nb[2]+i3*t->nb[3];
         return t->type==GGML_TYPE_F16 ? (float)*(const ork_f16*)p : *(const float*)p; };
@@ -10490,7 +10586,11 @@ extern "C" int ggml_backend_ork_residence_report(void) {
 }
 
 static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    if (g_segtime < 0) g_segtime = getenv("ORK_SEG_TIME") ? 1 : 0;
+    /* ORK_PROFILE implies ORK_SEG_TIME. The matmul counters cover only MUL_MAT handlers, so a profile
+     * run without the category table reports a remainder it cannot name -- which is exactly how the
+     * non-matmul half of prefill stayed unattributed. Two ggml_time_us() per node is noise against it. */
+    if (g_segtime < 0) g_segtime = (getenv("ORK_SEG_TIME") || getenv("ORK_PROFILE")) ? 1 : 0;
+    const double _g0 = ork_seg_t0();
     if (getenv("ORK_STATIC_GRAPH") && cgraph->n_nodes >= 8) { static int _p = 0; if (_p++ < 2) ork_log_static_plan(cgraph); }
     ggml_backend_ork_context * ctx = (ggml_backend_ork_context *) backend->context;
     ctx->last_src1 = nullptr;
@@ -10864,27 +10964,39 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 break;
             }
             case GGML_OP_MUL_MAT_ID: {
+                double _t = ork_seg_t0();
                 if (!ggml_backend_ork_mul_mat_id_i8(ctx, node)) return GGML_STATUS_FAILED;
+                ork_seg_add(SEG_MMID, _t);
                 break;
             }
             case GGML_OP_MUL: {   // ORK_OPS_NPU -> NPU ewmul (broadcast-aware); ORK_CLAIM_OPS -> CPU-delegate; else NPU ewmul
-                if (getenv("ORK_OPS_NPU") && ggml_backend_ork_binop_npu(ctx, node, false)) break;
-                if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
+                double _t = ork_seg_t0();
+                if (!(getenv("ORK_OPS_NPU") && ggml_backend_ork_binop_npu(ctx, node, false))) {
+                    if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_mul_f16(ctx, node)) return GGML_STATUS_FAILED;
+                }
+                ork_seg_add(SEG_MUL, _t);
                 break;
             }
             case GGML_OP_ADD: {   // residual add: fp16 accumulates error over layers -> OPT-IN only (ORK_OPS_NPU_ADD);
                                   // default keeps it fp32 (delegate). ORK_CLAIM_OPS -> CPU-delegate; else NPU add.
-                if (getenv("ORK_OPS_NPU_ADD") && ggml_backend_ork_binop_npu(ctx, node, true)) break;
-                if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
+                double _t = ork_seg_t0();
+                if (!(getenv("ORK_OPS_NPU_ADD") && ggml_backend_ork_binop_npu(ctx, node, true))) {
+                    if (getenv("ORK_CLAIM_OPS") ? !ork_cpu_delegate_node(ctx, node) : !ggml_backend_ork_add_f16(ctx, node)) return GGML_STATUS_FAILED;
+                }
+                ork_seg_add(SEG_ADD, _t);
                 break;
             }
             case GGML_OP_UNARY: {
+                double _t = ork_seg_t0();
                 const bool gelu = ggml_get_unary_op(node) == GGML_UNARY_OP_GELU;
                 if (!ggml_backend_ork_unary_i8(ctx, node, gelu)) return GGML_STATUS_FAILED;
+                ork_seg_add(SEG_UNARY, _t);
                 break;
             }
             case GGML_OP_GLU: {
+                double _t = ork_seg_t0();
                 if (!ggml_backend_ork_glu(ctx, node)) return GGML_STATUS_FAILED;
+                ork_seg_add(SEG_GLU, _t);
                 break;
             }
             case GGML_OP_SOFT_MAX: {   // 2b: attention softmax — exp on the NPU (supports_op gates the claimed cases)
@@ -10896,18 +11008,30 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
             case GGML_OP_RMS_NORM:
             case GGML_OP_ROPE: {   // #1: claimed boundary op. ORK_OPS_NPU -> run RoPE on the NPU
                                    // (ork_f16_npu_rope_neox); else CPU-delegate (keeps the layer one ork subgraph).
+                double _t = ork_seg_t0();
                 bool done = false;
                 if (getenv("ORK_OPS_NPU")) done = (node->op == GGML_OP_ROPE) ? ggml_backend_ork_rope_npu(ctx, node)
                                                                               : ggml_backend_ork_rmsnorm_npu(ctx, node);
                 if (!done && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                ork_seg_add(node->op == GGML_OP_ROPE ? SEG_ROPE : SEG_NORM, _t);
                 break;
             }
             case GGML_OP_SSM_SCAN: {
+                double _t = ork_seg_t0();
                 if (!ggml_backend_ork_ssm_scan(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                ork_seg_add(SEG_SSM, _t);
                 break;
             }
             case GGML_OP_FLASH_ATTN_EXT: {
+                /* Timed at the CALL SITE and bucketed by the sub-path the handler tagged: it has several
+                 * early returns that decline the shape, and only the caller knows the call did work.
+                 * Before this the whole op was absent from ORK_PROFILE -- no t_run, no n_mm, nothing. */
+                double _t = ork_seg_t0();
+                const double _fa0 = ctx->profile ? ork_now_us() : 0;
                 if (!ggml_backend_ork_flash_attn_ext(ctx, node) && !ork_cpu_delegate_node(ctx, node)) return GGML_STATUS_FAILED;
+                if (ctx->profile) { const int p = ctx->fa_path;
+                    ctx->fa_us[p] += ork_now_us() - _fa0; ctx->fa_n[p]++; }
+                ork_seg_add(SEG_FA, _t);
                 break;
             }
             case GGML_OP_NONE:
@@ -10920,12 +11044,8 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
-    if (g_segtime > 0) { static long _c = 0; if (++_c % 40 == 0) {
-        double tot = 0; for (int k = 0; k < SEG_N; k++) tot += g_seg_us[k];
-        fprintf(stderr, "[ORK SEG-TIME] cumulative NPU-op wall over %ld graphs (warmup+prefill dominate):\n", _c);
-        for (int k = 0; k < SEG_N; k++) if (g_seg_n[k])
-            fprintf(stderr, "  %-24s %8.1f ms (%5.1f%%) n=%ld\n", g_seg_name[k], g_seg_us[k]/1000.0, 100.0*g_seg_us[k]/(tot+1e-9), g_seg_n[k]);
-    } }
+    if (g_segtime > 0) { g_seg_graph_us += (double) ggml_time_us() - _g0; g_seg_graph_n++;
+        static long _c = 0; if (getenv("ORK_SEG_TIME") && ++_c % 40 == 0) ork_segtime_dump("periodic"); }
     return GGML_STATUS_SUCCESS;
     GGML_UNUSED(backend);
 }
