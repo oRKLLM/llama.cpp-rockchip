@@ -1731,8 +1731,15 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
                  * mid-eval free on the int4 path, which is the documented route to fragmenting the
                  * 32-bit IOVA into import-ENOMEM (ork_ffn_prep refuses to evict for the same reason).
                  * The int4 budget is enforced at the LOAD-TIME PLANNER, which cannot wedge the board.
-                 * wbits==4 is exactly the native int4 tier: DT_I4_ROT_A8 and friends carry wbits==8. */
-                it->second.wbits != 4 &&
+                 * wbits==4 is exactly the native int4 tier: DT_I4_ROT_A8 and friends carry wbits==8.
+                 *
+                 * NOT in convert mode. There the budget above is deliberately 0 because the design IS
+                 * pack -> dump -> free, which is what lets a conversion "fit ANY model size"; refusing
+                 * to free int4 there makes the resident set grow for the whole build and loses exactly
+                 * that property on a MIXED convert (a pure-int4 convert never reaches this function).
+                 * The hazard guarded above is a mid-EVAL free racing an in-flight chained submit, and a
+                 * convert frees BETWEEN ops, not under one. */
+                (ork_persist_writes(ctx) || it->second.wbits != 4) &&
                 (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
         if (lru == ctx->wcache.end()) break;   // all remaining entries are pinned by the active op — can't free more
         ork_slice_ws_drop(ctx, lru->second.w);
