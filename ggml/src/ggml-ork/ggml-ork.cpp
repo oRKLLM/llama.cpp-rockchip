@@ -1443,6 +1443,11 @@ struct ggml_backend_ork_context {
     // ORK_PROFILE=1: accumulate where time goes, report on free (split decode M=1 vs prefill M>1)
     double t_quant = 0, t_run = 0, t_deq = 0; long n_mm = 0; int profile = 0;
     double t_actq = 0; long n_actq = 0;   // LEVER3: pure activation-quant arithmetic (NEON absmax+quantize loop), split out of t_quant
+    /* W4A4 activation prep (divide-by-smooth -> rotate -> scale search -> quantise). aq_wall is the
+     * whole per-call block; the five stage timers are CPU time summed over the omp threads and only
+     * run under ORK_ACTQ_PROF=1. aq_bytes counts the activation bytes each stage reads or writes. */
+    double aq_wall = 0, aq_cpu_memcpy = 0, aq_cpu_smooth = 0, aq_cpu_rot = 0, aq_cpu_scale = 0, aq_cpu_quant = 0;
+    long   aq_calls = 0, aq_reuse = 0; double aq_elems = 0, aq_bytes = 0; int aq_threads = 0;
     double t_run_dec = 0, t_run_pf = 0; long n_dec = 0, n_pf = 0, m_pf = 0;
     // STREAMING sub-breakdown (ORK_PROFILE): where weight-resolution time goes for the 7B streamed prefill.
     // These split the t_quant bucket's weight-side from the activation-quant. Microseconds.
@@ -4353,6 +4358,22 @@ static inline float ork_clip_step(void) { static const float v = getenv("ORK_I4_
                                       return v > 0.0f ? v : 0.0625f; }
 #define ORK_I4_CLIP_N 8
 static bool ork_i4_clip_on(void) { static const int e = getenv("ORK_I4_NOCLIP") == nullptr; return e; }
+/* ORK_ACTQ_PROF=1 — per-stage CPU time inside the W4A4 activation-prep loop. Five clock reads per row
+ * (~0.1% of the loop at the measured per-row cost), so it stays opt-in rather than riding ORK_PROFILE. */
+static bool ork_actq_prof(void) { static const int e = getenv("ORK_ACTQ_PROF") != nullptr; return e; }
+static bool ork_actq_sum(void) { static const int e = getenv("ORK_ACTQ_SUM") != nullptr; return e; }
+/* ORK_ACTQ_SCALAR=1 — run the pre-vectorisation scalar clip search and quantise. One binary then serves
+ * both A/B arms, which removes the build hazard where two trees produce byte-identical objects. */
+static bool ork_actq_scalar(void) { static const int e = getenv("ORK_ACTQ_SCALAR") != nullptr; return e; }
+/* The activation-prep rows are split across all eight cores, but the four A55s are ~5x slower than the
+ * A76s on this code, so an even static split leaves the big cores idle for most of the loop -- measured
+ * par-eff 4.79 of 8 threads, and a 2.5x WALL penalty. Dynamic scheduling lets the A76s take the rows the
+ * A55s have not reached (par-eff 7.5). OMP_SCHEDULE still overrides, for A/B. */
+static void ork_actq_sched_default(void) {
+    static const int once = [](){ if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_dynamic, 1); return 1; }();
+    (void) once;
+}
+static uint64_t g_actq_digest = 1469598103934665603ull; static double g_actq_nelem = 0;
 
 /* ORK_I4_NOROT=1 — build and run the native-W4A4 tier WITHOUT the Hadamard rotation.
  *
@@ -4562,8 +4583,35 @@ static inline void ork_w4a4_rot_k(float * v, int K) {
  * Same search as the activation version — scan alpha down from 1.0, keep the scale minimising squared
  * reconstruction error — because trading a little clipping of the extremes for finer steps across the
  * bulk is usually a net win on Gaussian-ish weights. ORK_I4_NOWCLIP restores absmax for A/B. */
-static inline float ork_w_scale_mse(const float * a, int K, int qmax, int qmin) {
+/* The clip search is the single largest CPU term in W4A4 prefill (ORK_ACTQ_PROF: 81% of the activation
+ * prep, itself a third of the prefill wall), and it is pure ALU -- 8 candidate scales x K elements of
+ * round/clamp/residual, moving 8 GB over a whole 2048-token run, i.e. 0.3 GB/s. So it is vectorised, not
+ * re-blocked. The NEON core keeps the scalar version's arithmetic ELEMENT FOR ELEMENT (round-to-nearest-
+ * even via FRINTN, q*s exact because q is a small integer, one rounding for the residual); only the error
+ * sum is split across four lanes. Measured zero scale differences on every row of a full prefill. */
+#if defined(__ARM_NEON) && defined(__aarch64__)
+static inline float ork_clip_absmax(const float * a, int K) {
+    float32x4_t m = vdupq_n_f32(1e-9f); int k = 0;
+    for (; k + 16 <= K; k += 16) {
+        m = vmaxq_f32(m, vabsq_f32(vld1q_f32(a+k)));    m = vmaxq_f32(m, vabsq_f32(vld1q_f32(a+k+4)));
+        m = vmaxq_f32(m, vabsq_f32(vld1q_f32(a+k+8)));  m = vmaxq_f32(m, vabsq_f32(vld1q_f32(a+k+12)));
+    }
+    for (; k + 4 <= K; k += 4) m = vmaxq_f32(m, vabsq_f32(vld1q_f32(a+k)));
+    float mx = vmaxvq_f32(m);
+    for (; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
+    return mx;
+}
+#endif
+static inline float ork_scale_mse_core(const float * a, int K, int qmax, int qmin, bool vec) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const bool SC = !vec || ork_actq_scalar();
+#else
+    const bool SC = true; (void) vec;
+#endif
     float mx = 1e-9f;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if (!SC) mx = ork_clip_absmax(a, K); else
+#endif
     for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
     float best_s = mx / (float) qmax; double best_e = -1.0;
     const int    NT = ork_clip_n(); const float ST = ork_clip_step();
@@ -4574,7 +4622,27 @@ static inline float ork_w_scale_mse(const float * a, int K, int qmax, int qmin) 
         if (s <= 0.0f) continue;
         const float inv = 1.0f / s;
         double e = 0.0;
-        for (int k = 0; k < K; k++) {
+        int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        if (!SC) {
+            const float32x4_t vinv = vdupq_n_f32(inv);
+            const float32x4_t vhi = vdupq_n_f32((float) qmax), vlo = vdupq_n_f32((float) qmin);
+            const float64x2_t vs = vdupq_n_f64((double) s);
+            float64x2_t e0 = vdupq_n_f64(0.0), e1 = vdupq_n_f64(0.0);
+            for (; k + 4 <= K; k += 4) {
+                const float32x4_t av = vld1q_f32(a + k);
+                float32x4_t qf = vrndnq_f32(vmulq_f32(av, vinv));
+                qf = vminq_f32(vmaxq_f32(qf, vlo), vhi);
+                const float64x2_t a0 = vcvt_f64_f32(vget_low_f32(av)), a1 = vcvt_high_f64_f32(av);
+                const float64x2_t q0 = vcvt_f64_f32(vget_low_f32(qf)), q1 = vcvt_high_f64_f32(qf);
+                const float64x2_t d0 = vfmsq_f64(a0, q0, vs), d1 = vfmsq_f64(a1, q1, vs);
+                e0 = vaddq_f64(e0, vmulq_f64(d0, d0));
+                e1 = vaddq_f64(e1, vmulq_f64(d1, d1));
+            }
+            e = (vgetq_lane_f64(e0,0) + vgetq_lane_f64(e0,1)) + (vgetq_lane_f64(e1,0) + vgetq_lane_f64(e1,1));
+        }
+#endif
+        for (; k < K; k++) {
             int q = (int) lrintf(a[k] * inv); q = q > qmax ? qmax : (q < qmin ? qmin : q);
             const double d = (double) a[k] - (double) q * s;
             e += d * d;
@@ -4583,28 +4651,40 @@ static inline float ork_w_scale_mse(const float * a, int K, int qmax, int qmin) 
     }
     return best_s;
 }
+
+/* Round-to-nearest-even then clamp, as lrintf+clamp does: FCVTNS is the same rounding, and clamping the
+ * float before the convert is equivalent because the bounds are exactly representable. */
+static inline void ork_quant_row(const float * a, int K, float inv, int qmax, int qmin, int8_t * o) {
+    int k = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const float32x4_t vhi = vdupq_n_f32((float) qmax), vlo = vdupq_n_f32((float) qmin);
+    for (; !ork_actq_scalar() && k + 16 <= K; k += 16) {
+        const int32x4_t i0 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(a+k   ), vinv), vlo), vhi));
+        const int32x4_t i1 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(a+k+4 ), vinv), vlo), vhi));
+        const int32x4_t i2 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(a+k+8 ), vinv), vlo), vhi));
+        const int32x4_t i3 = vcvtnq_s32_f32(vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(a+k+12), vinv), vlo), vhi));
+        const int16x8_t s0 = vcombine_s16(vmovn_s32(i0), vmovn_s32(i1));
+        const int16x8_t s1 = vcombine_s16(vmovn_s32(i2), vmovn_s32(i3));
+        vst1q_s8(o + k, vcombine_s8(vmovn_s16(s0), vmovn_s16(s1)));
+    }
+#endif
+    for (; k < K; k++) {
+        int q = (int) lrintf(a[k] * inv); o[k] = (int8_t) (q > qmax ? qmax : (q < qmin ? qmin : q));
+    }
+}
+
+/* The WEIGHT clip stays scalar. It runs once per weight at pack time and never on the hot path, so
+ * vectorising it buys nothing -- and the four-lane error sum, while identical on every rotated row
+ * measured, picked a different grid point on 2 of 30000 UNROTATED heavy-tailed rows whose error curve
+ * is flat to the last bit. A pack is persisted and compared across builds; it does not get to wobble. */
+static inline float ork_w_scale_mse(const float * a, int K, int qmax, int qmin) {
+    return ork_scale_mse_core(a, K, qmax, qmin, /*vec=*/false);
+}
 static bool ork_i4_wclip_on(void) { static const int e = getenv("ORK_I4_NOWCLIP") == nullptr; return e; }
 
 static inline float ork_i4_scale_mse(const float * a, int K) {
-    float mx = 1e-9f;
-    for (int k = 0; k < K; k++) { const float v = fabsf(a[k]); if (v > mx) mx = v; }
-    float best_s = mx / 7.0f; double best_e = -1.0;
-    const int    NT = ork_clip_n(); const float ST = ork_clip_step();
-    for (int t = 0; t < NT; t++) {
-        const float alpha = 1.0f - ST * (float) t;             /* default 1.000 .. 0.5625 */
-        if (alpha <= 0.0f) break;
-        const float s = alpha * mx / 7.0f;
-        if (s <= 0.0f) continue;
-        const float inv = 1.0f / s;
-        double e = 0.0;
-        for (int k = 0; k < K; k++) {
-            int q = (int) lrintf(a[k] * inv); q = q > 7 ? 7 : (q < -8 ? -8 : q);
-            const double d = (double) a[k] - (double) q * s;
-            e += d * d;
-        }
-        if (best_e < 0.0 || e < best_e) { best_e = e; best_s = s; }
-    }
-    return best_s;
+    return ork_scale_mse_core(a, K, 7, -8, /*vec=*/true);   /* alpha grid 1.000 .. 0.5625 by default */
 }
 
 /* ORK_MM_DUMP=<name-substring> — hash every intermediate of ONE matmul so two machines can be compared
@@ -5279,18 +5359,30 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             bool reuse = (y == ctx->last_src1 && M == ctx->last_M && K == ctx->last_K && ctx->last_type == 3 &&
                           ctx->last_abits == ow.abits && ctx->last_smooth == (const void *) ow.smooth.data() &&
                           !ctx->no_reuse);
+            ork_actq_sched_default();
+            const bool AQP = ctx->profile && ork_actq_prof();
+            const double _aqw0 = ctx->profile ? ork_now_us() : 0.0;
             if (!reuse) {
+                double c_mc = 0, c_sm = 0, c_ro = 0, c_sc = 0, c_qz = 0; int nthr = 1;
                 // activations: rotate each row (A·R), per-row int4 quant with shape padding
-                #pragma omp parallel for if (M_padded >= 16)
+                #pragma omp parallel if (M_padded >= 16)
+                {
+                #pragma omp single
+                nthr = omp_get_num_threads();
+                #pragma omp for schedule(runtime) reduction(+:c_mc,c_sm,c_ro,c_sc,c_qz)
                 for (int m = 0; m < M_padded; m++) {
+                    double _s0 = AQP ? ork_now_us() : 0.0, _s1 = 0, _s2 = 0, _s3 = 0, _s4 = 0;
                     if (m < M) {
                         float arow_local[K];
                         memcpy(arow_local, y + (size_t) m*K, (size_t) K*sizeof(float));
+                        if (AQP) { _s1 = ork_now_us(); c_mc += _s1 - _s0; }
                         /* SMOOTHQUANT: divide by the same per-channel vector the weights were
                          * multiplied by, BEFORE the rotation. Exact — see ork_smooth_build. */
                         if (!ow.smooth.empty())
                             for (int k = 0; k < K; k++) arow_local[k] /= ow.smooth[(size_t) k];
+                        if (AQP) { _s2 = ork_now_us(); c_sm += _s2 - _s1; }
                         ork_w4a4_rot_k(arow_local, K);
+                        if (AQP) { _s3 = ork_now_us(); c_ro += _s3 - _s2; }
                         /* MSE-optimal clip rather than absmax/7 — measured (ORK_W4A4_DIAG) to cut the
                          * ACTIVATION half of the W4A4 error by 11-39% (mean ~26%) on every weight of
                          * qwen3.5-0.8B. The two error halves are at parity and independent, so this is
@@ -5307,15 +5399,22 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                                for (int k = 0; k < K; k++) { float v = fabsf(arow_local[k]); if (v > mx) mx = v; }
                                s = mx / (float) AQMAX; }
                         as[m] = s;
-                        const float inv = 1.0f / s;
-                        for (int k = 0; k < K; k++) {
-                            int q = (int) lrintf(arow_local[k] * inv);
-                            ai[(size_t) m*K + k] = (int8_t) (q > AQMAX ? AQMAX : q < AQMIN ? AQMIN : q);
-                        }
+                        if (AQP) { _s4 = ork_now_us(); c_sc += _s4 - _s3; }
+                        ork_quant_row(arow_local, K, 1.0f / s, AQMAX, AQMIN, ai + (size_t) m*K);
+                        if (AQP) c_qz += ork_now_us() - _s4;
                     } else {
                         memset(ai + (size_t) m*K, 0, K);
                         as[m] = 0.0f;
                     }
+                }
+                }
+                if (ctx->profile) {
+                    ctx->aq_cpu_memcpy += c_mc; ctx->aq_cpu_smooth += c_sm; ctx->aq_cpu_rot += c_ro;
+                    ctx->aq_cpu_scale  += c_sc; ctx->aq_cpu_quant  += c_qz;
+                    ctx->aq_elems += (double) M * K;
+                    /* bytes an ideal single-pass implementation would move: read y, write ai, write as. */
+                    ctx->aq_bytes += (double) M * K * 5.0 + (double) M * 4.0;
+                    if (nthr > ctx->aq_threads) ctx->aq_threads = nthr;
                 }
                 ctx->last_src1 = y;
                 ctx->last_M = M;
@@ -5326,6 +5425,24 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             } else {
                 if(getenv("ORK_VERBOSE"))fprintf(stderr, "[ORK] i4 hadamard: reuse activation cache for y=%p\n", y);
                 fflush(stderr);
+            }
+            if (ctx->profile) {
+                const double _w = ork_now_us() - _aqw0;
+                ctx->aq_wall += _w; ctx->aq_calls++;
+                if (reuse) ctx->aq_reuse++; else { ctx->t_actq += _w; ctx->n_actq++; }
+            }
+            /* ORK_ACTQ_SUM=1 — running hash of every quantised activation the W4A4 path produces. Two
+             * builds that print the same digest produced byte-identical activations, which a PPL compare
+             * cannot establish on its own. Verification only: it reads back the whole buffer. */
+            if (ork_actq_sum() && !reuse) {
+                uint64_t h = g_actq_digest;
+                const uint64_t * p64 = (const uint64_t *) ai;
+                const size_t n64 = ((size_t) M_padded * K) / 8;
+                for (size_t i = 0; i < n64; i++) { h ^= p64[i]; h *= 1099511628211ull; h ^= h >> 29; }
+                for (size_t i = n64*8; i < (size_t) M_padded * K; i++) { h ^= (uint8_t) ai[i]; h *= 1099511628211ull; }
+                const uint32_t * ps = (const uint32_t *) as;
+                for (int i = 0; i < M_padded; i++) { h ^= ps[i]; h *= 1099511628211ull; }
+                g_actq_digest = h; g_actq_nelem += (double) M_padded * K;
             }
 
             /* ORK_A_DIAG: one line per W4A4 matmul describing exactly what is about to reach the NPU.
@@ -5358,7 +5475,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if (ow.gsize > 0) {
                 const int GRP = ow.gsize, SK = K / GRP;
                 std::vector<float> asg((size_t) M * SK);
-                #pragma omp parallel for schedule(static) if (M >= 16)
+                #pragma omp parallel for schedule(dynamic, 1) if (M >= 16)
                 for (int m = 0; m < M; m++) {
                     float arow[K];
                     memcpy(arow, y + (size_t) m*K, (size_t) K*sizeof(float));
@@ -5379,11 +5496,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
                                for (int k = k0; k < k1; k++) { float v = fabsf(arow[k]); if (v > mx) mx = v; }
                                s = mx / (float) GQMAX; }
                         asg[(size_t) m*SK + g] = s;
-                        const float inv = 1.0f / s;
-                        for (int k = k0; k < k1; k++) {
-                            int q = (int) lrintf(arow[k] * inv);
-                            ai[(size_t) m*K + k] = (int8_t) (q > GQMAX ? GQMAX : q < GQMIN ? GQMIN : q);
-                        }
+                        ork_quant_row(arow + k0, GRP, 1.0f / s, GQMAX, GQMIN, ai + (size_t) m*K + k0);
                     }
                 }
                 const int grc = (ow.wbits == 8)
@@ -5411,7 +5524,7 @@ static bool ggml_backend_ork_mul_mat_i4_hadamard(ggml_backend_ork_context * ctx,
             if (ow.wbits == 8 ? ork_i8_mm_run(ctx->npu, task.w, task.M, task.A, task.C)
                               : ork_i4_mm_run(ctx->npu, task.w, task.M, task.A, task.C)) return false;
             double _t2 = ctx->profile ? ork_now_us() : 0.0;
-            #pragma omp parallel for if (M >= 16)
+            #pragma omp parallel for schedule(dynamic, 4) if (M >= 16)
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
                     d[(size_t) m*N + n] = (float) ci[(size_t) m*N + n] * as[m] * ow.bscale[n];
@@ -5994,6 +6107,31 @@ static void ork_profile_dump(ggml_backend_ork_context * ctx) {
                 double W = ctx->t_quant + gtot;
                 fprintf(stderr, "[ork ACTQ] t_quant=%.0fms = arith(NEON absmax+quant) %.0fms (%.0f%% of wall) + resolve %.0fms (%.0f%%) + misc %.0fms (%.0f%%) | act-quant calls=%ld\n",
                     ctx->t_quant/1e3, actq/1e3, 100*actq/W, resolve_in_q/1e3, 100*resolve_in_q/W, misc/1e3, 100*misc/W, ctx->n_actq);
+            }
+            /* W4A4 activation prep. aq_wall is wall (the omp loop is internally parallel); the stage
+             * timers are CPU time summed over the threads, so they sum to more than the wall and are
+             * reported as shares of that CPU total plus a parallel efficiency against the wall. */
+            if (ork_actq_sum())
+                fprintf(stderr, "[ork ACTQ-DIGEST] %016llx over %.0f quantised activation elements\n",
+                        (unsigned long long) g_actq_digest, g_actq_nelem);
+            if (ctx->aq_calls) {
+                const double cpu = ctx->aq_cpu_memcpy + ctx->aq_cpu_smooth + ctx->aq_cpu_rot
+                                 + ctx->aq_cpu_scale  + ctx->aq_cpu_quant;
+                fprintf(stderr, "[ork ACTQ-W4A4] wall %.0fms over %ld calls (%ld reuse-hits, %ld computed) | "
+                        "%.3f Gelem %.2f GB (ideal 1-pass) | %.2f ns/elem wall | threads=%d\n",
+                        ctx->aq_wall/1e3, ctx->aq_calls, ctx->aq_reuse, ctx->aq_calls - ctx->aq_reuse,
+                        ctx->aq_elems/1e9, ctx->aq_bytes/1e9,
+                        ctx->aq_elems > 0 ? 1e3*ctx->aq_wall/ctx->aq_elems : 0.0, ctx->aq_threads);
+                if (cpu > 0)
+                    fprintf(stderr, "[ork ACTQ-W4A4] cpu %.0fms = memcpy %.0f (%.0f%%) smooth-div %.0f (%.0f%%) "
+                            "rotate %.0f (%.0f%%) scale-search %.0f (%.0f%%) quantise %.0f (%.0f%%) | "
+                            "par-eff %.2fx of %d threads\n",
+                            cpu/1e3, ctx->aq_cpu_memcpy/1e3, 100*ctx->aq_cpu_memcpy/cpu,
+                            ctx->aq_cpu_smooth/1e3, 100*ctx->aq_cpu_smooth/cpu,
+                            ctx->aq_cpu_rot/1e3,    100*ctx->aq_cpu_rot/cpu,
+                            ctx->aq_cpu_scale/1e3,  100*ctx->aq_cpu_scale/cpu,
+                            ctx->aq_cpu_quant/1e3,  100*ctx->aq_cpu_quant/cpu,
+                            ctx->aq_wall > 0 ? cpu/ctx->aq_wall : 0.0, ctx->aq_threads);
             }
         }
         if (ctx->moe_calls) {
