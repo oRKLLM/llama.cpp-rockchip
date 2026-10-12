@@ -81,8 +81,8 @@
 //                        to deliberately rebuild an existing pack at a different tier. int4 = compact int4
 //                        STORAGE + W8A8-inflate compute on the NPU (route B — int4 weights inflate int4->int8 and
 //                        run on the robust int8 kernel; coherent, no wedge). The win is the .orkpack STORAGE
-//                        (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4 (single-row,
-//                        wedge-prone at prefill) is OPT-IN via ORK_MIXED_W4A4.
+//                        (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4 (3.6x slower
+//                        at prefill, half the resident bytes) is OPT-IN via ORK_MIXED_W4A4.
 //                        *** RECOMMENDED int4 setup: build the orkpack from the model's UNQUANTIZED (F16/F32/BF16)
 //                        GGUF — the NF4 codebook is then auto-selected (best fidelity; building from an already-
 //                        quantized source is warned and falls back to the lossier uniform int4). Measured Qwen3-1.7B
@@ -98,11 +98,20 @@
 //                        (q4) sources onto the NPU (instead of CPU) and pick the compute path per tensor by
 //                        source precision. Default: 4-bit tier computes W8A8 (dequant q4->int8, fast +
 //                        coherent ≈ Q8_0; the compact-int4 win is realized in the .orkpack STORAGE, not the
-//                        compute — native W4A4 prefill is single-row/no-M-amortization so it loses); >4-bit
+//                        compute — native W4A4 prefill is 3.6x slower, see below); >4-bit
 //                        stays W8A8. On Q4_K_M this gives NPU prefill (~3.8× CPU) with a compact mixed .orkpack.
 //   ORK_MIXED_W4A4=1     With ORK_MIXED_DISPATCH: opt the 4-bit tier into NATIVE W4A4 compute (int4 MAC)
-//                        instead of W8A8. For the decode/streaming regimes where int4's bandwidth wins;
-//                        loses at prefill (measured run ~54× the W8A8 path — see ORK_PROFILE [ork i4prof]).
+//                        instead of W8A8. Buys half the resident bytes (nibbles stay nibbles); costs prefill.
+//                        RE-MEASURED 2026-10-12 on Qwen3-1.7B, two packs differing ONLY in entry dtype:
+//                        prefill 169.5 -> 46.8 tok/s (3.6x), NPU run 1847 -> 5840 us/matmul (3.2x).
+//                        The "~54x" that stood here was stale by ~15x, and its stated cause --
+//                        "single-row / no-M-amortization" -- was also wrong: the path IS batched and
+//                        chained (281.7 programs/ioctl, 1157 of 1158 submits chained; ORK_I4_BCHAIN is no
+//                        longer a knob, it is the default for M>=2). The 4-bit MAC is simply slower.
+//                        The "decode/streaming regimes where int4's bandwidth wins" do NOT exist on this
+//                        stack: dense M==1 is declined by supports_op, so decode never reaches the NPU and
+//                        the tier cannot affect it (measured: 1.02 tok/s on both tiers).
+//                        Wiki: Exp-2026-10-12-W4A4-Tier-Trade.
 //   ORK_ZC_OUT=1         EXPERIMENTAL/BUGGY. Output zero-copy (single-tile ~90% wrong). Off.
 //   ORK_HYBRID=1         EXPERIMENTAL. Hybrid CPU/NPU weight loading.
 //   ORK_MINM=<n>         Min M to route a matmul to the NPU (default 32). Tuning, not experimental.
@@ -566,7 +575,10 @@ static int ork_sig_qbits(uint32_t sig) {
 }
 
 // NATIVE W4A4 — the only path that actually issues 4-bit MACs (ork_i4_mm_*). Opt-in via ORK_MIXED_W4A4,
-// because it is fragile at prefill (single-row, no M-amortization).
+// because it costs prefill: measured 3.6x slower end-to-end and 3.2x slower in the NPU run itself
+// (Qwen3-1.7B, two packs differing only in entry dtype, 2026-10-12). NOT for want of batching -- the
+// path chains 281.7 programs per ioctl -- the 4-bit MAC is just slower here. It buys half the resident
+// bytes, and nothing at decode, which never reaches the NPU for dense M==1.
 //
 // ORK_QUANT=4 does NOT select it. That is the int4 STORAGE tier: weights are stored 4-bit, then inflated
 // int4->int8 on the NPU and computed by the robust W8A8 kernel. No 4-bit MAC ever runs, so there is nothing
@@ -10525,12 +10537,13 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         int target_qbits = ctx->qbits;
                         if (ork_mixed_dispatch_on()) {
                             // per-tensor dispatch driven by the GGUF's own quant precision. The 4-bit tier's
-                            // COMPUTE path: native W4A4 (mul_mat_i4) is structurally single-row on this NPU
-                            // (no M-tile weight-DMA amortization → re-streams each weight ~M times → loses to
-                            // int8 at prefill), so by DEFAULT the 4-bit tier computes W8A8 (dequant q4→int8,
-                            // amortized + coherent ≈ Q8_0 speed); the compact-int4 win is realized in the
-                            // .orkpack STORAGE (i4a8), not the compute. ORK_MIXED_W4A4=1 opts the 4-bit tier
-                            // into native W4A4 for the decode/streaming regimes where it actually wins.
+                            // COMPUTE path: native W4A4 (mul_mat_i4) measures 3.6x slower than int8 at prefill
+                            // on this NPU — not for want of M-amortization (it batches and chains; see
+                            // ork_w4a4_native_on), the 4-bit run is simply slower — so by DEFAULT the 4-bit
+                            // tier computes W8A8 (dequant q4→int8, amortized + coherent ≈ Q8_0 speed); the
+                            // compact-int4 win is realized in the .orkpack STORAGE (i4a8), not the compute.
+                            // ORK_MIXED_W4A4=1 opts the 4-bit tier into native W4A4, which halves RESIDENT
+                            // bytes. It does not help decode: dense M==1 never reaches the NPU at all.
                             static const int w4a4 = env_enabled("ORK_MIXED_W4A4");
                             double b = ork_src_type_bits(node->src[0]->type);
                             target_qbits = (w4a4 && b >= 0.0 && b < 5.0) ? 4 : 8;
