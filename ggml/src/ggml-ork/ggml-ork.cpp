@@ -1106,10 +1106,19 @@ static size_t g_ork_weight_bytes = 0;   // diagnostic only; ork weights live on 
 // IOMMU domains (each ~4 GiB; up to ~64 GiB total), and the wcache tracks the resident set; sizing the
 // budget to system RAM keeps a model that fits FULLY resident (no eviction, no churn). Only a model
 // larger than this budget evicts the LRU weight. This is the oRKLLM global memory limit — override with
-// ORK_WCACHE_BUDGET_MB (min(model, frontend cap, sysram-1GiB)); unset = sysram-1GiB.
+// ORK_WCACHE_BUDGET_MB (min(model, frontend cap, sysram-1GiB)); unset = the planner's budget below.
+//
+// ONE BUDGET, NOT TWO. The load-time planner compares the resident footprint against its own budget
+// (0.72 x phys, or ORK_RESIDENCE_RAM_MB) and sets residence_stream on overflow; the evictor used to
+// enforce phys - 1 GiB instead -- about 8 GiB looser on a 32 GiB board. Worse, residence_stream is
+// read in exactly one place, the MoE expert path, so on a DENSE model the planner's overflow signal
+// fired into nothing: freeing a gigabyte simply let the resident set grow another gigabyte. Publish
+// the planner's number and enforce that. 0 = planner has not run yet (fall back to phys - 1 GiB).
+static size_t g_residence_ram_budget = 0;
 static size_t ork_wcache_budget() {
     const char * e = getenv("ORK_WCACHE_BUDGET_MB");
     if (e) return (size_t) atoll(e) * 1024 * 1024;
+    if (g_residence_ram_budget) return g_residence_ram_budget;
     size_t ram = (size_t) sysconf(_SC_PHYS_PAGES) * (size_t) sysconf(_SC_PAGE_SIZE);
     size_t rsv = (size_t) 1024 * 1024 * 1024;
     return ram > rsv ? ram - rsv : (ram ? ram : (size_t) 4 * 1024 * 1024 * 1024);
@@ -1704,6 +1713,14 @@ static void ork_wcache_evict(ggml_backend_ork_context * ctx, size_t need) {
         auto lru = ctx->wcache.end();
         for (auto it = ctx->wcache.begin(); it != ctx->wcache.end(); ++it)
             if (!ctx->wcache_pin.count(it->first) &&                    // never evict a weight the active op still references
+                /* NEVER evict a NATIVE-INT4 weight here. Those entries only started being counted in
+                 * wcache_bytes recently (the native-W4A4 resolve kept none), and making them visible to
+                 * this loop would ALSO have made them evictable -- turning an accounting fix into a new
+                 * mid-eval free on the int4 path, which is the documented route to fragmenting the
+                 * 32-bit IOVA into import-ENOMEM (ork_ffn_prep refuses to evict for the same reason).
+                 * The int4 budget is enforced at the LOAD-TIME PLANNER, which cannot wedge the board.
+                 * wbits==4 is exactly the native int4 tier: DT_I4_ROT_A8 and friends carry wbits==8. */
+                it->second.wbits != 4 &&
                 (lru == ctx->wcache.end() || it->second.last_use < lru->second.last_use)) lru = it;
         if (lru == ctx->wcache.end()) break;   // all remaining entries are pinned by the active op — can't free more
         ork_slice_ws_drop(ctx, lru->second.w);
@@ -5151,6 +5168,19 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
                     ork_persist_write_i4native(ctx, src0->name, K, N, ow);   // convert: persist the rotated+tiled bytes
                 }
             }
+            /* ACCOUNT FOR IT. This is the native-W4A4 resolve -- the path a W4A4 pack actually runs --
+             * and it used to add the weight to the wcache without recording its size anywhere. The int8
+             * resolve maintains ctx->wcache_bytes and consults an evictor; this one did neither, so on
+             * the int4 dense path there was no budget at all, loose or tight: the resident set grew
+             * monotonically until an IOVA allocation failed. A failed allocation leaks a mapping the
+             * kernel cannot reclaim until reboot, so the first symptom is a leak, not a clean error.
+             *
+             * Accounting is NOT eviction, and deliberately so. Freeing an int4 weight mid-eval is the
+             * documented route to fragmenting the 32-bit IOVA into import-ENOMEM (see ork_ffn_prep,
+             * which refuses to evict for exactly this reason), and a wedge here costs a physical reset.
+             * So the number is recorded and the LOAD-TIME PLANNER acts on it; nothing frees mid-run. */
+            ow.bytes = ork_w_bytes(ow.w);
+            ctx->wcache_bytes += ow.bytes;
             it = ctx->wcache.emplace(x, std::move(ow)).first;
         }
     return it;
@@ -6045,6 +6075,16 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
         for (int d = 0; d < ctx->n_domains; d++)
             fprintf(stderr, "[ork RESIDENT]   domain %d: %.2f GiB\n", d, ctx->domain_bytes[d] / (1024.0*1024.0*1024.0));
     }
+    /* The LIVE tracked set against the budget that is actually enforced. Deliberately OUTSIDE the
+     * n_domains > 1 guard above: a model that fits one domain still has a resident set and a budget,
+     * and gating this on the domain count hid it on exactly the single-domain int4 runs it was added
+     * to make observable. `tot` above is cumulative domain FILL, so repacking inflates it and it cannot
+     * be compared to a budget; wcache_bytes is the number the evictor reasons about. This is also the
+     * only way to see that the native-int4 path counts its weights at all -- it kept no byte count
+     * before, so "it is counted now" was otherwise checkable only by reading the code. */
+    fprintf(stderr, "[ork RESIDENT] tracked wcache: %.2f GiB over %zu weights vs budget %.2f GiB\n",
+        ctx->wcache_bytes / (1024.0*1024.0*1024.0), ctx->wcache.size(),
+        ork_wcache_budget() / (1024.0*1024.0*1024.0));
     if (const char * fp = getenv("ORK_MOE_PROFILE_FREQ")) {
         if (!ctx->moe_freq.empty()) {
             FILE * f = fopen(fp, "w");
@@ -11038,6 +11078,24 @@ ggml_backend_t ggml_backend_ork_init(void) {
           ctx->residence_footprint = inflated;
           ctx->residence_ram_budget = budget;
           ctx->residence_stream = (inflated > budget) ? 1 : 0;       // even Bb-only overflows -> stream by layer
+          /* PUBLISH the budget the planner actually used, so ork_wcache_budget() -- and therefore the
+           * evictor -- enforces this number instead of its own looser phys - 1 GiB. */
+          g_residence_ram_budget = budget;
+          /* AND SAY SO WHEN IT DOES NOT FIT. residence_stream is consumed by the MoE expert path alone,
+           * so on a DENSE model this overflow has until now been silent: the run proceeds, the resident
+           * set grows past the budget, and the first visible symptom is an IOVA allocation failure deep
+           * into the load (which leaks a mapping the kernel cannot reclaim until reboot) or the host
+           * OOM-killing the process. An unmeetable plan is knowable HERE, before a single weight is
+           * placed, so state it here -- at INFO, not behind ORK_VERBOSE, because by the time anyone
+           * thinks to set a debug flag the board has already been lost. */
+          if (ctx->residence_stream)
+              fprintf(stderr, "[ORK] RESIDENCE: planned footprint %.2f GiB EXCEEDS the %.2f GiB RAM budget "
+                              "by %.2f GiB (Bf %s, %d domains). Dense weights have no streaming fallback, so "
+                              "expect IOVA-allocation failure or an OOM kill. Reduce the resident set: a "
+                              "lower-precision pack, ORK_NO_BF=1, or raise ORK_RESIDENCE_RAM_MB only if the "
+                              "RAM is genuinely there.\n",
+                      inflated/(1024.0*1024*1024), budget/(1024.0*1024*1024),
+                      (inflated - budget)/(1024.0*1024*1024), want_bf ? "on" : "auto-shed", ctx->n_domains);
           if (getenv("ORK_VERBOSE"))
               fprintf(stderr, "[ORK] auto n_domains=%d (@%.2f GiB/dom) footprint %.2f GiB (Bf %s) vs RAM budget %.2f GiB -> %s\n",
                       ctx->n_domains, ctx->domain_fill_cap/(1024.0*1024*1024), inflated/(1024.0*1024*1024),
