@@ -54,4 +54,11 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // dflash: per-decode target context injected into every draft layer's K/V (set out-of-band by the
+    // speculative driver via llama_set_dflash_context). dflash_ctx is [n_embd, dflash_ctx_len] (the encoder
+    // g_embd), dflash_ctx_pos is [dflash_ctx_len] (RoPE positions for the context keys).
+    const float *   dflash_ctx     = nullptr;
+    int32_t         dflash_ctx_len = 0;
+    const int32_t * dflash_ctx_pos = nullptr;
 };

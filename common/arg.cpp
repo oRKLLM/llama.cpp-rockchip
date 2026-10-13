@@ -397,6 +397,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2041,6 +2044,67 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = !value;
         }
     ).set_env("LLAMA_ARG_REPACK"));
+    // ---- .orkpack build configuration (ggml-ork) ----
+    // The pack is the artifact these produce, so how it is built is a real user decision: the base tier,
+    // and which weights are worth spending extra bytes on. Promotion is ranked by qerr — the measured
+    // per-weight quantisation error the pack records — so a MIXED build wants --pack-qerr-source pointing
+    // at an earlier pack of the same model.
+    //
+    // qerr is NOT recorded by every build. It is written only by the GPTQ finalize pass (ORK_GPTQ, which
+    // ork_bench drives), because that is the only path holding the calibration Hessian the metric is
+    // weighted by. A plain uniform build records nothing, so pointing --pack-qerr-source at one yields an
+    // empty ranking and no promotion — the backend says so rather than failing silently. Producing qerr
+    // from an imatrix on ordinary int4 builds is oRKLLM/ork-driver#2.
+    add_opt(common_arg(
+        {"--pack-bits"}, "N",
+        "orkpack base tier: 4 or 8 (default: backend's own, currently 4).\n"
+        "note: 4 from an UNQUANTIZED source selects the NF4 codebook; from an already-quantized source it\n"
+        "falls back to uniform int4, which is markedly worse — prefer an f16/bf16 source for 4-bit packs",
+        [](common_params & params, int value) {
+            if (value != 4 && value != 8) throw std::invalid_argument("--pack-bits must be 4 or 8");
+            params.ork_pack_bits = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-mixed"},
+        {"--no-pack-mixed"},
+        "promote the worst-quantised weights to int8 (default: enabled). --no-pack-mixed builds a pure\n"
+        "single-tier pack",
+        [](common_params & params, bool value) {
+            params.ork_pack_mixed = value; params.ork_pack_mixed_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-budget"}, "MiB",
+        "how much EXTRA pack size promotion to int8 may spend (default: 8)",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_budget_mb = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-qerr-min"}, "F",
+        "never promote a weight whose measured error is below this (default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_qerr_min = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-qerr-source"}, "FNAME",
+        "a previously built .orkpack to rank qerr from. That pack must carry qerr, which today means it\n"
+        "was built under ORK_GPTQ (an ordinary build records none); the backend reports what it read,\n"
+        "promoted and spent, so an empty ranking is visible rather than silent",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_qerr_src = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-promote"}, "NAMES",
+        "explicit comma-separated tensor names to promote to int8; wins over the qerr policy",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_promote = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--no-host"},
         "bypass host buffer allowing extra buffers to be used",
@@ -3254,6 +3318,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
         [](common_params & params, const std::string & value) {
             params.slot_prompt_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-similarity"}, "SIMILARITY",
+        string_format("how much the prompt of a cache_key request must match the cached slot prompt before reusing it (default: %.2f, 0.0 = disable ratio check)\n", params.slot_cache_key_similarity),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-min-prefix"}, "N",
+        string_format("minimum common-prefix tokens required before reusing a cache_key slot (default: %d, 0 = disabled)\n", params.slot_cache_key_min_prefix),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_min_prefix = std::stoi(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
