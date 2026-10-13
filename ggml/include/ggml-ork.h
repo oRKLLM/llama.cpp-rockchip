@@ -127,6 +127,11 @@ GGML_BACKEND_API enum ggml_status    ggml_backend_ork_synchronize(ggml_backend_t
 //                 was taken under; it is ignored on load by any machine that no longer matches
 GGML_BACKEND_API void ggml_backend_ork_set_min_m(int m);
 GGML_BACKEND_API bool ggml_backend_ork_write_calib(const char * pack_path, int min_m);
+
+// Zero every ORK_PROFILE counter. A harness calls this after its warmup so the profile covers the same
+// window as its clock: a full-shape warmup does as much work as the pass it warms, so an unscoped
+// counter divided by a timed-window wall is wrong by a factor of two, with every share still plausible.
+GGML_BACKEND_API void ggml_backend_ork_profile_reset(void);
 }
 
 #endif

@@ -10568,6 +10568,29 @@ extern "C" int ggml_backend_ork_preload(void) {
 // 400 resident, because it only instrumented the int8 resolve. The cache is the one structure every path
 // must update to work at all, so it cannot silently drift. Timing is the CALLER's business: it knows when
 // it started loading; the backend only knows what is resident now.
+/* SCOPE THE PROFILE TO THE TIMED WINDOW.
+ *
+ * Every counter in this file accumulates from process start, but a harness times one window -- and
+ * ork_bench's warmup is a FULL-SHAPE pass, i.e. it does as much work as the prefill it is warming up
+ * for, plus the one-time pack loads. Dividing a counter that covers warmup+prefill by a wall that
+ * covers prefill only is a factor of two, and it is invisible because every term is wrong by the same
+ * factor and the shares still look plausible. A harness calls this after its warmup; nothing calls it
+ * otherwise, so the un-scoped behaviour is unchanged. */
+extern "C" void ggml_backend_ork_profile_reset(void) {
+    ggml_backend_ork_context * c = g_ork_ctx;
+    if (c) {
+        c->t_quant = c->t_run = c->t_deq = 0; c->n_mm = 0;
+        c->t_actq = 0; c->n_actq = 0;
+        c->t_run_dec = c->t_run_pf = 0; c->n_dec = c->n_pf = c->m_pf = 0;
+        c->aq_wall = c->aq_cpu_memcpy = c->aq_cpu_smooth = c->aq_cpu_rot = c->aq_cpu_scale = c->aq_cpu_quant = 0;
+        c->aq_calls = c->aq_reuse = 0; c->aq_elems = c->aq_bytes = 0;
+        for (int p = 0; p < FA_NPATH; p++) { c->fa_us[p] = 0; c->fa_n[p] = 0; }
+    }
+    for (int k = 0; k < SEG_N; k++) { g_seg_us[k] = 0; g_seg_n[k] = 0; }
+    g_seg_graph_us = 0; g_seg_graph_n = 0; g_cpudel_us = 0; g_cpudel_n = 0;
+    ork_npu_floor_reset();   // the driver-side submit counters have the same scope problem
+}
+
 extern "C" void ggml_backend_ork_residence(int * n_weights, size_t * bytes) {
     const ggml_backend_ork_context * c = g_ork_ctx;
     if (n_weights) *n_weights = c ? (int) c->wcache.size() : 0;
