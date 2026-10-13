@@ -9430,8 +9430,17 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
     const int64_t ne2 = dst->ne[2], ne3 = dst->ne[3];
     const int64_t r2_0 = src0->ne[2] ? ne2 / src0->ne[2] : 1, r3_0 = src0->ne[3] ? ne3 / src0->ne[3] : 1;
     const int64_t r2_1 = src1->ne[2] ? ne2 / src1->ne[2] : 1, r3_1 = src1->ne[3] ? ne3 / src1->ne[3] : 1;
-    std::vector<ork_f16> A((size_t) M * K), B((size_t) K * N);
-    std::vector<float>   C((size_t) M * N);
+    // Which marshalling each operand needs is a property of the TENSOR METADATA, not of the head, so
+    // decide once here and leave the per-head loop branch-free. B/C are the staging buffers the fast
+    // paths do NOT need (C is M*N floats — 4 MB at n_kv=2048 — and std::vector value-initializes), so
+    // they stay empty unless a fallback actually wants them.
+    const size_t e0 = ggml_type_size(src0->type), e1 = ggml_type_size(src1->type);
+    const bool b_fast = (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) &&
+                        src0->nb[0] % e0 == 0 && src0->nb[1] % e0 == 0;
+    const bool a_fast = src1->nb[0] == e1 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    const bool c_direct = dst->nb[0] == sizeof(float) && dst->nb[1] == (size_t) N * sizeof(float);
+    std::vector<ork_f16> A((size_t) M * K), B(b_fast ? 0 : (size_t) K * N);
+    std::vector<float>   C(c_direct ? 0 : (size_t) M * N);
     // strided read of logical element (i0,i1) of a per-head slice — densifies non-contiguous (permuted-view)
     // attention operands (real QK^T/A·V read permuted-Q / non-contig KV-cache views) into the packed A/B.
     auto rds = [](const struct ggml_tensor * t, const char * base, int64_t i0, int64_t i1) -> float {
@@ -9477,13 +9486,43 @@ static bool ggml_backend_ork_bmm_fp16(ggml_backend_ork_context * ctx, struct ggm
         // (QKᵀ and A·V), NOT as FLASH_ATTN_EXT — and ORK_ATTN_CPU only moves the FA handler's
         // matmuls, which is why forcing "both FA matmuls to CPU" left the PPL byte-identical.
         // Correct order: B[j] = src0(j / N, j % N)  =>  B[k*N + n] = src0(k, n).
-        for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j / N, j % N);   // B[k*N+n] = src0(k,n)
-        for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
-        if (ork_f16_mm_repack(ctx->npu, w, K, N, B.data()) || ork_f16_mm_run(ctx->npu, w, M, A.data(), C.data())) {
+        // MARSHALLING, not the matmul, is what made this path lose: measured on RK3588 (ork-driver
+        // tools/re/attn_marshal_probe, M=512 n_kv=2048), the element-wise gather + repack + scatter was
+        // 61% (QK^T) / 70% (A·V) of the call, against an NPU that reaches ~181 GMAC/s while it is
+        // actually busy. All three loops below are the same fix: stop materializing an intermediate
+        // whose only purpose is to be permuted again.
+        //   B — ork_f16_mm_repack_strided writes the NPU weight tile straight from the strided view.
+        //       The old pair built a row-major B[K,N] (a full K*N elementwise TRANSPOSE of the KV view)
+        //       which the tiler then transposed BACK inside each 32x16 block. 1970 -> 244 us.
+        //   A — the contraction dim is stride-1 in both QK^T (Q is [head_dim, n_tok]) and A·V (the
+        //       softmax scores are [n_kv, n_tok]), so a row is a contiguous f32 run: one vectorised
+        //       narrow per row instead of a strided scalar read per element. 3204 -> 1011 us.
+        //   C — ork_f16_mm_run already writes [M][N] row-major fp32, which IS the dst slice's layout
+        //       when it is contiguous, so the staging vector and its copy-out just go away. 499 -> 0 us.
+        // Each falls back to the original loop for any layout it does not recognise, and the strided
+        // repack is byte-identical to repacking the gathered B (ork-driver test_bmm, repack-strided case).
+        if (b_fast) {
+            if (ork_f16_mm_repack_strided(ctx->npu, w, K, N, s0,
+                                          (long) (src0->nb[0] / e0), (long) (src0->nb[1] / e0),
+                                          src0->type == GGML_TYPE_F32)) { ok = false; break; }
+        } else {
+            for (size_t j = 0; j < (size_t) K * N; j++) B[j] = (ork_f16) rds(src0, s0, j / N, j % N);   // B[k*N+n] = src0(k,n)
+            if (ork_f16_mm_repack(ctx->npu, w, K, N, B.data())) { ok = false; break; }
+        }
+        if (a_fast && src1->type == GGML_TYPE_F32) {
+            for (int m = 0; m < M; m++)
+                ggml_fp32_to_fp16_row((const float *) (s1 + (size_t) m * src1->nb[1]),
+                                      (ggml_fp16_t *) (A.data() + (size_t) m * K), K);
+        } else if (a_fast) {
+            for (int m = 0; m < M; m++) memcpy(A.data() + (size_t) m * K, s1 + (size_t) m * src1->nb[1], (size_t) K * 2);
+        } else {
+            for (size_t j = 0; j < (size_t) M * K; j++) A[j] = (ork_f16) rds(src1, s1, j % K, j / K);   // src1 [K,M]
+        }
+        if (ork_f16_mm_run(ctx->npu, w, M, A.data(), c_direct ? d : C.data())) {
             if (getenv("ORK_ATTN_TRACE")) fprintf(stderr, "[bmm] ^^^ FAILED M=%d K=%d N=%d head(%lld,%lld)\n",
                 M, K, N, (long long)i2, (long long)i3);
             ok = false; break; }
-        for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
+        if (!c_direct) for (size_t j = 0; j < (size_t) M * N; j++) d[j] = C[j];
     }
     // NO ork_mm_free(w) — the (K,N) cache owns it (freed in ggml_backend_ork_free). Freeing per node is what
     // churned the contiguous/CMA pool and poisoned later int8 submits (see the comment above).
