@@ -82,7 +82,7 @@
 //                        STORAGE + W8A8-inflate compute on the NPU (route B — int4 weights inflate int4->int8 and
 //                        run on the robust int8 kernel; coherent, no wedge). The win is the .orkpack STORAGE
 //                        (~3.4× smaller than int8), not the compute (~int8 speed). Native W4A4 (3.6x slower
-//                        at prefill, half the resident bytes) is OPT-IN via ORK_MIXED_W4A4.
+//                        at prefill, half the resident bytes) is chosen automatically — see ork_tier_rule.
 //                        *** RECOMMENDED int4 setup: build the orkpack from the model's UNQUANTIZED (F16/F32/BF16)
 //                        GGUF — the NF4 codebook is then auto-selected (best fidelity; building from an already-
 //                        quantized source is warned and falls back to the lossier uniform int4). Measured Qwen3-1.7B
@@ -91,7 +91,7 @@
 //   (no ORK_HADAMARD)    The block-Hadamard rotation is IMPLIED by NATIVE W4A4 and cannot be turned off:
 //                        RK3588's W4A4 MAC is symmetric per-channel and incoherent unrotated (PPL ~104 vs ~24),
 //                        so un-rotated 4-bit compute was never a usable configuration — only a way to get a
-//                        silently garbage run. Note this is about the 4-bit COMPUTE path (ORK_MIXED_W4A4), not
+//                        silently garbage run. Note this is about the 4-bit COMPUTE path (ork_tier_rule), not
 //                        the int4 STORAGE tier (ORK_QUANT=4), which computes W8A8 and rotates nothing. See
 //                        ork_w4a4_native_on for why ggml-ork owns this rule and ork-driver cannot.
 //   ORK_MIXED_DISPATCH=1 Per-tensor dispatch driven by the GGUF's OWN mixed quantization: accept sub-5-bit
@@ -100,7 +100,9 @@
 //                        coherent ≈ Q8_0; the compact-int4 win is realized in the .orkpack STORAGE, not the
 //                        compute — native W4A4 prefill is 3.6x slower, see below); >4-bit
 //                        stays W8A8. On Q4_K_M this gives NPU prefill (~3.8× CPU) with a compact mixed .orkpack.
-//   ORK_MIXED_W4A4=1     With ORK_MIXED_DISPATCH: opt the 4-bit tier into NATIVE W4A4 compute (int4 MAC)
+//   (ORK_MIXED_W4A4      REMOVED. Which 4-bit tier a model gets is decided from the model and the machine
+//                        at pack-BUILD time and carried by the pack's entry dtypes — see ork_tier_rule.)
+//   [historic]           With ORK_MIXED_DISPATCH: opt the 4-bit tier into NATIVE W4A4 compute (int4 MAC)
 //                        instead of W8A8. Buys half the resident bytes (nibbles stay nibbles); costs prefill.
 //                        RE-MEASURED 2026-10-12 on Qwen3-1.7B, two packs differing ONLY in entry dtype:
 //                        prefill 169.5 -> 46.8 tok/s (3.6x), NPU run 1847 -> 5840 us/matmul (3.2x).
@@ -416,6 +418,10 @@ struct orkpack_footer { uint64_t index_off; uint32_t n_entries; uint32_t version
                          * is; these say what INPUTS produced it, which is a different question and the one that
                          * decides whether regenerating it reproduces it. */
                         uint32_t prov_flags; uint32_t prov_pad; uint64_t prov_imhash;
+                        /* NOTE deliberately absent: the 4-bit RESIDENT WIDTH. It is not a property of the
+                         * file -- it depends on the RAM of whichever machine loads it, which the builder
+                         * cannot know (a .deb is installed after it is built). The pack stores ROTATED INT4
+                         * either way and the loader picks the width (see ork_tier_rule). */
                         char magic[8]; };
 
 static void ork_calib_provenance(orkpack_calib_hdr * h) {
@@ -658,8 +664,8 @@ static int ork_sig_qbits(uint32_t sig) {
     return ((sig & ORK_SIG_QB_MASK) == (uint32_t) '4') ? 4 : 8;
 }
 
-// NATIVE W4A4 — the only path that actually issues 4-bit MACs (ork_i4_mm_*). Opt-in via ORK_MIXED_W4A4,
-// because it costs prefill: measured 3.6x slower end-to-end and 3.2x slower in the NPU run itself
+// NATIVE W4A4 — the only path that actually issues 4-bit MACs (ork_i4_mm_*). Selected by the rule below
+// rather than by a flag, because it costs prefill: measured 3.6x slower end-to-end and 3.2x slower in the NPU run itself
 // (Qwen3-1.7B, two packs differing only in entry dtype, 2026-10-12). NOT for want of batching -- the
 // path chains 281.7 programs per ioctl -- the 4-bit MAC is just slower here. It buys half the resident
 // bytes, and nothing at decode, which never reaches the NPU for dense M==1.
@@ -677,7 +683,113 @@ static int ork_sig_qbits(uint32_t sig) {
 // matmul is rotation-invariant by construction — it never observes whether the caller rotated, so it can
 // neither enforce nor check. ggml-ork applies R to the weight column at pack AND to the activation row at
 // run (both at the same block size), so ggml-ork is the only layer that can hold the invariant.
-static bool ork_w4a4_native_on(void) { return env_enabled("ORK_MIXED_W4A4"); }
+/* ---- WHICH 4-BIT RESIDENT WIDTH: decided by the MACHINE THAT LOADS, not written into the file ----
+ *
+ * A pack built at 4 bits always stores the SAME bytes: a Hadamard-ROTATED, per-channel int4-quantised,
+ * int4-TILED weight. Two load-time interpretations of those identical bytes exist, and the orkpack
+ * dtypes that name them (DT_I4_NATIVE / DT_I4_ROT_A8) are produced by one writer and differ in no byte:
+ *
+ *   NATIVE (W4A4)   nibbles stay 4-bit in IOVA, int4 activations, real 4-bit MACs. ~K*N/2 resident.
+ *   ROT_A8          the same nibbles inflated 1:2 into int8 containers at load, int8 activations,
+ *                   computed on the robust W8A8 kernel. 2x the residency, measurably FASTER at prefill,
+ *                   and the most ACCURATE tier we have: its residual equals the weight-only error
+ *                   (0.1578 vs 0.1576 W-only), i.e. int8 activations remove the activation half of the
+ *                   error budget entirely -- at zero storage cost.
+ *
+ * THE RULE: take the inflating one whenever the machine can afford it.
+ *
+ *     inflated = what the WHOLE resident weight set would occupy with every 4-bit entry inflated to
+ *                int8 containers (ork_w_resident_bytes -- the driver's authority; see its comment:
+ *                IOVA is the whole cost, there is no host-side term to add)
+ *     inflated < 50% of THIS machine's physical RAM  ->  ROT_A8   (fast + most accurate)
+ *     otherwise                                      ->  NATIVE   (compact; ~1/3 the RAM)
+ *
+ * WHY AT LOAD AND NOT AT BUILD. This is a property of the serving machine, and a pack is a portable
+ * artifact -- built here, shipped in a .deb, installed on a board whose RAM the builder never saw. A
+ * baked decision is a stale premise the moment the file moves, and the bytes could not be re-decided
+ * afterwards. Because the two tiers are the same bytes, nothing has to be baked: the loader looks at
+ * the machine it is actually on. (The widened DT_I8_ROT promotion tier is NOT in this class -- it
+ * stores genuinely different, int8 bytes -- so it is left exactly as the pack wrote it.)
+ *
+ * WHAT THIS REPLACED, and why it was wrong twice over. It used to be `env_enabled("ORK_MIXED_W4A4")`.
+ * A per-model row set that variable, the row was keyed to a filename the model no longer had, nothing
+ * set it, nothing noticed -- and a 27B was built at the UNROTATED DT_I4 tier, which costs int8-sized
+ * residency (22.7 GiB on a 31 GiB board) AND is the worst-quality 4-bit form we have, because dropping
+ * the rotation measured worse than plain W4A4. An env flag cannot be the gate for this, and DT_I4 is
+ * no longer a build target for the NPU tier at all: it is strictly dominated by the rotated bytes,
+ * which cost the same and can be loaded either way. It stays READABLE so existing packs still work.
+ *
+ * ORK_TIER_RAM_PCT overrides the 50% for A/B measurement. It is a LOAD-time knob by nature -- there is
+ * nothing in the artifact for it to contradict -- and it is reported on the line below, so a run that
+ * used it says so.
+ *
+ * ---- AND A SECOND, UNAVOIDABLY BUILD-TIME CHOICE: which BYTES to write -----------------------
+ *
+ * There is a third 4-bit tier whose bytes are NOT interchangeable with the two above: DT_I4, the
+ * unrotated i4a8 container, which from a full-precision source is quantised with the NF4 CODEBOOK.
+ * It was nearly deleted here as "strictly dominated". It is not. MEASURED on Qwen3-1.7B (BF16 source,
+ * wiki, 2 x 512-token windows, identical harness; both tiers run int8 activations, so only the weight
+ * quantiser differs):
+ *
+ *     DT_I4   (NF4 codebook, unrotated)   PPL 34.80
+ *     ROT_A8  (uniform int4, rotated)     PPL 49.74
+ *     NATIVE  (uniform int4, rotated, int4 activations)  PPL 59.04
+ *
+ * The rotation is what makes a UNIFORM 4-bit grid survivable; a non-uniform codebook fitted to the
+ * weight distribution beats it outright when the source is full precision. So the best 4-bit tier is
+ * NF4 i4a8 -- and its cost is that it must be INFLATED to int8 containers to run, i.e. it only exists
+ * at int8 residency. That is exactly the owner's rule: take the inflating tier when the machine can
+ * afford it, fall back to W4A4 when it cannot.
+ *
+ * This one cannot be deferred to load time: the containers differ, so the choice IS the bytes. It is
+ * therefore made against the BUILD host's RAM, and that is sound HERE because packs are built on the
+ * machine that serves them -- a .orkpack is a derived cache, built at <model>.orkpack on first load if
+ * absent (oRKLLM's conversion scheduler spawns the build on the serving board). A pack COPIED to a
+ * smaller machine has a stale premise, which is why the choice and its inputs go into the provenance
+ * record and the load path says what it found. */
+struct ork_tier_rule {
+    int      native;      /* 1 = keep nibbles (NATIVE/W4A4), 0 = inflate to int8 containers (ROT_A8) */
+    int      resolved;    /* 0 = nothing has decided yet */
+    int      pct;         /* threshold, percent of RAM */
+    uint64_t inflated;    /* resident cost with every 4-bit entry inflated (0 = not measured) */
+    uint64_t compact;     /* resident cost with them kept at 4 bits */
+    uint64_t ram;         /* this machine's physical RAM */
+    int      rotated;     /* 1 = the 4-bit weights in play are the ROTATED form (ctx->hadamard) */
+    int      build_done;  /* the BUILD-side tier choice has been made */
+    uint64_t build_infl;  /* what the i4a8/NF4 tier would have cost on the build host */
+};
+static ork_tier_rule g_tier = { 0, 0, 50, 0, 0, 0, 0, 0, 0 };
+
+static uint64_t ork_phys_ram_bytes(void) {
+    long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
+    return (pg > 0 && ps > 0) ? (uint64_t) pg * (uint64_t) ps : 0;
+}
+
+/* THE one predicate for "would ork claim this tensor as an NPU weight". Written to MIRROR supports_op's
+ * MUL_MAT gate; the two drifting apart would make the build-time tier estimate quietly wrong, so keep
+ * them together. */
+static bool ork_tensor_npu_eligible(int64_t K, int64_t N, enum ggml_type t) {
+    static const int max_n = getenv("ORK_MAXN") ? atoi(getenv("ORK_MAXN")) : 32768;
+    if (K < 32 || K % 32 != 0 || N % 64 != 0 || N > max_n) return false;
+    return t == GGML_TYPE_F32 || ggml_get_type_traits(t)->to_float != nullptr;
+}
+
+/* Rotated int4 on disk: the class whose resident width the loader gets to choose. DT_I4_NATIVE and
+ * DT_I4_ROT_A8 are written by the SAME function from the SAME ork_w_dump bytes (ork_persist_write_i4native
+ * tags them apart only by the build's activation width), so the tag carries no byte-level meaning. */
+static inline bool ork_dt_is_rotated_i4(uint32_t dt) {
+    return dt == ORKPACK_DT_I4_NATIVE || dt == ORKPACK_DT_I4_ROT_A8;
+}
+
+/* true = this run keeps 4-bit weights as nibbles (native W4A4); false = inflate them to int8 containers.
+ * Either way the weights are ROTATED, which is what ctx->hadamard actually means at the call sites. */
+static bool ork_i4_keep_nibbles(void) { return g_tier.resolved && g_tier.native != 0; }
+
+/* "the 4-bit weights this run touches are the ROTATED form" -- what ctx->hadamard has always meant at
+ * its call sites. In READ mode it is a census of the loaded pack; in WRITE mode it is the build target
+ * (rotated int4 is now the only 4-bit NPU form we emit). Kept under the old name because ~6 comments
+ * and two call sites reference it. */
+static bool ork_w4a4_native_on(void) { return g_tier.rotated != 0; }
 
 /* OFFLINE PACK MODE — build an .orkpack on a machine that has no NPU.
  *
@@ -2021,6 +2133,93 @@ static bool ork_persist_resumable(const char * path, uint64_t * footer_at, uint3
     return true;
 }
 
+/* Decide WHICH 4-BIT BYTES to write, before the first weight is packed. See the second half of
+ * ork_tier_rule: NF4 i4a8 (DT_I4) is the best-quality 4-bit tier but only exists at int8 residency, so
+ * it is taken when the whole model fits the threshold and rotated int4 is the fallback when it does not.
+ *
+ * ork_w_resident_bytes is ASKED rather than modelled: it is the driver's authority for tile geometry,
+ * page padding and whether a full-K Bf companion gets built, and re-deriving it is how the load-time
+ * domain planner drifted twice at once. Experts (ne[2] > 1) count once per expert. Returns 1 for
+ * "rotated" (ctx->hadamard). */
+static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * src_path) {
+    if (g_tier.build_done) return g_tier.rotated;
+    g_tier.build_done = 1;
+    const uint64_t ram = ork_phys_ram_bytes();
+    if (const char * pc = getenv("ORK_TIER_RAM_PCT")) { int v = atoi(pc); if (v > 0 && v <= 100) g_tier.pct = v; }
+    uint64_t sum = 0; int n_elig = 0;
+    if (src_path && *src_path) {
+        struct ggml_context * mc = nullptr;
+        struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/&mc };
+        struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+        if (gg && mc) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(mc); t; t = ggml_get_next_tensor(mc, t)) {
+                if (t->ne[3] != 1) continue;
+                if (!ork_tensor_npu_eligible(t->ne[0], t->ne[1], t->type)) continue;
+                const uint64_t mult = (uint64_t) (t->ne[2] > 0 ? t->ne[2] : 1);
+                sum += (uint64_t) ork_w_resident_bytes(ctx->npu, (int) t->ne[0], (int) t->ne[1], 8, -1) * mult;
+                n_elig += (int) mult;
+            }
+        }
+        if (gg) gguf_free(gg);
+        if (mc) ggml_free(mc);
+    }
+    g_tier.build_infl = sum;
+    const uint64_t limit = ram ? ram / 100 * (uint64_t) g_tier.pct : 0;
+    /* Unmeasurable (no source path / unreadable gguf) -> the COMPACT tier, which cannot OOM. An
+     * unmeasured guess that OOMs on the first prompt is the failure this rule exists to remove. */
+    g_tier.rotated = (sum == 0 || ram == 0) ? 1 : (sum >= limit);
+    fprintf(stderr,
+        "[ORK TIER] build: %s. The NF4 i4a8 form of this model would be %.2f GiB resident across %d "
+        "weights; this host has %.2f GiB RAM, threshold %d%% (%.2f GiB)%s.\n",
+        g_tier.rotated ? "ROTATED int4 (W4A4-capable, compact)"
+                       : "DT_I4 / NF4 i4a8 (best 4-bit quality, int8 residency)",
+        sum/(1024.0*1024*1024), n_elig, ram/(1024.0*1024*1024), g_tier.pct,
+        limit/(1024.0*1024*1024), getenv("ORK_TIER_RAM_PCT") ? " [ORK_TIER_RAM_PCT override]" : "");
+    return g_tier.rotated;
+}
+
+/* Decide the RESIDENT WIDTH of this pack's rotated-int4 weights, on the machine that is loading it.
+ * See ork_tier_rule for the rule and for why this is not, and cannot be, a property of the file.
+ *
+ * Both totals come from ork_w_resident_bytes -- the driver's authority for tile geometry, page padding
+ * and whether a full-K Bf companion gets built. Re-deriving that here is exactly how the load-time
+ * domain planner drifted twice at once, so it is asked, not modelled. */
+static void ork_tier_decide_load(ggml_backend_ork_context * ctx) {
+    g_tier.resolved = 1;
+    g_tier.ram = ork_phys_ram_bytes();
+    if (const char * pc = getenv("ORK_TIER_RAM_PCT")) { int v = atoi(pc); if (v > 0 && v <= 100) g_tier.pct = v; }
+    uint32_t n_rot = 0, n_i4a8 = 0, n_i8 = 0;
+    uint64_t infl = 0, comp = 0;
+    for (const auto & kv : ctx->persist_idx) {
+        const int K = (int) kv.second.K, N = (int) kv.second.N;
+        const uint32_t dt = kv.second.dtype;
+        const bool rot_i4 = ork_dt_is_rotated_i4(dt);
+        if (rot_i4) n_rot++;
+        else if (dt == ORKPACK_DT_I4) n_i4a8++;
+        else if (dt == ORKPACK_DT_I8_ROT) n_rot++;        /* rotated, but int8 bytes: width is fixed */
+        else n_i8++;
+        const size_t as8 = ork_w_resident_bytes(ctx->npu, K, N, 8, -1);
+        infl += as8;
+        comp += rot_i4 ? ork_w_resident_bytes(ctx->npu, K, N, 4, -1) : as8;
+    }
+    g_tier.rotated  = (n_rot > 0);
+    g_tier.inflated = infl;
+    g_tier.compact  = comp;
+    const uint64_t limit = g_tier.ram ? g_tier.ram / 100 * (uint64_t) g_tier.pct : 0;
+    /* No rotated-int4 entries => nothing to choose; leave native=0 so nothing changes for int8 packs. */
+    g_tier.native = (n_rot && g_tier.ram && infl >= limit) ? 1 : 0;
+    if (n_rot || n_i4a8)
+        fprintf(stderr,
+            "[ORK TIER] pack census: %u rotated-int4, %u i4a8(unrotated), %u int8. Inflated to int8 "
+            "containers this model is %.2f GiB resident; kept at 4 bits %.2f GiB. This machine has "
+            "%.2f GiB RAM, threshold %d%% (%.2f GiB)%s -> loading 4-bit weights %s.\n",
+            n_rot, n_i4a8, n_i8, infl/(1024.0*1024*1024), comp/(1024.0*1024*1024),
+            g_tier.ram/(1024.0*1024*1024), g_tier.pct, limit/(1024.0*1024*1024),
+            getenv("ORK_TIER_RAM_PCT") ? " [ORK_TIER_RAM_PCT override]" : "",
+            g_tier.native ? "as NATIVE int4 nibbles (W4A4, compact)"
+                          : "INFLATED to int8 containers (ROT_A8: faster, best measured error)");
+}
+
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_i8_mm_import),
@@ -2172,6 +2371,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv,
                             g_soc_id ? g_soc_id : "?");
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
+                    ork_tier_decide_load(ctx);   /* resident WIDTH for the rotated-int4 entries (see ork_tier_rule) */
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
                     /* ORK_MAKE_STUB=1: emit the companion stub for a pack that already exists. The stub needs
@@ -2445,6 +2645,8 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     }
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
+        /* BEFORE the first weight: which 4-bit BYTES this model gets on this machine (ork_tier_rule). */
+        ork_tier_decide_build(ctx, ork_find_model_path().c_str());
         /* Reserve the recovery header; blobs start after it. Every offset in the format is absolute,
          * so this is invisible to readers. */
         ctx->persist_off = ORKPACK_HDR_BYTES;
@@ -2807,9 +3009,11 @@ static void ork_persist_write_i4native(ggml_backend_ork_context * ctx, const cha
     if (!tb) return;
     std::vector<char> tmp(tb); ork_w_dump(ow.w, tmp.data(), tb);
     orkpack_entry e{}; e.K = K; e.N = N;
-    e.dtype = (ow.wbits == 8) ? ORKPACK_DT_I8_ROT
-            : (ow.abits == 8) ? ORKPACK_DT_I4_ROT_A8      /* rotated int4 bytes, int8 activations */
-                              : ORKPACK_DT_I4_NATIVE;
+    /* ONE tag for rotated int4. DT_I4_ROT_A8 and DT_I4_NATIVE were written from these same
+     * ork_w_dump bytes and differed only in the BUILD's activation width -- a run-time property that
+     * the loader now decides from the machine's RAM (ork_tier_rule), so recording it here would be
+     * recording an answer to a question this file cannot see. DT_I8_ROT is different: int8 bytes. */
+    e.dtype = (ow.wbits == 8) ? ORKPACK_DT_I8_ROT : ORKPACK_DT_I4_NATIVE;
     e.bscale_n = (uint32_t) ow.bscale.size();
     e.qerr = ow.qerr;   /* the evidence for this weight's tier, so re-tiering needs no model run */
     e.blob_off = ctx->persist_off; e.blob_size = tb;
@@ -2903,7 +3107,12 @@ static bool ork_persist_load_i4native(ggml_backend_ork_context * ctx, const char
     /* DT_I4_ROT_A8 stores int4 bytes but RUNS on the int8 MAC: inflate at load (ork_i4a8_mm_load turns
      * int4 tiles into int8 containers) and pair with int8 activations. bscale stays the int4 mx/7 scale,
      * which is correct — inflation does not change the represented values. */
-    const bool rot_a8 = (e.dtype == ORKPACK_DT_I4_ROT_A8);
+    /* WIDTH IS THIS MACHINE'S CALL, not the tag's. DT_I4_NATIVE and DT_I4_ROT_A8 are the same bytes
+     * written by the same function (ork_persist_write_i4native tags them apart only by the BUILD's
+     * activation width), so which one a given run should use depends on the RAM in front of it --
+     * see ork_tier_rule. DT_I8_ROT is excluded: it stores genuinely different, int8 bytes. */
+    const bool rot_a8 = ork_dt_is_rotated_i4(e.dtype) ? !ork_i4_keep_nibbles()
+                                                      : (e.dtype == ORKPACK_DT_I4_ROT_A8);
     ow.wbits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
     ow.abits = (e.dtype == ORKPACK_DT_I8_ROT || rot_a8) ? 8 : 4;
     const size_t wbytes = (size_t) K * N / (ow.wbits == 8 ? 1 : 2);   /* rot_a8: int8 RESIDENT though int4 on disk */
@@ -3168,6 +3377,220 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
     }
 }
 
+
+/* ---- THE SHADOW GGUF: what the pack carries for the tensors ork DECLINED ---------------------
+ *
+ * An .orkpack is self-sufficient: besides its own tiled weights it embeds everything the model needs
+ * that ork does NOT serve -- the header/KV block and every tensor the NPU declined. Those used to be
+ * copied out of the source BYTE FOR BYTE, which on a BF16 source means a 4-bit pack shipping its two
+ * largest matrices at 16 bits. On Qwen3.8-27B that is token_embd (2.37 GiB) + output (2.37 GiB) of
+ * BF16 inside a pack whose own weights are 4-bit, and both of them are resident at load.
+ *
+ * Note WHY they were declined: `N > ORK_MAXN` -- they are too WIDE for the NPU's IOVA budget, not too
+ * precision-critical for 4 bits. The CPU consumes them, and the CPU reads k-quants natively. So they
+ * are stored quantized, and the pack costs what its name says it costs.
+ *
+ * WHAT IS LEFT ALONE, and why. Norms, biases, 1-D tensors, ssm_conv1d/ssm_a/ssm_dt.bias and the
+ * N=48 ssm_alpha/beta pairs are ~54 MiB together on the 27B -- quantizing them buys nothing measurable
+ * and k-quants are not designed for them. Anything whose source is ALREADY quantized is left alone too:
+ * re-quantizing compounds error and the bits are already spent. The floor is a size, not a name list,
+ * so it needs no per-architecture maintenance.
+ *
+ * THE OUTPUT HEAD IS NOT THE BODY. A 4-bit lm_head costs more perplexity than 4-bit body weights (it
+ * is the one matrix whose error lands directly on the logits), which is why llama-quantize's own Q4_K_M
+ * stores output.weight at Q6_K. We follow that split and measured it rather than assuming -- see the
+ * report accompanying this change. ORK_DECLINED_HEAD_TYPE / ORK_DECLINED_TYPE / ORK_DECLINED_MIN_MB
+ * exist to RE-measure it; they are recorded verbatim in the pack's provenance `env:` line, so a pack
+ * built with a different policy says so.
+ *
+ * MECHANICS. The old copy was byte-identical in layout, which let it copy the tensor-info block
+ * wholesale. Changing a tensor's TYPE changes its size, so the info block has to be re-serialised;
+ * that is what ork_shadow_build does, through the gguf writer itself (no hand-rolled offsets). The
+ * packed tensors keep their SOURCE type in the info block and are left as file HOLES exactly as
+ * before -- ork substitutes them, and ork_stub_verify still catches a stub running without its pack. */
+
+struct ork_shadow_tensor {
+    std::string    name;
+    uint64_t       out_off = 0, out_size = 0;   /* absolute offset + size in the shadow gguf */
+    uint64_t       src_off = 0, src_size = 0;   /* absolute offset + size in the SOURCE gguf */
+    enum ggml_type src_type = GGML_TYPE_F32, out_type = GGML_TYPE_F32;
+    int64_t        ne0 = 0, nrows = 0;
+    bool           hole = false;                /* served by the pack -> no data */
+};
+struct ork_shadow {
+    std::vector<char>              meta;        /* header + KV + tensor-info */
+    uint64_t                       data_off = 0, total = 0;
+    std::vector<ork_shadow_tensor> t;
+    uint64_t kept_b = 0, src_kept_b = 0;        /* stored vs what verbatim would have cost */
+    uint32_t n_kept = 0, n_quant = 0;
+};
+
+/* EXACT match, never strstr. "blk.17.attn_output.weight" CONTAINS "output.weight", and an is-this-the-
+ * lm-head test written with strstr says yes to all 28 of them -- which is the same over-match this file
+ * already had once and fixed (see "LEVER D" in supports_op). Here it would have mis-typed every attention
+ * output projection AND, worse, concluded that a TIED model has an untied head: measured on Qwen3-1.7B,
+ * whose token_embd then got the body width instead of the head's. */
+static bool ork_name_is_lm_head(const char * n) {
+    if (!n) return false;
+    return !strcmp(n, "output.weight") || !strcmp(n, "lm_head.weight") ||
+           !strcmp(n, "output")        || !strcmp(n, "lm_head");
+}
+
+static enum ggml_type ork_declined_type_env(const char * var, enum ggml_type dflt) {
+    const char * v = getenv(var);
+    if (!v || !*v) return dflt;
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        const char * nm = ggml_type_name((enum ggml_type) i);
+        if (nm && !strcasecmp(nm, v)) return (enum ggml_type) i;
+    }
+    fprintf(stderr, "[ORK META] %s='%s' is not a ggml type name — ignoring\n", var, v);
+    return dflt;
+}
+
+/* The storage type for one tensor of the shadow gguf. `packed` tensors keep their source type (they are
+ * holes); everything else is the policy above. */
+static enum ggml_type ork_shadow_store_type(const char * name, const struct ggml_tensor * t, bool packed,
+                                            bool tied_embd) {
+    if (packed) return t->type;
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) return t->type;
+    if (ggml_n_dims(t) != 2 || t->ne[2] != 1 || t->ne[3] != 1) return t->type;
+    static const uint64_t min_b = (uint64_t) (getenv("ORK_DECLINED_MIN_MB") ? atoll(getenv("ORK_DECLINED_MIN_MB")) : 16) << 20;
+    if ((uint64_t) ggml_nbytes(t) < min_b) return t->type;
+    static const enum ggml_type body = ork_declined_type_env("ORK_DECLINED_TYPE",      GGML_TYPE_Q4_K);
+    static const enum ggml_type head = ork_declined_type_env("ORK_DECLINED_HEAD_TYPE", GGML_TYPE_Q6_K);
+    /* TIED EMBEDDINGS: with no output.weight, token_embd IS the output head and carries the head's
+     * sensitivity -- the logits are computed from it. Giving it the body's width there would quietly
+     * apply the body policy to the one matrix the head policy exists for. (Qwen3-1.7B is tied;
+     * Qwen3.8-27B is not.) */
+    const bool is_head = ork_name_is_lm_head(name) ||
+                         (tied_embd && name && !strcmp(name, "token_embd.weight"));
+    enum ggml_type want = is_head ? head : body;
+    if (want == t->type) return t->type;
+    if (ggml_quantize_requires_imatrix(want)) return t->type;        /* no imatrix here -> don't */
+    if (t->ne[0] % (int64_t) ggml_blck_size(want) != 0) {            /* row not a whole number of blocks */
+        if (t->ne[0] % 32 == 0) want = GGML_TYPE_Q8_0;               /* fall back to the 32-wide block */
+        else return t->type;
+    }
+    return want;
+}
+
+/* Re-serialise the source gguf's metadata with the declined tensors' new types, and lay out the data
+ * section. Nothing is read or written here beyond the source's metadata — the plan is bytes-on-demand. */
+static bool ork_shadow_build(const char * src_path, const std::unordered_set<std::string> & own, ork_shadow & sh) {
+    struct ggml_context * mc = nullptr;
+    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/&mc };
+    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
+    if (!gg || !mc) { if (gg) gguf_free(gg); if (mc) ggml_free(mc); return false; }
+    const uint64_t src_data_off = (uint64_t) gguf_get_data_offset(gg);
+    const int64_t  nt = gguf_get_n_tensors(gg);
+    bool tied_embd = true;
+    for (int64_t i = 0; i < nt; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        if (ork_name_is_lm_head(nm)) { tied_embd = false; break; }
+    }
+
+    struct gguf_context * out = gguf_init_empty();
+    gguf_set_kv(out, gg);
+    /* gguf_set_kv COPIES general.alignment as a key but does not adopt it as the writer's padding, so a
+     * source with a non-default alignment would produce a file whose KV and whose actual offsets
+     * disagree -- every tensor after the first read from the wrong place. The writer pads at the
+     * default, so say the default. (Every model seen here uses 32; this is the guard, not a case.) */
+    if (gguf_get_alignment(gg) != gguf_get_alignment(out)) {
+        fprintf(stderr, "[ORK META] source alignment %zu != writer alignment %zu — rewriting the key\n",
+                gguf_get_alignment(gg), gguf_get_alignment(out));
+        gguf_set_val_u32(out, "general.alignment", (uint32_t) gguf_get_alignment(out));
+    }
+    struct ggml_init_params gp = { /*mem_size=*/ (size_t) (nt + 8) * ggml_tensor_overhead(),
+                                   /*mem_buffer=*/ nullptr, /*no_alloc=*/ true };
+    struct ggml_context * oc = ggml_init(gp);
+    if (!oc) { gguf_free(out); gguf_free(gg); ggml_free(mc); return false; }
+
+    sh.t.resize((size_t) nt);
+    for (int64_t i = 0; i < nt; i++) {
+        const char * nm = gguf_get_tensor_name(gg, i);
+        struct ggml_tensor * st = ggml_get_tensor(mc, nm);
+        const bool packed = own.count(nm) != 0;
+        const enum ggml_type ot = ork_shadow_store_type(nm, st, packed, tied_embd);
+        struct ggml_tensor * ot_t = ggml_new_tensor(oc, ot, GGML_MAX_DIMS, st->ne);
+        ggml_set_name(ot_t, nm);
+        gguf_add_tensor(out, ot_t);
+        ork_shadow_tensor & r = sh.t[(size_t) i];
+        r.name = nm; r.hole = packed;
+        r.src_type = st->type; r.out_type = ot;
+        r.ne0 = st->ne[0]; r.nrows = ggml_nelements(st) / st->ne[0];
+        r.src_off = src_data_off + (uint64_t) gguf_get_tensor_offset(gg, i);
+        r.src_size = (uint64_t) gguf_get_tensor_size(gg, i);
+    }
+    sh.data_off = gguf_get_meta_size(out);
+    sh.meta.resize(sh.data_off);
+    gguf_get_meta_data(out, sh.meta.data());
+    for (int64_t i = 0; i < nt; i++) {
+        ork_shadow_tensor & r = sh.t[(size_t) i];
+        r.out_off  = sh.data_off + (uint64_t) gguf_get_tensor_offset(out, i);
+        r.out_size = (uint64_t) gguf_get_tensor_size(out, i);
+        if (!r.hole) { sh.n_kept++; sh.kept_b += r.out_size; sh.src_kept_b += r.src_size;
+                       if (r.out_type != r.src_type) sh.n_quant++; }
+    }
+    /* End of the data section = the furthest tensor's padded end. Computed, not inferred from a
+     * data-offset identity that only holds for a freshly written context. */
+    { uint64_t end = sh.data_off;
+      for (const auto & r : sh.t) end = std::max(end, r.out_off + GGML_PAD(r.out_size, gguf_get_alignment(out)));
+      sh.total = end; }
+
+    ggml_free(oc); gguf_free(out); gguf_free(gg); ggml_free(mc);
+    return true;
+}
+
+/* Produce one kept tensor's shadow bytes and hand them to `sink` in order. Verbatim when the type is
+ * unchanged (streamed, so a 2 GiB tensor costs a 1 MiB buffer); otherwise dequantised to f32 a row-block
+ * at a time and re-quantised with ggml's own quantiser, parallel across rows within the block. */
+template <typename Sink>
+static bool ork_shadow_emit(int sfd, const ork_shadow_tensor & r, Sink sink) {
+    if (r.out_type == r.src_type) {
+        std::vector<char> buf(1u << 20);
+        for (uint64_t got = 0; got < r.out_size; ) {
+            const size_t want = (size_t) std::min<uint64_t>(r.out_size - got, buf.size());
+            ssize_t n = pread(sfd, buf.data(), want, (off_t) (r.src_off + got));
+            if (n <= 0 || !sink(buf.data(), (size_t) n)) return false;
+            got += (uint64_t) n;
+        }
+        return true;
+    }
+    ggml_quantize_init(r.out_type);
+    const auto * tr = ggml_get_type_traits(r.src_type);
+    const size_t src_row = ggml_row_size(r.src_type, r.ne0);
+    const size_t dst_row = ggml_row_size(r.out_type, r.ne0);
+    int64_t rb = (int64_t) ((128u << 20) / (size_t) (r.ne0 * 4));
+    if (rb < 1) rb = 1; if (rb > r.nrows) rb = r.nrows;
+    std::vector<char>  sbuf((size_t) rb * src_row);
+    std::vector<float> f32((size_t) rb * r.ne0);
+    std::vector<char>  dbuf((size_t) rb * dst_row);
+    for (int64_t r0 = 0; r0 < r.nrows; r0 += rb) {
+        const int64_t nr = std::min<int64_t>(rb, r.nrows - r0);
+        const size_t  nb = (size_t) nr * src_row;
+        if (pread(sfd, sbuf.data(), nb, (off_t) (r.src_off + (uint64_t) r0 * src_row)) != (ssize_t) nb) return false;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int64_t i = 0; i < nr; i++) {
+            if (r.src_type == GGML_TYPE_F32) memcpy(f32.data() + i * r.ne0, sbuf.data() + (size_t) i * src_row, (size_t) r.ne0 * 4);
+            else tr->to_float(sbuf.data() + (size_t) i * src_row, f32.data() + i * r.ne0, (int) r.ne0);
+            ggml_quantize_chunk(r.out_type, f32.data() + i * r.ne0, dbuf.data() + (size_t) i * dst_row,
+                                /*start=*/0, /*nrows=*/1, /*n_per_row=*/r.ne0, /*imatrix=*/nullptr);
+        }
+        if (!sink(dbuf.data(), (size_t) nr * dst_row)) return false;
+    }
+    return true;
+}
+
+static void ork_shadow_report(const char * what, const ork_shadow & sh) {
+    fprintf(stderr, "[ORK META] %s: %u non-packed tensors, %u of them re-quantised — %.2f GiB stored vs "
+                    "%.2f GiB at source precision (saved %.2f GiB); header/KV %.1f MiB\n",
+            what, sh.n_kept, sh.n_quant, sh.kept_b/1073741824.0, sh.src_kept_b/1073741824.0,
+            (sh.src_kept_b > sh.kept_b ? sh.src_kept_b - sh.kept_b : 0)/1073741824.0,
+            sh.data_off/1048576.0);
+}
+
 /* ---- STUB GGUF -------------------------------------------------------------------------------------
  * Emitted next to the .orkpack at build time, so a run needs (stub GGUF + orkpack) instead of (FULL GGUF
  * + orkpack). Without it the matmul weights are carried TWICE -- once as source GGUF bytes and again as
@@ -3187,56 +3610,37 @@ static void ork_persist_write_experts(ggml_backend_ork_context * ctx, const stru
  * stub without its pack; it is not a model on its own. */
 static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed) {
-    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
-    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
-    if (!gg) { fprintf(stderr, "[ORK STUB] cannot read %s — no stub written\n", src_path); return false; }
-
     std::unordered_set<std::string> own;
     for (const auto & kv : packed) own.insert(kv.first);
+    ork_shadow sh;
+    if (!ork_shadow_build(src_path, own, sh)) {
+        fprintf(stderr, "[ORK STUB] cannot read %s — no stub written\n", src_path); return false; }
 
     int sfd = open(src_path, O_RDONLY);
     int dfd = open(stub_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (sfd < 0 || dfd < 0) { if (sfd>=0) close(sfd); if (dfd>=0) close(dfd); gguf_free(gg);
+    if (sfd < 0 || dfd < 0) { if (sfd>=0) close(sfd); if (dfd>=0) close(dfd);
         fprintf(stderr, "[ORK STUB] open failed for %s\n", stub_path); return false; }
 
-    const size_t data_off = gguf_get_data_offset(gg);
-    std::vector<char> buf(1u << 20);
-    bool ok = true;
-
-    /* 1. header + KV + tensor-info, verbatim */
-    for (size_t got = 0; got < data_off && ok; ) {
-        const size_t want = (data_off - got < buf.size()) ? (data_off - got) : buf.size();
-        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
-        if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, (off_t) got) != r) ok = false; else got += (size_t) r;
+    bool ok = pwrite(dfd, sh.meta.data(), sh.meta.size(), 0) == (ssize_t) sh.meta.size();
+    /* full length up front, so the untouched ranges (the packed tensors) become holes, not a short file */
+    ok = ok && ftruncate(dfd, (off_t) sh.total) == 0;
+    size_t dropped = 0; uint64_t dropped_b = 0;
+    for (const auto & r : sh.t) {
+        if (!ok) break;
+        if (r.hole) { dropped++; dropped_b += r.out_size; continue; }   /* served from the pack -> hole */
+        uint64_t at = r.out_off;
+        ok = ork_shadow_emit(sfd, r, [&](const void * p2, size_t n) {
+            if (pwrite(dfd, p2, n, (off_t) at) != (ssize_t) n) return false; at += n; return true; });
     }
-
-    /* 2. full length up front, so the untouched ranges become holes rather than a short file */
-    const off_t total = lseek(sfd, 0, SEEK_END);
-    if (ok && ftruncate(dfd, total) != 0) ok = false;
-
-    /* 3. copy only what the pack does not own */
-    size_t kept = 0, dropped = 0; uint64_t kept_b = 0, dropped_b = 0;
-    const int64_t nt = gguf_get_n_tensors(gg);
-    for (int64_t i = 0; i < nt && ok; i++) {
-        const char * nm = gguf_get_tensor_name(gg, i);
-        const size_t sz = gguf_get_tensor_size(gg, i);
-        const off_t  at = (off_t) (data_off + gguf_get_tensor_offset(gg, i));
-        if (own.count(nm)) { dropped++; dropped_b += sz; continue; }        /* served from the pack -> hole */
-        kept++; kept_b += sz;
-        for (size_t got = 0; got < sz && ok; ) {
-            const size_t want = (sz - got < buf.size()) ? (sz - got) : buf.size();
-            ssize_t r = pread(sfd, buf.data(), want, at + (off_t) got);
-            if (r <= 0 || pwrite(dfd, buf.data(), (size_t) r, at + (off_t) got) != r) ok = false; else got += (size_t) r;
-        }
-    }
-    close(sfd); close(dfd); gguf_free(gg);
+    close(sfd); close(dfd);
     if (!ok) { unlink(stub_path); fprintf(stderr, "[ORK STUB] write failed — stub removed\n"); return false; }
 
     struct stat st; long long blocks_b = (stat(stub_path, &st) == 0) ? (long long) st.st_blocks * 512 : -1;
-    fprintf(stderr, "[ORK STUB] %s: kept %zu tensors (%.2f GiB), left %zu to the pack (%.2f GiB of holes)\n"
+    ork_shadow_report("stub", sh);
+    fprintf(stderr, "[ORK STUB] %s: kept %u tensors (%.2f GiB), left %zu to the pack (%.2f GiB of holes)\n"
                     "[ORK STUB]   apparent %.2f GiB, on disk %.2f GiB — run with THIS gguf + the .orkpack\n",
-            stub_path, kept, kept_b/1073741824.0, dropped, dropped_b/1073741824.0,
-            total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
+            stub_path, sh.n_kept, sh.kept_b/1073741824.0, dropped, dropped_b/1073741824.0,
+            sh.total/1073741824.0, blocks_b < 0 ? 0.0 : blocks_b/1073741824.0);
     return true;
 }
 
@@ -3334,6 +3738,13 @@ static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * 
     { uint32_t fl = 0; uint64_t ih = 0; ork_pack_provenance(&fl, &ih);
       snprintf(ln, sizeof ln, "prov_flags: %08x%s%s\n", fl,
                (fl & ORK_PROV_GPTQ) ? " GPTQ" : "", (fl & ORK_PROV_IMATRIX) ? " IMATRIX" : ""); t += ln; }
+    /* The tier decision in words, next to the environment that did NOT make it. */
+    snprintf(ln, sizeof ln, "tier: %s (NF4 i4a8 form would be %.2f GiB resident; build host RAM %.2f GiB; "
+                            "threshold %d%%)\n",
+             g_tier.rotated ? "ROTATED int4 (DT_I4_NATIVE bytes; the loader picks the resident width)"
+                            : "DT_I4 / NF4 i4a8",
+             g_tier.build_infl / (1024.0*1024*1024), ork_phys_ram_bytes() / (1024.0*1024*1024),
+             g_tier.pct); t += ln;
 
     /* Every ORK_* variable set for this run, so a method nobody thought to flag is still recorded. */
     t += "env:";
@@ -3356,61 +3767,43 @@ static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * 
 static bool ork_write_pack_meta(FILE * out, const char * src_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed,
                                 uint64_t * bytes_written) {
-    struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
-    struct gguf_context * gg = gguf_init_from_file(src_path, ip);
-    if (!gg) { fprintf(stderr, "[ORK META] cannot read %s — pack will carry no metadata\n", src_path); return false; }
     std::unordered_set<std::string> own;
     for (const auto & kv : packed) own.insert(kv.first);
-
+    ork_shadow sh;
+    if (!ork_shadow_build(src_path, own, sh)) {
+        fprintf(stderr, "[ORK META] cannot read %s — pack will carry no metadata\n", src_path); return false; }
     int sfd = open(src_path, O_RDONLY);
-    if (sfd < 0) { gguf_free(gg); return false; }
-    const uint64_t data_off = (uint64_t) gguf_get_data_offset(gg);
-    const uint64_t total    = (uint64_t) lseek(sfd, 0, SEEK_END);
-    uint64_t w = 0; bool ok = true;
-    std::vector<char> buf(1u << 20);
+    if (sfd < 0) return false;
 
-    ok = ok && fwrite(&total, 8, 1, out) == 1;    w += 8;
-    ok = ok && fwrite(&data_off, 8, 1, out) == 1; w += 8;
-    for (uint64_t got = 0; got < data_off && ok; ) {
-        const size_t want = (size_t) std::min<uint64_t>(data_off - got, buf.size());
-        ssize_t r = pread(sfd, buf.data(), want, (off_t) got);
-        if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
-        else { got += (uint64_t) r; w += (uint64_t) r; }
+    uint64_t w = 0; bool ok = true;
+    ok = ok && fwrite(&sh.total,    8, 1, out) == 1; w += 8;
+    ok = ok && fwrite(&sh.data_off, 8, 1, out) == 1; w += 8;
+    ok = ok && fwrite(sh.meta.data(), 1, sh.meta.size(), out) == sh.meta.size(); w += sh.meta.size();
+    ok = ok && fwrite(&sh.n_kept, 4, 1, out) == 1; w += 4;
+    for (const auto & r : sh.t) {
+        if (!ok || r.hole) continue;
+        ok = ok && fwrite(&r.out_off,  8, 1, out) == 1; w += 8;
+        ok = ok && fwrite(&r.out_size, 8, 1, out) == 1; w += 8;
+        if (!ok) break;
+        uint64_t got = 0;
+        ok = ork_shadow_emit(sfd, r, [&](const void * p2, size_t n) {
+            if (fwrite(p2, 1, n, out) != n) return false; got += n; return true; });
+        ok = ok && got == r.out_size;
+        w += got;
     }
-    const int64_t nt = gguf_get_n_tensors(gg);
-    uint32_t n_kept = 0;
-    for (int64_t i = 0; i < nt; i++) if (!own.count(gguf_get_tensor_name(gg, i))) n_kept++;
-    ok = ok && fwrite(&n_kept, 4, 1, out) == 1; w += 4;
-    uint64_t kept_b = 0;
-    for (int64_t i = 0; i < nt && ok; i++) {
-        const char * nm = gguf_get_tensor_name(gg, i);
-        if (own.count(nm)) continue;
-        const uint64_t sz = (uint64_t) gguf_get_tensor_size(gg, i);
-        const uint64_t at = data_off + (uint64_t) gguf_get_tensor_offset(gg, i);
-        ok = ok && fwrite(&at, 8, 1, out) == 1; w += 8;
-        ok = ok && fwrite(&sz, 8, 1, out) == 1; w += 8;
-        for (uint64_t got = 0; got < sz && ok; ) {
-            const size_t want = (size_t) std::min<uint64_t>(sz - got, buf.size());
-            ssize_t r = pread(sfd, buf.data(), want, (off_t) (at + got));
-            if (r <= 0 || fwrite(buf.data(), 1, (size_t) r, out) != (size_t) r) ok = false;
-            else { got += (uint64_t) r; w += (uint64_t) r; }
-        }
-        kept_b += sz;
-    }
-    close(sfd); gguf_free(gg);
+    close(sfd);
     if (!ok) { fprintf(stderr, "[ORK META] write failed — pack will carry no metadata\n"); return false; }
     *bytes_written = w;
-    fprintf(stderr, "[ORK META] embedded %u non-packed tensors (%.2f GiB) + %.1f MiB of header/KV; "
-                    "pack is now self-sufficient\n", n_kept, kept_b/1073741824.0, data_off/1048576.0);
+    ork_shadow_report("embedded", sh);
     /* A PARTIAL pack must not look finished. The metadata section embeds whatever the pack does NOT own,
      * so a run that died early packs a handful of weights and then embeds nearly the whole model as
      * "non-packed" -- observed: a 27B build that failed at weight 73 of 400 produced a 24.34 GiB pack that
      * orkpack_info still reported as "ok — loads". Loud, because the file is superficially valid. */
-    if (packed.size() * 4 < (size_t) n_kept)
+    if (packed.size() * 4 < (size_t) sh.n_kept)
         fprintf(stderr, "[ORK META] *** WARNING: only %zu tensors are PACKED against %u embedded — this pack is "
                         "almost certainly PARTIAL (a failed/aborted build). Delete it and rebuild; it will "
                         "load and silently serve most weights from the embedded copies at source precision.\n",
-                packed.size(), n_kept);
+                packed.size(), sh.n_kept);
     return true;
 }
 
@@ -3698,6 +4091,14 @@ ork_resolve_weight_i8(ggml_backend_ork_context * ctx, const struct ggml_tensor *
                 else            ork_wcache_evict(ctx, (size_t) K * N);
             }
             ork_weight ow;
+            /* RESIDENT WIDTH, not disk width. Everything this branch loads ends up in int8 containers:
+             * DT_I8 natively, DT_I4 by inflating its nibbles 1:2 at load. ork_weight defaults wbits/abits
+             * to 4 (the native-W4A4 tier's value), and this path never corrected it -- so EVERY weight a
+             * pack served looked like native int4 to the rest of the backend. The visible consequence was
+             * ork_wcache_evict, which refuses to evict wbits==4 (a deliberate guard against freeing an
+             * int4 weight mid-eval and fragmenting the 32-bit IOVA): with the wrong label it refused to
+             * evict ANYTHING, and a 15.62 GiB wcache budget measured zero bytes evicted. */
+            ow.wbits = 8; ow.abits = 8;
             const char * blob = (const char *) ctx->persist_map + e.blob_off;
             int _dom = ork_weight_domain_named(ctx, src0->name, (size_t) K * N, ork_layer_of(src0->name));   // multi-domain residence: byte-balanced + layer-aligned (advance only at layer boundaries)
             ork_npu_set_pack_domain(ctx->npu, _dom);
@@ -5375,6 +5776,21 @@ ork_resolve_weight_i4native(ggml_backend_ork_context * ctx, const struct ggml_te
              * which refuses to evict for exactly this reason), and a wedge here costs a physical reset.
              * So the number is recorded and the LOAD-TIME PLANNER acts on it; nothing frees mid-run. */
             ow.bytes = ork_w_bytes(ow.w);
+            /* ...EXCEPT WHILE CONVERTING, where not freeing is fatal and the hazard does not exist.
+             *
+             * A convert frees BETWEEN ops, never under an in-flight chain -- which is the whole argument
+             * ork_wcache_evict already makes for the int8 path ("the design IS pack -> dump -> free, which
+             * is what lets a conversion fit ANY model size"). This resolve never made that call, so a
+             * rotated-int4 build grew monotonically in ONE domain and stopped the moment its IOVA filled:
+             * MEASURED on Qwen3.8-27B, the build packed 73 of ~400 weights (2.04 GiB), then silently
+             * persisted nothing more and finalised a pack that embedded 12.57 GiB of the model as
+             * "non-packed". No error, and the file is superficially valid -- it is only the PARTIAL
+             * warning in ork_write_pack_meta that says anything is wrong. This is why no native-W4A4 pack
+             * of a large model had ever been produced.
+             *
+             * GPTQ is excluded: it holds wcache references across the whole calibration (see the pin note
+             * above), so evicting underneath it is the "wcache entry vanished" failure. */
+            if (ork_persist_writes(ctx) && !ork_gptq_on()) ork_wcache_evict(ctx, ow.bytes);
             ctx->wcache_bytes += ow.bytes;
             it = ctx->wcache.emplace(x, std::move(ow)).first;
         }
@@ -9406,7 +9822,7 @@ static bool ggml_backend_ork_glu(ggml_backend_ork_context * ctx, struct ggml_ten
 // used to gate same-tier group fusion (only i8-tier matmuls concatenate into mul_mat_group_i8).
 static int ork_node_qbits(const ggml_backend_ork_context * ctx, const struct ggml_tensor * node) {
     if (ork_mixed_dispatch_on()) {
-        static const int w4a4 = env_enabled("ORK_MIXED_W4A4");
+        const int w4a4 = ctx->hadamard;              /* the resolved tier, not an env flag */
         double b = ork_src_type_bits(node->src[0]->type);
         return (w4a4 && b >= 0.0 && b < 5.0) ? 4 : 8;
     }
@@ -10851,7 +11267,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                     // packed-weight submit — fewer round-trips. Members must share ONE compute tier: an
                     // all-W8A8 group -> mul_mat_group_i8, an all-W4A4 group -> mul_mat_group_i4 (the W4A4 twin,
                     // which also shares the FWHT rotation once). Default mixed path (q4->W8A8) => all-i8 groups;
-                    // ORK_MIXED_W4A4 => i4 groups for the 4-bit tier. Mixed-tier runs stay per-node.
+                    // Native-W4A4 tier => i4 groups. Mixed-tier runs stay per-node.
                     const int grp_tier = ork_node_qbits(ctx, node);   // group members must all share this tier (8=W8A8, 4=W4A4)
                     // node->ne[1] = M (output rows). M-sweep (qwen3-1.7B-Q8_0, 2026-07-10, warm -r3): fusion WINS
                     // at EVERY M>=2 — pp2 +10.8%, pp4 +10.5%, pp8 +8-9%, pp64 +12-17%. At M=1: pp1 is +1% but
@@ -10929,9 +11345,10 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                             // ork_w4a4_native_on), the 4-bit run is simply slower — so by DEFAULT the 4-bit
                             // tier computes W8A8 (dequant q4→int8, amortized + coherent ≈ Q8_0 speed); the
                             // compact-int4 win is realized in the .orkpack STORAGE (i4a8), not the compute.
-                            // ORK_MIXED_W4A4=1 opts the 4-bit tier into native W4A4, which halves RESIDENT
-                            // bytes. It does not help decode: dense M==1 never reaches the NPU at all.
-                            static const int w4a4 = env_enabled("ORK_MIXED_W4A4");
+                            // The tier rule opts the 4-bit tier into native W4A4 when the inflating form
+                            // would not fit (ork_tier_rule), which halves RESIDENT bytes. It does not help
+                            // decode: dense M==1 never reaches the NPU at all.
+                            const int w4a4 = ctx->hadamard;   /* the resolved tier (ork_tier_rule), not an env flag */
                             double b = ork_src_type_bits(node->src[0]->type);
                             target_qbits = (w4a4 && b >= 0.0 && b < 5.0) ? 4 : 8;
                             if (getenv("ORK_VERBOSE"))
@@ -10943,7 +11360,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
                         }
 
                         // int4 COMPUTE routing: native W4A4 is fragile at prefill (grouped M_padded wedges) and stays
-                        // opt-in via ORK_MIXED_W4A4 (ctx->hadamard). When selected it is ALWAYS the rotated variant —
+                        // selected by the tier rule (ctx->hadamard). When selected it is ALWAYS the rotated variant —
                         // the un-rotated grouped route is gone, because a symmetric 4-bit MAC without R is incoherent
                         // (see ork_w4a4_native_on). The DEFAULT int4 (incl. ORK_QUANT=4) computes W8A8 via mul_mat_i8
                         // (int4 weights inflated int4->int8 on the NPU — robust, no wedge); compact i4a8 STORAGE is
@@ -10960,7 +11377,7 @@ static enum ggml_status ggml_backend_ork_graph_compute(ggml_backend_t backend, s
 
                         /* THE PACK DECIDES THE ROUTE, per weight.
                          *
-                         * ORK_QUANT / ORK_MIXED_W4A4 describe what to BUILD. They must not decide how to RUN
+                         * ORK_QUANT and the tier rule describe what to BUILD. They must not decide how to RUN
                          * a weight that already exists on disk at a definite precision — when the two
                          * disagree the weight is served as one tier and computed as another, which is how a
                          * strictly-higher-precision config scored WORSE than the tier it was meant to beat.
@@ -11271,11 +11688,24 @@ ggml_backend_t ggml_backend_ork_init(void) {
     ctx->no_cache = getenv("ORK_NOCACHE") != nullptr;
     ctx->slice_route = getenv("ORK_SLICE_ROUTE") != nullptr && !ctx->via_orkd;   // wide int8 via sliced doorbell (fd-local only)
     ctx->hybrid = g_ork_hybrid_loading || getenv("ORK_HYBRID") != nullptr;
-    // Rotation is now exactly "native W4A4 is selected" — one flag, no separate opt-in. Selecting the 4-bit
+    // Rotation is exactly "native W4A4 is selected" — one flag, no separate opt-in. Selecting the 4-bit
     // datapath routes to mul_mat_i4_hadamard (per-channel, single submit, persist-able); the un-rotated
-    // grouped route is no longer reachable. ORK_QUANT=4 alone does NOT land here — that is the int4 STORAGE
-    // tier computing W8A8. See ork_w4a4_native_on for the full rule and why ork-driver cannot own it.
-    ctx->hadamard = ork_w4a4_native_on();
+    // grouped route is no longer reachable. WHICH 4-bit tier is selected is no longer an env flag: it is
+    // decided from the model and the machine at BUILD time and read back off the pack's dtype census at
+    // load (ork_persist_init ran above, so this is already resolved). See ork_tier_rule.
+    /* READ: what the pack actually holds. WRITE / no pack: what we are about to build, which for the
+     * 4-bit NPU tier is now always the ROTATED form (unrotated DT_I4 is strictly dominated -- same
+     * storage class, worse error than both alternatives -- and is no longer emitted; it stays readable).
+     * The MoE auto-profile is excluded: its int4 experts are NF4 blobs consumed by the CPU kernels, a
+     * different tier with a different codebook, not this one. */
+    if (ctx->persist_mode == 1) ctx->hadamard = ork_w4a4_native_on();            /* READ: the pack's census */
+    else {
+        /* WRITE / no pack: the build rule decided (ork_tier_decide_build, run in ork_persist_init).
+         * The MoE auto-profile is excluded: its int4 experts are NF4 blobs consumed by the CPU
+         * kernels, which is the DT_I4 tier by construction and not a choice this rule gets to make. */
+        ctx->hadamard = (ctx->qbits == 4 && !ork_moe_auto() && g_tier.rotated);
+        g_tier.rotated = ctx->hadamard;
+    }
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     // SHIP HARDENING (2026-07-11): the FFN chain ships with a COMPACT resident footprint — default ORK_NO_BF
     // when ORK_FFN_CHAIN is on. The full-K Bf decode-copies ~double the footprint (~1.9->3.6 GiB on 1.7B),
@@ -11358,9 +11788,13 @@ ggml_backend_t ggml_backend_ork_init(void) {
                * mis-plan: the overflowing domain's IOVA allocation fails, and a failed allocation leaks a
                * mapping the kernel cannot reclaim until reboot. */
               const uint32_t dt = kv.second.dtype;
-              const bool i8_resident = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
-                                        dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
-                                       (dt == 0 && ctx->qbits == 8);   /* dt==0: pre-dtype pack, fall back */
+              /* The rotated-int4 class's resident width is THIS RUN's decision (ork_tier_rule), not the
+               * tag's, so the planner has to ask the same question the loader will. Everything else has
+               * a width fixed by its storage. */
+              const bool i8_resident = ork_dt_is_rotated_i4(dt)
+                                     ? !ork_i4_keep_nibbles()
+                                     : ((dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT || dt == ORKPACK_DT_I4) ||
+                                        (dt == 0 && ctx->qbits == 8));   /* dt==0: pre-dtype pack, fall back */
               const int    wbits = i8_resident ? 8 : 4;
               const size_t tile  = (size_t) K * N / (i8_resident ? 1 : 2);   /* Bb only, for the fp16/chain deltas below */
               /* Ask both ways: base is the always-resident set, bf_extra the optional full-K companion the
@@ -11459,9 +11893,10 @@ ggml_backend_t ggml_backend_ork_init(void) {
               for (const auto & kv : ctx->persist_idx) {
                   const int K = (int) kv.second.K, N = (int) kv.second.N;
                   const uint32_t dt = kv.second.dtype;
-                  const bool i8r = (dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT ||
-                                    dt == ORKPACK_DT_I4 || dt == ORKPACK_DT_I4_ROT_A8) ||
-                                   (dt == 0 && ctx->qbits == 8);
+                  const bool i8r = ork_dt_is_rotated_i4(dt)
+                                 ? !ork_i4_keep_nibbles()
+                                 : ((dt == ORKPACK_DT_I8 || dt == ORKPACK_DT_I8_ROT || dt == ORKPACK_DT_I4) ||
+                                    (dt == 0 && ctx->qbits == 8));
                   ents.emplace_back(kv.first, ork_w_resident_bytes(ctx->npu, K, N, i8r ? 8 : 4, want_bf ? 1 : 0));
               }
               std::sort(ents.begin(), ents.end(), [](const std::pair<std::string,size_t> & a,
