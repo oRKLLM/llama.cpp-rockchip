@@ -23,9 +23,13 @@
 //   Attention precision trades prefill for decode: f16 38.4/5.26, q8_0 36.9/6.59, Q4_K 26.8/7.42 — and
 //   BELOW 5 bits the NPU declines the source entirely (sbits<5.0 gate), losing the prefill path. q8_0 is
 //   the balanced optimum. Expert precision in the GGUF is irrelevant (NF4 comes from the .orkpack).
-// The .orkpack path is DERIVED from the loaded model (<model-dir>/<model-basename>.orkpack) — no env var
-// needed; an absent pack is built once, and a MoE model always gets the SAME scheme (NF4 experts) whatever
-// the GGUF's own precision, so one model = one pack. ORK_ORKPACK_PATH is a DEVELOPMENT override only.
+// WHERE the .orkpack lives: two layouts, both supported. LEGACY is <model-dir>/<base>.orkpack, one pack
+// per source. DIRECTORY is <model-dir>/<base>/<label>.orkpack — several packs from one source, each named
+// for its measured bpw, under a .orkpack-dir marker. bpw changes on every re-quantize, so it is an
+// attribute of the variant and never part of the identity: the DIRECTORY carries the source's name and
+// does not move. ORK_ORKPACK_PATH names a pack explicitly and wins over both; it is a SUPPORTED input,
+// not a development override, because an embedder has no command line to derive from and a caller
+// managing several variants must be able to say which it means. See ork_default_orkpack_path().
 // ORK_PERSIST is REMOVED and now aborts with guidance.
 // Research escape hatches: ORK_MOE_AUTO=0 disables the profile; ORK_MOE_NPU forces experts to the NPU.
 //
@@ -177,6 +181,7 @@ extern "C" {
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>   // .orkpack directory layout: enumerating a source's pack variants
 #include <strings.h>   // strcasecmp (env_enabled)
 #ifdef _OPENMP
 #include <omp.h>
@@ -1955,15 +1960,108 @@ static std::string ork_find_model_path() {
     for (const auto & a : av) if (is_gguf(a)) return a;            // positional (ork_bench)
     return std::string();
 }
-// DEFAULT orkpack path: <model-dir>/<model-basename>.orkpack, derived from the loaded GGUF. No env needed.
-// ORK_ORKPACK_PATH overrides it (e.g. to share ONE pack built from the f16 source across several GGUFs —
-// sharing one pack across GGUFs during development). DEVELOPMENT OVERRIDE ONLY — the derived path is the
-// supported path; a MoE model's pack scheme is fixed by the model type (NF4 experts + int8 attn/dense).
+/* ---- resolving WHERE the .orkpack is ------------------------------------------------------------
+ *
+ * Two layouts, both supported:
+ *
+ *   LEGACY     <model-dir>/<base>.orkpack                 one pack per source
+ *   DIRECTORY  <model-dir>/<base>/<label>.orkpack         several, each named for its measured bpw
+ *              <model-dir>/<base>/.orkpack-dir            the marker that makes it a pack directory
+ *
+ * The directory exists because one source GGUF can reasonably carry several packs (4bpw native W4A4,
+ * 4.9bpw promoted mixed, 8bpw int8), and bpw is a MEASURED property that changes on every re-quantize
+ * — so it has to be an attribute and never part of the identity. The directory is named for the
+ * SOURCE, which does not move; only the variant's name does.
+ *
+ * ORK_ORKPACK_PATH is a SUPPORTED input, not a development override. An embedder (oRKLLM's N-API
+ * worker) has no command line to derive from, and a caller managing several variants has to be able
+ * to say which one it means. It still wins over everything below.
+ *
+ * Deriving still matters for the CLI frontends (llama-cli / llama-bench / ork_bench), and it has to
+ * know about the directory: a bare `-m X.gguf` sitting next to a populated X/ would otherwise find no
+ * pack, silently rebuild a multi-GB one at the legacy path, and leave two copies on disk.
+ */
+static bool ork_is_pack_dir(const std::string & dir) {
+    struct stat st;
+    return stat((dir + "/.orkpack-dir").c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* bpw parsed out of a variant's FILENAME ("4.9bpw.orkpack" -> 4.9), or -1.
+ *
+ * Parsing a filename is acceptable HERE and nowhere else in this file, because it only ever breaks a
+ * TIE between candidates that have already passed the footer gates below; adoption stays the footer's
+ * decision. oRKLLM names each variant from the measurement it reads off that pack's own index, so a
+ * hand-renamed file can mis-order a tie and cannot cause a wrong pack to be adopted. */
+static double ork_variant_bpw(const std::string & fname) {
+    const char * p = fname.c_str();
+    char * end = nullptr;
+    const double v = strtod(p, &end);
+    if (end == p || v <= 0) return -1;
+    return strncmp(end, "bpw", 3) == 0 ? v : -1;
+}
+
+/* Pick a variant out of a pack directory, or "" when it holds none this build would adopt.
+ *
+ * Footer FIRST — schema version, ork_fmt and the build signature, exactly the gates ork_persist_init
+ * applies below — so a directory of packs in an older format resolves to nothing and the caller builds
+ * a fresh one, rather than adopting something that would be refused two screens later. Then, among the
+ * survivors: prefer the tier an explicit ORK_QUANT asks for, and break the remaining tie on filename
+ * bpw, descending, then strcmp — so the answer is a pure function of the directory's contents and
+ * never of readdir order. */
+static std::string ork_pick_variant(const std::string & dir) {
+    DIR * d = opendir(dir.c_str());
+    if (!d) return std::string();
+    const char * q = getenv("ORK_QUANT");
+    const int want = (q && (*q == '4' || *q == '8')) ? (*q - '0') : 0;
+    std::string best; double best_bpw = -2; int best_tier = -1;
+    for (struct dirent * e = readdir(d); e; e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 9 || n.compare(n.size() - 8, 8, ".orkpack") != 0) continue;
+        if (n[0] == '.') continue;                 /* .building-… — a build in flight, never a variant */
+        const std::string full = dir + "/" + n;
+        int fd = open(full.c_str(), O_RDONLY);
+        if (fd < 0) continue;
+        orkpack_footer f; bool ok = false;
+        const off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > (off_t) sizeof f && lseek(fd, sz - (off_t) sizeof f, SEEK_SET) >= 0 &&
+            read(fd, &f, sizeof f) == (ssize_t) sizeof f) {
+            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
+                 f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) &&
+                 f.index_off < (uint64_t) sz;
+        }
+        close(fd);
+        if (!ok) continue;
+        const int tier = want ? (ork_sig_qbits(f.quant_sig) == want ? 1 : 0) : 1;
+        const double bpw = ork_variant_bpw(n);
+        if (tier > best_tier ||
+            (tier == best_tier && (bpw > best_bpw || (bpw == best_bpw && (best.empty() || n < best))))) {
+            best = n; best_bpw = bpw; best_tier = tier;
+        }
+    }
+    closedir(d);
+    return best.empty() ? std::string() : dir + "/" + best;
+}
+
+/* The pack path for the GGUF on this command line: a variant from its pack DIRECTORY when one is
+ * there, else the legacy sibling file.
+ *
+ * When neither exists this is the path to BUILD at — inside the directory when the directory exists
+ * (so a CLI build joins the variants instead of orphaning itself beside them, under a `.building-`
+ * name the server renames to its measured bpw), and at the legacy path otherwise, which leaves a
+ * greenfield CLI user's behaviour exactly as it was. */
 static std::string ork_default_orkpack_path() {
     std::string m = ork_find_model_path();
     if (m.empty()) return std::string();
     const size_t dot = m.rfind(".gguf");
-    return m.substr(0, dot) + ".orkpack";
+    const std::string base = m.substr(0, dot);
+    if (ork_is_pack_dir(base)) {
+        const std::string v = ork_pick_variant(base);
+        if (!v.empty()) return v;
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "/.building-%d-%lld.orkpack", (int) getpid(), (long long) time(nullptr));
+        return base + tmp;
+    }
+    return base + ".orkpack";
 }
 static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed);
@@ -2032,12 +2130,15 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // from the loaded model. Fail loudly so stale scripts get fixed rather than silently losing the pack.
     if (getenv("ORK_PERSIST")) {
         GGML_ABORT("ork: ORK_PERSIST is no longer supported. The .orkpack path is DERIVED from the loaded "
-                   "model (<model-dir>/<model-basename>.orkpack) and needs no configuration — just run with "
-                   "-m <model.gguf>. ORK_ORKPACK_PATH=<file.orkpack> exists ONLY as a development override "
-                   "(e.g. to point several GGUFs at one pack built from an f16 source). Unset ORK_PERSIST.\n");
+                   "model and needs no configuration — just run with -m <model.gguf>; both the legacy "
+                   "<model-dir>/<base>.orkpack and the <model-dir>/<base>/ pack directory are found. To name "
+                   "a pack explicitly, set ORK_ORKPACK_PATH=<file.orkpack>, which is a supported input "
+                   "(an embedder has no command line to derive from). Unset ORK_PERSIST.\n");
     }
-    // Path resolution (no env required): ORK_ORKPACK_PATH (development override only) >
-    // <model>.orkpack derived from the loaded GGUF. An absent derived pack is BUILT this run (one-time).
+    // Path resolution (no env required): ORK_ORKPACK_PATH — a SUPPORTED input, and the only way an
+    // embedder or a multi-variant caller can name a pack — then the derivation, which tries the pack
+    // DIRECTORY before the legacy sibling file (ork_default_orkpack_path). An absent pack is BUILT this
+    // run (one-time), inside the directory when there is one.
     const char * env_p = getenv("ORK_ORKPACK_PATH");
     std::string derived;
     if (!env_p || !*env_p) {
