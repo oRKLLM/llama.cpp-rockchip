@@ -2017,23 +2017,21 @@ static long ork_mem_total_mb() {
     return kb > 0 ? kb / 1024 : 0;
 }
 
-/* The budget a variant's footprint is measured against, in MiB, or 0 = "unknown, do not apply".
- * `src` is filled with where the number came from, for the selection line.
+/* The DEFAULT budget a variant's footprint is measured against, in MiB, or 0 = "unknown, do not
+ * apply". MemTotal - 1 GiB floored at 1 GiB, mirroring oRKLLM's defaultPackBudgetMB() exactly.
  *
- * ORK_PACK_BUDGET_MB first: the server resolves its budget from CONFIGURATION (the global memory
- * limit minus the hot-cache reservation), which this process cannot see, so a bench run that needs
- * to reproduce the server's choice exactly is told the number. Otherwise MemTotal - 1 GiB floored at
- * 1 GiB, which mirrors oRKLLM's defaultPackBudgetMB() — the same fallback the server uses when
- * nothing is configured. */
-static long ork_pack_budget_mb(const char ** src) {
-    const char * e = getenv("ORK_PACK_BUDGET_MB");
-    if (e && *e) {
-        const long v = strtol(e, nullptr, 10);
-        if (v > 0) { if (src) *src = "ORK_PACK_BUDGET_MB"; return v; }
-    }
+ * This is a default, not a policy: ork_pick_variant takes the budget as an ARGUMENT, so a caller
+ * that knows better passes its own. There is deliberately no environment variable to override it —
+ * an env knob that SELECTS behaviour is a side channel, and the selection line below reports the
+ * number and where it came from, which is what actually makes the choice auditable.
+ *
+ * Consequence, accepted rather than engineered around: a bare llama-bench on a box whose server has
+ * a CONFIGURED budget (the global memory limit minus the hot-cache reservation) cannot see that
+ * number and will use this rule instead, so it may select a different variant than the server. The
+ * printed line states the budget and its source, so the difference is visible in the record. */
+static long ork_pack_budget_mb() {
     const long tot = ork_mem_total_mb();
-    if (tot <= 0) { if (src) *src = "unknown"; return 0; }
-    if (src) *src = "MemTotal - 1 GiB";
+    if (tot <= 0) return 0;
     return tot - 1024 < 1024 ? 1024 : tot - 1024;
 }
 
@@ -2070,11 +2068,9 @@ static std::string ork_hsize(off_t b) {
  * The footprint is the pack FILE's size, an upper bound on its resident weight bytes (the file also
  * carries the model's non-packed tensors), so the rule errs toward the smaller variant — the safe
  * direction. It is NOT a residency measurement, and the printed line says so. */
-static std::string ork_pick_variant(const std::string & dir, std::string & why) {
+static std::string ork_pick_variant(const std::string & dir, long budget_mb, int want, std::string & why) {
     DIR * d = opendir(dir.c_str());
     if (!d) { why = "pack directory unreadable"; return std::string(); }
-    const char * q = getenv("ORK_QUANT");
-    const int want = (q && (*q == '4' || *q == '8')) ? (*q - '0') : 0;
 
     std::vector<ork_variant> cand;
     for (struct dirent * e = readdir(d); e; e = readdir(d)) {
@@ -2099,16 +2095,15 @@ static std::string ork_pick_variant(const std::string & dir, std::string & why) 
     if (cand.empty()) { why = "no adoptable variant in the pack directory"; return std::string(); }
 
     const size_t total = cand.size();
-    bool tier_applied = false;
+    int tier_state = 0;                       /* 0 = no tier asked, 1 = applied, 2 = asked but unmet */
     if (want) {
         std::vector<ork_variant> m;
         for (const auto & c : cand) if (c.tier_ok) m.push_back(c);
-        if (!m.empty()) { cand.swap(m); tier_applied = true; }
+        if (m.empty()) tier_state = 2;        /* say so: selecting across all tiers is a real fallback */
+        else { cand.swap(m); tier_state = 1; }
     }
 
-    const char * budget_src = "unknown";
-    const long budget_mb = ork_pack_budget_mb(&budget_src);
-    const off_t budget   = (off_t) budget_mb * 1048576;
+    const off_t budget = (off_t) budget_mb * 1048576;
     const ork_variant * best = nullptr;
     bool fits = false;
     if (budget > 0) {                                        /* highest bpw that FITS */
@@ -2127,22 +2122,31 @@ static std::string ork_pick_variant(const std::string & dir, std::string & why) 
     }
 
     char buf[768];
-    const char * rule = budget <= 0 ? "highest-bpw (no /proc/meminfo and no ORK_PACK_BUDGET_MB — the "
-                                      "budget rule could NOT be applied, so this MAY DIFFER from what "
-                                      "the server would select)"
+    const char * rule = budget <= 0 ? "highest-bpw (no budget: /proc/meminfo unreadable — the budget "
+                                      "rule could NOT be applied, so this MAY DIFFER from what the "
+                                      "server would select)"
                       : fits        ? "highest-bpw-that-fits"
                                     : "lowest-bpw (none fit the budget)";
+    /* Worded to match oRKLLM's [orkpack] line, so the two can be compared at a glance when someone is
+     * asking whether a benchmark measured the artifact the server serves. */
+    char tier_note[80] = "";
+    if (tier_state == 1) snprintf(tier_note, sizeof tier_note, " after the int%d tier filter", want);
+    if (tier_state == 2) snprintf(tier_note, sizeof tier_note,
+                                  " (no int%d variant; selected across all tiers)", want);
     snprintf(buf, sizeof buf, "chose '%.*s' of %zu variant(s)%s via %s; pack FILE %s "
                               "(an upper bound on resident weight bytes, not a residency measurement)",
-             (int) (best->name.size() - 8), best->name.c_str(), total,
-             tier_applied ? " after the ORK_QUANT tier filter" : "", rule,
+             (int) (best->name.size() - 8), best->name.c_str(), total, tier_note, rule,
              ork_hsize(best->size).c_str());
     std::string w = buf;
     if (budget > 0) {
-        snprintf(buf, sizeof buf, "; budget %s from %s", ork_hsize(budget).c_str(), budget_src);
+        const long dflt = ork_pack_budget_mb();
+        if (budget_mb == dflt) snprintf(buf, sizeof buf, "; budget %s (MemTotal %ld MiB - 1 GiB)",
+                                        ork_hsize(budget).c_str(), ork_mem_total_mb());
+        else                   snprintf(buf, sizeof buf, "; budget %s (caller-supplied)",
+                                        ork_hsize(budget).c_str());
         w += buf;
     }
-    if (want) { snprintf(buf, sizeof buf, "; ORK_QUANT=%d", want); w += buf; }
+
     if (best->bpw > 0) { snprintf(buf, sizeof buf, "; bpw %.4g from the filename", best->bpw); w += buf; }
     else               { w += "; no bpw in the filename"; }
     why = w;
@@ -2152,18 +2156,23 @@ static std::string ork_pick_variant(const std::string & dir, std::string & why) 
 /* The pack path for the GGUF on this command line, plus a one-line account of HOW it was chosen for
  * the caller to print. `why` is never left empty.
  *
+ * `budget_mb` (0 = unknown) and `want_qbits` (0 = no forced tier) are ARGUMENTS, not environment
+ * reads: the selection is then a pure function of the directory's contents and these two inputs,
+ * which is the same property the server-side resolver has. The one caller reads ORK_QUANT — a
+ * long-standing knob this file consults in a dozen places — and the default budget, once.
+ *
  * A variant from the pack DIRECTORY when one is adoptable, else the legacy sibling file. When neither
  * exists this is the path to BUILD at — inside the directory when the directory exists (so a CLI build
  * joins the variants instead of orphaning itself beside them, under a `.building-` name the server
  * renames to its measured bpw), and at the legacy path otherwise, which leaves a greenfield CLI user's
  * behaviour exactly as it was. */
-static std::string ork_default_orkpack_path(std::string & why) {
+static std::string ork_default_orkpack_path(long budget_mb, int want_qbits, std::string & why) {
     std::string m = ork_find_model_path();
     if (m.empty()) { why = "no .gguf on the command line"; return std::string(); }
     const size_t dot = m.rfind(".gguf");
     const std::string base = m.substr(0, dot);
     if (ork_is_pack_dir(base)) {
-        const std::string v = ork_pick_variant(base, why);
+        const std::string v = ork_pick_variant(base, budget_mb, want_qbits, why);
         if (!v.empty()) return v;
         char tmp[64];
         snprintf(tmp, sizeof tmp, "/.building-%d-%lld.orkpack", (int) getpid(), (long long) time(nullptr));
@@ -2254,7 +2263,11 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (env_p && *env_p) {
         why = "ORK_ORKPACK_PATH (explicit — the caller named this pack)";
     } else {
-        derived = ork_default_orkpack_path(why);
+        /* The resolver takes its inputs as arguments; the environment is read HERE, once, and only
+         * for ORK_QUANT, which this file already consults everywhere else. */
+        const char * q = getenv("ORK_QUANT");
+        const int want_qbits = (q && (*q == '4' || *q == '8')) ? (*q - '0') : 0;
+        derived = ork_default_orkpack_path(ork_pack_budget_mb(), want_qbits, why);
         if (derived.empty()) {
             fprintf(stderr, "[ORK PACK] no pack: %s — set ORK_ORKPACK_PATH=<file.orkpack> to enable "
                             "the packed-weight path.\n", why.c_str());
