@@ -4541,7 +4541,9 @@ static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * 
     snprintf(ln, sizeof ln, "pack_format: %u\n", ork_pack_format_version());       t += ln;
     snprintf(ln, sizeof ln, "quant_sig: %08x\n", ork_build_sig());                 t += ln;
     { uint32_t fl = 0; uint64_t ih = 0; ork_pack_provenance(&fl, &ih);
-      snprintf(ln, sizeof ln, "prov_flags: %08x%s%s\n", fl,
+      /* INPUTS only -- the footer's prov_flags additionally carries the build-record census, so the
+       * two numbers differ on purpose and the label has to say which one this is. */
+      snprintf(ln, sizeof ln, "prov_flags_inputs: %08x%s%s\n", fl,
                (fl & ORK_PROV_GPTQ) ? " GPTQ" : "", (fl & ORK_PROV_IMATRIX) ? " IMATRIX" : ""); t += ln; }
     /* The tier decision in words, next to the environment that did NOT make it. */
     snprintf(ln, sizeof ln, "tier: %s (NF4 i4a8 form would be %.2f GiB resident; build host RAM %.2f GiB; "
