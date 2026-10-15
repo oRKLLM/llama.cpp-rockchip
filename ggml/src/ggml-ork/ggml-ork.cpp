@@ -3290,6 +3290,14 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
      *
      * Only the regeneration path cares. Reading such a pack without those inputs is correct and normal:
      * they were consumed at pack time and their effect is already in the bytes. */
+    /* ADOPT THE OLD PACK'S RECIPE FIRST, before anything asks what this build is going to do.
+     *
+     * The guard below compares the pack's build INPUTS against this run's, and "this run's" includes
+     * whether GPTQ will run -- which, for an automatic rebuild, is decided BY the recipe. Ask before
+     * adopting and a stale GPTQ pack reads as "about to be rebuilt as something weaker" and aborts,
+     * which is precisely the rebuild the recipe exists to make faithful. */
+    if (stale && pack_well_formed) ork_pack_recipe_adopt(p);
+
     if (stale && prov_have) {
         uint32_t now_flags = 0; uint64_t now_imhash = 0;
         ork_pack_provenance(&now_flags, &now_imhash);
@@ -3437,9 +3445,6 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
             return;
         }
     }
-    /* A stale pack is replaced by one built the way IT was built, not the way this binary defaults. */
-    if (stale && pack_well_formed) ork_pack_recipe_adopt(p);
-
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
         /* BEFORE the first weight: which 4-bit BYTES this model gets on this machine (ork_tier_rule). */
