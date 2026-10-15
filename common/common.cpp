@@ -4,6 +4,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "ggml-ork.h"
+#include "ork-calib-text.h"   // built-in GPTQ calibration corpus (see common_ork_pack_gptq_drive)
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -1332,7 +1333,9 @@ static void common_apply_ork_pack_config(const common_params & params) {
 #else
     const bool asked = params.ork_pack_bits != 0 || params.ork_pack_mixed_set ||
                        params.ork_pack_budget_mb >= 0.0f || params.ork_pack_qerr_min >= 0.0f ||
-                       !params.ork_pack_qerr_src.empty() || !params.ork_pack_promote.empty();
+                       !params.ork_pack_qerr_src.empty() || !params.ork_pack_promote.empty() ||
+                       params.ork_pack_bpw >= 0.0f || params.ork_pack_gptq >= 0 ||
+                       params.ork_pack_smooth >= 0 || params.ork_pack_4bit != 0;
     if (!asked) return;
 
     using defaults_fn = void (*)(struct ggml_backend_ork_pack_config *);
@@ -1354,8 +1357,141 @@ static void common_apply_ork_pack_config(const common_params & params) {
     if (params.ork_pack_qerr_min  >= 0.0f)  cfg.promote_qerr_min  = params.ork_pack_qerr_min;
     if (!params.ork_pack_qerr_src.empty())  cfg.qerr_source_pack  = params.ork_pack_qerr_src.c_str();
     if (!params.ork_pack_promote.empty())   cfg.promote_list      = params.ork_pack_promote.c_str();
+    if (params.ork_pack_bpw >= 0.0f)        cfg.target_bpw        = params.ork_pack_bpw;
+    if (params.ork_pack_4bit != 0)          cfg.four_bit_tier     = params.ork_pack_4bit;
+    if (params.ork_pack_gptq >= 0)          cfg.gptq              = params.ork_pack_gptq;
+    if (params.ork_pack_smooth >= 0)        cfg.smooth            = params.ork_pack_smooth;
     // cfg borrows those two strings; params outlives the load, so they stay valid.
     f(&cfg);
+#endif
+}
+
+/* ---- THE .orkpack GPTQ CALIBRATION DRIVER -------------------------------------------------------
+ *
+ * GPTQ is the one rung of the pack's quality ladder the backend cannot run by itself: it needs a
+ * Hessian H = A^T A accumulated over real activations, which means real text pushed through the model
+ * by whoever is driving the build, and then an explicit finalize. Every other rung is a pure function
+ * of what the packer already holds.
+ *
+ * SO IT LIVES HERE, not in a tool. The pack is built lazily, during an ordinary model load, by
+ * whichever frontend happened to open the model first -- in production that is llama-completion, spawned
+ * by oRKLLM's conversion scheduler with a one-token prompt. Putting the driver in common_init_from_params
+ * means every frontend gets it, which is what makes "the ladder is on by default" an actual property of
+ * the artifact rather than a property of remembering to use the right binary. A backend without GPTQ
+ * armed answers wanted()==0 on the first dlsym'd call and this costs nothing.
+ *
+ * WINDOWED, because H is K*K doubles per weight and is NOT disk-backed -- an evicted Hessian can only be
+ * rebuilt by replaying the corpus. Calibrating every weight at once is ~236 GiB on a 64-layer 27B. So a
+ * layer range is claimed, the corpus is replayed, that range is finalized, and the next range begins.
+ * Finalize writes each quantised weight back into the weight cache and the pins keep it there, so later
+ * windows calibrate against ALREADY QUANTISED upstream layers -- sequential GPTQ, which is the better
+ * algorithm and not merely the one that fits.
+ *
+ * ROWS, NOT BATCHES. rank(H) <= rows, and below K rows the damping owns the null space and GPTQ decays
+ * to round-to-nearest in exactly those directions. The batch SIZE is bounded by the context the caller
+ * built (and by the wide-colsplit submit hazard); the row COUNT is derived from the model's own largest
+ * K. When the corpus cannot supply that many rows the shortfall is printed, because a silently
+ * rank-deficient calibration produces a pack that looks right and is not. */
+static void common_ork_pack_gptq_drive(llama_context * lctx, llama_model * model, const common_params & params) {
+#ifdef _WIN32
+    (void) lctx; (void) model; (void) params;
+#else
+    using i_fn  = int    (*)(void);
+    using l_fn  = long   (*)(void);
+    using v_fn  = void   (*)(void);
+    using w_fn  = void   (*)(int, int);
+    using d_fn  = double (*)(int);
+    auto wanted   = (i_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_wanted");
+    if (!wanted || !wanted()) return;
+    auto pending  = (i_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_pending");
+    auto minrows  = (i_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_min_rows");
+    auto rows     = (l_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_rows");
+    auto maxk     = (i_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_max_k");
+    auto setwin   = (w_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_set_window");
+    auto hbytes   = (d_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_hessian_bytes");
+    auto finalize = (v_fn) dlsym(RTLD_DEFAULT, "ggml_backend_ork_gptq_finalize");
+    if (!pending || !minrows || !rows || !maxk || !setwin || !hbytes || !finalize) {
+        LOG_WRN("%s: the ork backend wants GPTQ but does not export the calibration API — skipping\n", __func__);
+        return;
+    }
+
+    // The corpus: an explicit one if the caller named it, else the built-in default.
+    std::string text;
+    if (!params.ork_pack_calib.empty()) {
+        std::ifstream f(params.ork_pack_calib, std::ios::binary);
+        if (!f) { LOG_ERR("%s: --pack-calib %s cannot be read\n", __func__, params.ork_pack_calib.c_str()); return; }
+        std::stringstream ss; ss << f.rdbuf(); text = ss.str();
+        LOG_INF("%s: GPTQ calibration corpus: %s (%zu bytes)\n", __func__, params.ork_pack_calib.c_str(), text.size());
+    } else {
+        text = ORK_CALIB_TEXT;
+        LOG_INF("%s: GPTQ calibration corpus: built-in (%zu bytes). --pack-calib <file> overrides it with "
+                "text representative of what you will serve.\n", __func__, text.size());
+    }
+
+    const std::vector<llama_token> toks = common_tokenize(lctx, text, true, true);
+    const int nt = (int) toks.size();
+    if (nt < 16) { LOG_ERR("%s: GPTQ calibration text tokenized to %d tokens — too short\n", __func__, nt); return; }
+
+    /* Batch size: bounded by the context the caller actually built, and kept modest because a wide
+     * prefill is the colsplit submit hazard. Rank accumulates ACROSS batches, so this bounds latency,
+     * not quality. */
+    int nb = (int) params.n_batch;
+    if (nb > (int) params.n_ctx - 8) nb = (int) params.n_ctx - 8;
+    if (nb > 512) nb = 512;
+    if (nb > nt)  nb = nt;
+    if (nb < 8)   { LOG_ERR("%s: context too small for GPTQ calibration (n_ctx=%d)\n", __func__, (int) params.n_ctx); return; }
+
+    auto decode_at = [&](int off, int n) {
+        llama_memory_clear(llama_get_memory(lctx), true);
+        std::vector<llama_token> t(toks.begin() + off, toks.begin() + off + n);
+        return llama_decode(lctx, llama_batch_get_one(t.data(), n)) == 0;
+    };
+
+    // Discovery pass: the first forward registers every native-W4A4 weight (no Hessian is allocated yet).
+    if (!decode_at(0, nb)) { LOG_ERR("%s: GPTQ discovery forward failed\n", __func__); return; }
+    if (pending() == 0) return;          // nothing registered: not a 4-bit write build after all
+
+    /* Window size from the Hessian budget. Memory, not preference: one window's Hessians must fit, and
+     * the budget is a fraction of this machine's RAM rather than a knob, so a smaller box simply takes
+     * more passes instead of being OOM-killed. */
+    const int nlayer = llama_model_n_layer(model);
+    double budget = 8.0 * 1024 * 1024 * 1024;
+#ifdef _SC_PHYS_PAGES
+    { const long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
+      if (pg > 0 && ps > 0) budget = 0.60 * (double) pg * (double) ps; }
+#endif
+    int win = nlayer;
+    { const int kmax = maxk();
+      const double per_layer = hbytes(kmax) * 1.6;        // the big H plus the K-small ones in that layer
+      if (per_layer > 0) {
+          win = (int) (budget / per_layer);
+          if (win < 1)      win = 1;
+          if (win > nlayer) win = nlayer;
+      }
+      LOG_INF("%s: GPTQ: %d layers, largest K=%d -> %.2f GiB/layer of Hessian, %.0f GiB budget -> "
+              "window %d layer(s), %d pass(es)\n", __func__, nlayer, kmax, per_layer/1073741824.0,
+              budget/1073741824.0, win, (nlayer + win - 1) / win);
+    }
+
+    const int64_t t0 = ggml_time_us();
+    for (int w = 0; w * win < nlayer; w++) {
+        setwin(w * win, (w + 1) * win < nlayer ? (w + 1) * win : nlayer);
+        if (!decode_at(0, nb)) { LOG_ERR("%s: GPTQ window %d claim forward failed\n", __func__, w); break; }
+        const int need = minrows();
+        if (need <= 0) continue;                           // this window claimed nothing
+        if (nt < need)
+            LOG_WRN("%s: GPTQ window %d: the calibration corpus is %d tokens but %d rows are needed for "
+                    "full rank — GPTQ degrades toward round-to-nearest on the widest weights. Supply a "
+                    "longer --pack-calib.\n", __func__, w, nt, need);
+        for (int off = nb; off + nb <= nt && rows() < (long) need; off += nb)
+            if (!decode_at(off, nb)) { LOG_ERR("%s: GPTQ calibration batch at %d failed\n", __func__, off); break; }
+        LOG_INF("%s: GPTQ window %d: %ld/%d calibration rows -> finalizing\n", __func__, w, rows(), need);
+        finalize();
+    }
+    setwin(-1, -1);
+    LOG_INF("%s: GPTQ calibration done in %.1f min (%d weights still pending)\n",
+            __func__, (ggml_time_us() - t0) / 6e7, pending());
+    llama_memory_clear(llama_get_memory(lctx), true);
 #endif
 }
 
@@ -1435,6 +1571,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
+
+    /* The .orkpack GPTQ pass, if this load is building a 4-bit pack. Before warmup, because warmup's
+     * two-token forward would otherwise be the first thing to pack weights. */
+    common_ork_pack_gptq_drive(lctx, model, params);
 
     if (params.warmup) {
         LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);

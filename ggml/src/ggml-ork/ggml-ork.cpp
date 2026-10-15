@@ -483,7 +483,14 @@ static bool ork_calib_valid_here(const orkpack_calib_hdr * st) {
 // WHICH tensors are packed at all, so a mismatch there is a genuinely unusable file.
 #define ORK_SIG_QB_MASK 0x0ffu   // forced-precision char: '4', '8', or 0 = source-driven default
 #define ORK_SIG_HY_BIT  0x100u   // ORK_HYBRID split
-#define ORK_SIG_HD_BIT  0x200u   // hadamard — now IMPLIED by native W4A4 (see ork_w4a4_native_on); vestigial in the sig
+/* HADAMARD, DERIVED -- AND THEREFORE WRONG. This bit is computed below as `qb == '4' && !NOROT`, not
+ * recorded, so an UNROTATED i4a8 pack (an ordinary thing to build) stamps it SET. A reader that
+ * believed "a set bit can only have been stamped by a build that rotated" -- which oRKLLM's
+ * sigCompatible did -- was reasoning from a value that was never observed. It is left exactly as it
+ * is because changing it would invalidate every pack on disk for no gain: the authoritative answer is
+ * now ORK_PROV_ROTATED in the footer's prov_flags, censused from the entries actually written. Treat
+ * this bit as decorative. */
+#define ORK_SIG_HD_BIT  0x200u   // hadamard — DERIVED, not recorded. Use ORK_PROV_ROTATED instead.
 static bool ork_i4_norot(void);   /* fwd: folded into the pack signature below */
 /* The forced base tier for THIS build. ONE function, because the tier is decided in TWO places — what
  * ork_orkpack_tier WRITES, and what ork_build_sig says the pack IS — and those disagreeing is a bug this
@@ -540,6 +547,38 @@ static uint32_t ork_build_sig(void) {
  * from zero. Readers MUST NOT treat a PARTIAL pack as the finished article: it is missing weights
  * by construction, so anything benchmarking or shipping it is measuring the wrong thing. */
 #define ORK_PROV_PARTIAL 0x8u
+
+/* ---- THE BUILD RECORD: what the PPL ladder actually applied ---------------------------------
+ *
+ * WHY THESE BITS AND NOT A DERIVATION. The pack already had a rotation flag -- ORK_SIG_HD_BIT in
+ * quant_sig -- and it was COMPUTED (`qb == '4' && !NOROT`) rather than recorded. So an unrotated
+ * i4a8 pack, which is a perfectly ordinary thing to build, advertised itself as ROTATED; oRKLLM's
+ * sigCompatible reasoned "a set bit can only have been stamped by a build that rotated" and was
+ * wrong. Rotation is orthogonal -- (R*A)(R*B) == A*B -- so acting on that answer does not fail, it
+ * returns fluent nonsense (measured PPL 7,059,519 on a build/run rotation mismatch). A load-bearing
+ * flag that is computed rather than recorded is worse than one that is absent, because absent is
+ * honest.
+ *
+ * THESE ARE A CENSUS, NOT A DECLARATION. They are written at footer time from the entries the build
+ * ACTUALLY wrote, not from the configuration it was asked for. A knob that was set and silently did
+ * nothing (ORK_FFN_DEC, ORK_MIXED_W4A4, --pack-budget) is this project's most repeated bug; a census
+ * cannot have it, because the thing it reports is the bytes.
+ *
+ * WHERE THEY LIVE, and why the footer did not have to grow. prov_flags is a u32 with four bits used,
+ * so this is additive INSIDE the v8 layout: no offset moves, no ORKPACK_VERSION bump, every existing
+ * pack still parses, and no 27B has to be rebuilt to gain a reader. The non-boolean parameters
+ * (alpha, damping, requested/achieved bpw) are NOT load-bearing -- SmoothQuant's runtime half reads
+ * the stored per-entry vector, not alpha, and GPTQ has no runtime half at all -- so they are
+ * provenance and go in the variable-length provenance record, which is where this file already says
+ * variable-length provenance belongs.
+ *
+ * BUILDREC is the "these bits mean something" bit. Without it, clear is ambiguous between "not
+ * rotated" and "written by a build that did not record rotation", which is the exact ambiguity that
+ * made the derived flag necessary in the first place. */
+#define ORK_PROV_BUILDREC 0x10u   /* the four bits below are RECORDED; clear = pack predates them */
+#define ORK_PROV_ROTATED  0x20u   /* LOAD-BEARING: the weights are Hadamard-rotated */
+#define ORK_PROV_SMOOTH   0x40u   /* LOAD-BEARING: SmoothQuant vectors are folded in (per-entry smooth_n) */
+#define ORK_PROV_PROMOTED 0x80u   /* a mixed-tier int8 promotion set was applied */
 
 /* ---- FIXED RECOVERY HEADER (offset 0) --------------------------------------------------------
  *
@@ -661,15 +700,17 @@ static uint64_t ork_file_hash(const char * p) {
     return h ? h : 1ULL;   // 0 is reserved for "no imatrix"
 }
 
+static bool ork_gptq_on(void);   /* fwd: the ladder's resolved answer, not a raw getenv */
 static void ork_pack_provenance(uint32_t * flags, uint64_t * imhash) {
     static int done = 0; static uint32_t fl = 0; static uint64_t ih = 0;
     if (!done) {   // the imatrix hash reads the whole file; do it once per process
         done = 1;
-        if (getenv("ORK_GPTQ")) fl |= ORK_PROV_GPTQ;
         const char * im = getenv("ORK_IMATRIX");
         if (im && *im) { ih = ork_file_hash(im); if (ih) fl |= ORK_PROV_IMATRIX; }
     }
-    *flags = fl; *imhash = ih;
+    /* GPTQ is NOT cached with the imatrix hash: it is now a resolved configuration rather than an
+     * env var, and the resolution happens after the first possible call to this function. */
+    *flags = fl | (ork_gptq_on() ? ORK_PROV_GPTQ : 0u); *imhash = ih;
 }
 
 // The weight tier a pack was BUILT at, decoded from its stored signature. This is what makes an .orkpack
@@ -848,8 +889,91 @@ static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? at
 /* The build configuration (see ggml-ork.h). Defaults live HERE so the header documents intent and the
  * implementation cannot drift from it: mixed on, a modest promotion budget, and a floor below which
  * promoting a weight is not worth its bytes. */
-static ggml_backend_ork_pack_config g_pack_cfg = { 0, true, nullptr, nullptr, 8.0f, 0.05f };
+static ggml_backend_ork_pack_config g_pack_cfg =
+    { 0, true, nullptr, nullptr, 8.0f, 0.05f, /*target_bpw*/ 0.0f,
+      /*four_bit_tier*/ 0,
+      /*gptq*/ -1, /*gptq_damp*/ 0.3f, /*smooth*/ -1, /*smooth_alpha*/ 0.5f };
 static bool g_pack_cfg_set = false;
+
+/* ---- THE LADDER, RESOLVED ONCE -------------------------------------------------------------
+ *
+ * The three build-time techniques are tri-state in the config (-1 = auto) and auto means "on for a
+ * 4-bit WRITE build". That predicate is only answerable once the tier is known, and it must not be
+ * answerable DIFFERENTLY later: GPTQ in particular is two-phase, and a phase-1 that registers a
+ * weight followed by a phase-2 that thinks GPTQ is off leaves the weight unpersisted -- a pack with
+ * a hole in it and no error. So the answer is latched exactly once, by ork_ladder_resolve(), at the
+ * point the backend has decided what it is building.
+ *
+ * Before that point the accessors answer from EXPLICIT configuration only (config field or env).
+ * Auto never fires early, so nothing can observe a different answer than the latch will take. */
+struct ork_ladder_state { int resolved; int gptq; int smooth; float damp; float alpha; };
+static ork_ladder_state g_ladder = { 0, 0, 0, 0.3f, 0.5f };
+
+/* The one env-or-config read for each knob. The env spellings stay as DEV OVERRIDES -- they must
+ * never be required for correctness, and the default path sets none of them. */
+static bool ork_gptq_on(void) {
+    if (g_ladder.resolved) return g_ladder.gptq != 0;
+    if (g_pack_cfg.gptq >= 0) return g_pack_cfg.gptq != 0;
+    return getenv("ORK_GPTQ") != nullptr;
+}
+static float ork_gptq_damp(void) {
+    if (const char * e = getenv("ORK_GPTQ_DAMP")) return (float) atof(e);
+    return g_ladder.resolved ? g_ladder.damp : g_pack_cfg.gptq_damp;
+}
+static inline bool ork_smooth_on(void) {
+    if (g_ladder.resolved) return g_ladder.smooth != 0;
+    if (g_pack_cfg.smooth >= 0) return g_pack_cfg.smooth != 0;
+    return getenv("ORK_I4_SMOOTH") != nullptr;
+}
+static inline float ork_smooth_alpha(void) {
+    float a = g_ladder.resolved ? g_ladder.alpha : g_pack_cfg.smooth_alpha;
+    if (const char * e = getenv("ORK_I4_SMOOTH_ALPHA")) a = (float) atof(e);
+    return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+}
+static bool ork_i4_rht_on(void);   /* fwd: the ladder reports the one combination that is a mistake */
+
+/* Latch the ladder for this run. Called once from backend init, at the first point where "is this a
+ * 4-bit WRITE build" is answerable (after the pack has been opened and ctx->qbits/hadamard resolved).
+ *
+ * LATCHED, not re-evaluated, because GPTQ is two-phase: a phase 1 that registers a weight followed by
+ * a phase 2 that believes GPTQ is off leaves that weight packed and never persisted -- a pack with a
+ * hole in it and no error. One answer per run, taken once.
+ *
+ * WHICH WEIGHTS GET THE LADDER: the ones stored as ROTATED INT4, and only those.
+ *
+ * Not "4-bit", which is too broad. The 4-bit storage tiers are not one datapath:
+ *   rotated int4 (DT_I4_NATIVE / DT_I4_ROT_A8)  -> W4A4-capable   -> LADDER
+ *   DT_I4 / NF4 unrotated (i4a8)                -> W4A8 at run    -> no ladder; the NF4 codebook IS
+ *                                                                    its quality story, and rotation
+ *                                                                    is not an improvement on it
+ *                                                                    (1.7B, equal activation width:
+ *                                                                    NF4 34.80 vs rotated-uniform
+ *                                                                    49.74)
+ *   DT_I8 / DT_I8_ROT                           -> W8A8           -> no ladder
+ * so the gate below is `qbits == 4 && hadamard`, and ctx->hadamard in WRITE mode means precisely
+ * "the bytes this build is about to write are the rotated int4 form".
+ *
+ * THE UNDECIDABLE PART, decided deliberately. DT_I4_NATIVE and DT_I4_ROT_A8 are the SAME BYTES; which
+ * one a weight becomes is chosen at LOAD by the serving machine's RAM (ork_tier_rule). So "will this
+ * weight run W4A4" is not answerable at build time -- the same artifact is W4A4 on a constrained host
+ * and rotated-int4-in-int8-containers on a roomier one. We build the ladder for the stored FORM, not
+ * the predicted datapath: rotated int4 gets it. The cost of being wrong that way is build time for a
+ * host that did not strictly need GPTQ, which harms nothing at run; the cost of the opposite error is
+ * a W4A4 load of un-laddered weights, which is bad output.
+ *
+ * ALL THREE RUNGS ARE ON BY DEFAULT FOR THAT FORM. Rotation and SmoothQuant are pure functions of
+ * what is already in hand at pack time. GPTQ additionally needs calibration ACTIVATIONS and an explicit
+ * finalize, which only the builder can produce -- common_ork_pack_gptq_drive() does it for every
+ * llama.cpp frontend, so the ordinary build path has a driver and the default is honoured. A caller
+ * that arms GPTQ and never finalizes is NOT silently downgraded: ork_persist_finalize detects the
+ * registered-but-unpersisted weights and writes them at round-to-nearest with a loud line, because a
+ * pack missing most of its weights is the worse outcome.
+ *
+ * The cost is real and deliberate: GPTQ is O(K^3) per weight and dominates the build (measured 23.7 of
+ * 28.5 min on a 1.7B). That is a PACK-BUILD cost, not a load cost; where it lands is the scheduler's
+ * business, not this function's. */
+/* ork_ladder_resolve() is defined further down, next to ork_pack_contract_check: it needs the
+ * backend context type, and the two are the write-side and read-side of the same record. */
 
 /* THE one place the decode route is resolved. Precedence mirrors min_m's: an explicit override wins, then
  * the pack's measured decision, then the default.
@@ -1047,6 +1171,11 @@ extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pa
     if (!cfg) return;
     cfg->weight_bits = 0; cfg->mixed = true; cfg->promote_list = nullptr;   /* 0 = unset: ORK_QUANT / source policy decides */
     cfg->qerr_source_pack = nullptr; cfg->promote_budget_mb = 8.0f; cfg->promote_qerr_min = 0.05f;
+    /* THE LADDER IS THE DEFAULT. -1 = auto, which means ON for the 4-bit tier and off otherwise --
+     * the techniques are 4-bit concerns (at 8 bits GPTQ's residual is below the noise it adds, and
+     * SmoothQuant moves error onto a weight half that has ample resolution). */
+    cfg->target_bpw = 0.0f; cfg->four_bit_tier = 0;
+    cfg->gptq = -1; cfg->gptq_damp = 0.3f; cfg->smooth = -1; cfg->smooth_alpha = 0.5f;
 }
 
 extern "C" void ggml_backend_ork_set_pack_config(const struct ggml_backend_ork_pack_config * cfg) {
@@ -1055,9 +1184,15 @@ extern "C" void ggml_backend_ork_set_pack_config(const struct ggml_backend_ork_p
     char wb[32];
     if (cfg->weight_bits) snprintf(wb, sizeof wb, "%d", cfg->weight_bits);
     else                  snprintf(wb, sizeof wb, "unset (ORK_QUANT/source)");
-    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%s mixed=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
-            wb, cfg->mixed ? "yes" : "no (pure)", cfg->promote_budget_mb, cfg->promote_qerr_min,
+    char bp[32];
+    if (cfg->target_bpw > 0.0f) snprintf(bp, sizeof bp, "%.2f", cfg->target_bpw);
+    else                        snprintf(bp, sizeof bp, "unset");
+    fprintf(stderr, "[ORK PACK-CFG] weight_bits=%s mixed=%s target_bpw=%s budget=%.1f MiB qerr_min=%.3f%s%s\n",
+            wb, cfg->mixed ? "yes" : "no (pure)", bp, cfg->promote_budget_mb, cfg->promote_qerr_min,
             cfg->promote_list ? " list=explicit" : "", cfg->qerr_source_pack ? " qerr_source=set" : "");
+    fprintf(stderr, "[ORK PACK-CFG] ladder: gptq=%s(damp %.3g) smooth=%s(alpha %.2f)\n",
+            cfg->gptq < 0 ? "auto" : (cfg->gptq ? "on" : "off"), cfg->gptq_damp,
+            cfg->smooth < 0 ? "auto" : (cfg->smooth ? "on" : "off"), cfg->smooth_alpha);
 }
 
 static uint32_t ork_forced_qb(void) {
@@ -1239,6 +1374,104 @@ static const std::unordered_set<std::string> & ork_qerr_promote_set(void) {
     return promo;
 }
 
+/* ---- TARGET BITS PER WEIGHT -> A PROMOTION SET -------------------------------------------------
+ *
+ * The caller asks for a rate; the builder promotes weights to int8 until it reaches it. This is the
+ * stopping rule the qerr policy could never be: qerr only exists after a pack has been built, so a
+ * bpw request used to be translated OUTSIDE this file into a `--pack-budget` in MiB by replaying the
+ * packer's own greedy loop over a previous pack (oRKLLM quant_plan.js budgetMbForBpw). Two passes,
+ * two implementations of one rule, and a first build that could not honour a target at all.
+ *
+ * ORDER: THE Q4_K_M STRUCTURAL PRIOR, NOT QERR. attn_v then ffn_down -- the tensors llama.cpp's own
+ * Q4_K_M spends its extra bits on. MEASURED to beat qerr ranking by 3.8% at a matched bit budget:
+ * qerr is a poor ordering, not merely a flat one. (Plausibly because qerr measures the error in ONE
+ * weight's output, while what matters is how that error propagates, which the structural prior
+ * encodes as prior knowledge and the local metric cannot see.) Within a family, layer order; after
+ * both families are exhausted, the remaining eligible weights smallest-first, so a target that
+ * overshoots the prior still lands near the rate instead of jumping past it.
+ *
+ * FROM THE SOURCE GGUF, before a single weight is packed, because the decision has to be made for
+ * the FIRST weight the forward pass touches. Shapes are in the GGUF header; nothing is mapped. */
+static std::string ork_find_model_path();   /* fwd */
+static bool ork_tensor_npu_eligible(int64_t K, int64_t N, enum ggml_type t);   /* fwd */
+static float ork_target_bpw(void) { return g_pack_cfg.target_bpw > 0.0f ? g_pack_cfg.target_bpw : 0.0f; }
+
+static const std::unordered_set<std::string> & ork_bpw_promote_set(void) {
+    static std::unordered_set<std::string> promo;
+    static bool built = false;
+    if (built) return promo;
+    built = true;
+
+    const float want = ork_target_bpw();
+    if (want <= 4.0f) return promo;              /* at or below the base tier: nothing to promote */
+
+    const std::string src = ork_find_model_path();
+    if (src.empty()) {
+        fprintf(stderr, "[ORK PACK-BPW] target %.2f bpw requested but the source model path is unknown - "
+                        "no promotion (the pack will be uniform at the base tier)\n", (double) want);
+        return promo;
+    }
+    struct ork_cand { std::string name; double params; int rank; int layer; };
+    std::vector<ork_cand> cand;
+    double total = 0;
+    {
+        struct ggml_context * mc = nullptr;
+        struct gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/&mc };
+        struct gguf_context * gg = gguf_init_from_file(src.c_str(), ip);
+        if (gg && mc) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(mc); t; t = ggml_get_next_tensor(mc, t)) {
+                if (t->ne[3] != 1) continue;
+                if (!ork_tensor_npu_eligible(t->ne[0], t->ne[1], t->type)) continue;
+                const double mult = (double) (t->ne[2] > 0 ? t->ne[2] : 1);   /* MoE expert stacks */
+                const double pp = (double) t->ne[0] * (double) t->ne[1] * mult;
+                total += pp;
+                /* The prior. Substring, so attn_v / attn_v_b / ffn_down_exps all land in the family
+                 * they belong to -- the same matching ork_i4_force_i8's list clause uses. */
+                int rank = 2;
+                if      (strstr(t->name, "attn_v"))   rank = 0;
+                else if (strstr(t->name, "ffn_down")) rank = 1;
+                int layer = 1 << 20;
+                { const char * d = strpbrk(t->name, "0123456789"); if (d) layer = atoi(d); }
+                cand.push_back({ std::string(t->name), pp, rank, layer });
+            }
+        }
+        if (gg) gguf_free(gg);
+        if (mc) ggml_free(mc);
+    }
+    if (total <= 0 || cand.empty()) {
+        fprintf(stderr, "[ORK PACK-BPW] target %.2f bpw: no NPU-eligible weights found in %s - no promotion\n",
+                (double) want, src.c_str());
+        return promo;
+    }
+
+    /* bpw = (4*(P - Pp) + 8*Pp)/P  =>  Pp = P*(bpw - 4)/4 */
+    double need = total * ((double) want - 4.0) / 4.0;
+    if (need > total) need = total;
+
+    std::stable_sort(cand.begin(), cand.end(), [](const ork_cand & a, const ork_cand & b) {
+        if (a.rank != b.rank)   return a.rank < b.rank;
+        if (a.rank == 2)        return a.params < b.params;   /* the tail: smallest first */
+        return a.layer < b.layer;
+    });
+
+    double got = 0;
+    int n_v = 0, n_d = 0, n_other = 0;
+    for (const auto & c : cand) {
+        if (got >= need) break;
+        promo.insert(c.name);
+        got += c.params;
+        if (c.rank == 0) n_v++; else if (c.rank == 1) n_d++; else n_other++;
+    }
+    const double proj = (4.0 * (total - got) + 8.0 * got) / total;
+    fprintf(stderr,
+        "[ORK PACK-BPW] target %.2f bpw over %.3f G eligible params -> promote %.3f G (%zu weights: "
+        "%d attn_v, %d ffn_down, %d other) -> projected %.3f bpw\n",
+        (double) want, total/1e9, got/1e9, promo.size(), n_v, n_d, n_other, proj);
+    if (promo.empty())
+        fprintf(stderr, "[ORK PACK-BPW] nothing promoted: the target is within one weight of the base tier\n");
+    return promo;
+}
+
 static bool ork_i4_force_i8(const char * name) {
     static const char * spec = g_pack_cfg.promote_list ? g_pack_cfg.promote_list : getenv("ORK_I4_INT8_LAYERS");
     if (g_pack_cfg_set && !g_pack_cfg.mixed) return false;         // pure int4: explicit opt-out
@@ -1254,8 +1487,20 @@ static bool ork_i4_force_i8(const char * name) {
         }
         return false;
     }
-    const std::unordered_set<std::string> & promo = ork_qerr_promote_set();   // clause 2: qerr-ranked
-    return !promo.empty() && promo.count(name) != 0;                          // clause 3: else nothing
+    /* clause 2: a TARGET BIT RATE. Ahead of qerr because it is the rule a caller can state before any
+     * pack exists, and because its ordering measured better at a matched budget. */
+    if (ork_target_bpw() > 4.0f) {
+        const std::unordered_set<std::string> & bp = ork_bpw_promote_set();
+        if (bp.empty()) return false;
+        if (bp.count(name) != 0) return true;
+        /* A routed MoE expert is persisted under the synthetic key "<tensor>#<e>" (ork_expert_key),
+         * which is not a GGUF tensor name. Match the stack it came from. */
+        if (const char * h = strchr(name, '#'))
+            return bp.count(std::string(name, (size_t) (h - name))) != 0;
+        return false;
+    }
+    const std::unordered_set<std::string> & promo = ork_qerr_promote_set();   // clause 3: qerr-ranked
+    return !promo.empty() && promo.count(name) != 0;                          // clause 4: else nothing
 }
 
 // Is a pack with this stored signature usable by this run? Precision is ADOPTED, not required to match —
@@ -1466,6 +1711,9 @@ struct ggml_backend_ork_context {
                                // fused/stream/chain/MoE runners are fd-local (not routed) and are gated OFF here.
     int qbits = 8;              // 8 = W8A8, 4 = W4A4. Adopted from the loaded .orkpack (persist_qbits); ORK_QUANT overrides.
     int persist_qbits = 0;     // tier the loaded .orkpack was BUILT at (4/8), 0 = no pack read. Set by ork_persist_init.
+    uint32_t pack_prov_flags = 0;  // the loaded pack's footer prov_flags (0 = no pack / pre-record pack).
+                                   // Carries the BUILD RECORD -- rotation and SmoothQuant are load-bearing,
+                                   // so this is read, not re-derived. See ork_pack_contract_check.
     int hadamard = 0;          // 1 iff NATIVE W4A4 is selected; rotation is inseparable from it (see ork_w4a4_native_on)
     int no_reuse = 0;          // ORK_NOREUSE=1: disable activation-quant reuse (A/B benchmark)
     int no_cache = 0;          // ORK_NOCACHE=1: re-pack the weight every matmul (A/B benchmark)
@@ -2402,11 +2650,19 @@ static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * sr
     /* Unmeasurable (no source path / unreadable gguf) -> the COMPACT tier, which cannot OOM. An
      * unmeasured guess that OOMs on the first prompt is the failure this rule exists to remove. */
     g_tier.rotated = (sum == 0 || ram == 0) ? 1 : (sum >= limit);
+    /* An explicit request wins over the RAM rule. The rule is right for production -- it asks the one
+     * question the builder can answer about the machine that will serve the file -- and useless when
+     * the point is to compare the two tiers, or when a pack is built on a box bigger than its target.
+     * Stated as a configuration ARGUMENT, not an env var, so the choice lands in the provenance record
+     * with everything else rather than in somebody's shell history. */
+    const int forced = g_pack_cfg.four_bit_tier;
+    if (forced == 1 || forced == 2) g_tier.rotated = (forced == 1);
     fprintf(stderr,
-        "[ORK TIER] build: %s. The NF4 i4a8 form of this model would be %.2f GiB resident across %d "
+        "[ORK TIER] build: %s%s. The NF4 i4a8 form of this model would be %.2f GiB resident across %d "
         "weights; this host has %.2f GiB RAM, threshold %d%% (%.2f GiB)%s.\n",
         g_tier.rotated ? "ROTATED int4 (W4A4-capable, compact)"
                        : "DT_I4 / NF4 i4a8 (best 4-bit quality, int8 residency)",
+        forced ? " [REQUESTED, not the RAM rule]" : "",
         sum/(1024.0*1024*1024), n_elig, ram/(1024.0*1024*1024), g_tier.pct,
         limit/(1024.0*1024*1024), "");
     return g_tier.rotated;
@@ -2452,6 +2708,111 @@ static void ork_tier_decide_load(ggml_backend_ork_context * ctx, int ram_pct) {
             "",
             g_tier.native ? "as NATIVE int4 nibbles (W4A4, compact)"
                           : "INFLATED to int8 containers (ROT_A8: faster, best measured error)");
+}
+
+static bool ork_persist_writes(const ggml_backend_ork_context * ctx);
+static void ork_ladder_resolve(ggml_backend_ork_context * ctx) {
+    if (g_ladder.resolved) return;
+    const bool writing = ork_persist_writes(ctx);
+    const bool four    = (ctx->qbits == 4 && ctx->hadamard);
+    int gptq   = g_pack_cfg.gptq;
+    int smooth = g_pack_cfg.smooth;
+    if (gptq   < 0) gptq   = (writing && four) ? 1 : 0;   /* auto: on for a 4-bit write build */
+    if (smooth < 0) smooth = (writing && four) ? 1 : 0;
+    if (getenv("ORK_GPTQ"))      gptq   = 1;              /* dev overrides; never required for correctness */
+    if (getenv("ORK_I4_SMOOTH")) smooth = 1;
+    if (!four || !writing) { gptq = 0; smooth = 0; }      /* rotated-int4 BUILD concerns only */
+    g_ladder.gptq   = gptq;
+    g_ladder.smooth = smooth;
+    g_ladder.damp   = g_pack_cfg.gptq_damp;
+    g_ladder.alpha  = g_pack_cfg.smooth_alpha;
+    g_ladder.resolved = 1;
+    if (!writing) return;                                 /* a READ run has no ladder to report */
+    if (!four) {
+        /* Say why, once, for any 4-bit build that is NOT a ladder target -- otherwise "the ladder is
+         * on by default" and a pack with none of it look like a bug rather than the rule working. */
+        if (ctx->qbits == 4)
+            fprintf(stderr, "[ORK LADDER] not applied: this build writes the UNROTATED NF4 i4a8 form "
+                            "(W4A8 at run), whose quality comes from the NF4 codebook. The ladder is "
+                            "for rotated int4 (W4A4) only.\n");
+        if (ork_target_bpw() > 4.0f && ctx->qbits != 4)
+            fprintf(stderr, "[ORK LADDER] NOTE: a target bits-per-weight was given but the base tier is "
+                            "int8, so there is nothing to promote FROM and the pack will come out at 8 "
+                            "bpw.\n");
+        return;
+    }
+    fprintf(stderr, "[ORK LADDER] rotated-int4 (W4A4-capable) build: rotation=on smooth=%s(alpha %.2f) gptq=%s(damp %.3g) "
+                    "promotion=%s\n",
+            smooth ? "on" : "off", (double) g_ladder.alpha,
+            gptq ? "on" : "off", (double) g_ladder.damp,
+            !g_pack_cfg.mixed ? "off (pure)"
+              : (ork_target_bpw() > 4.0f ? "on (target bpw)"
+                 : (g_pack_cfg.promote_list ? "on (explicit list)"
+                    : (g_pack_cfg.qerr_source_pack ? "on (qerr-ranked)" : "off (no target bpw given)"))));
+    if (gptq && ork_i4_rht_on())
+        fprintf(stderr, "[ORK LADDER] WARNING: ORK_I4_RHT and GPTQ are both on. They measured SUBSTITUTES, "
+                        "not complements -- RHT buys nothing once GPTQ is present.\n");
+}
+
+/* Does this run need a calibration driver, and has it not had one yet? The frontend asks before it
+ * spends minutes pushing calibration text through the model, so a non-4-bit or read-mode run costs
+ * nothing. Separate from gptq_pending() below, which answers the same question AFTER registration. */
+extern "C" int ggml_backend_ork_gptq_wanted(void) { return g_ladder.resolved && g_ladder.gptq ? 1 : 0; }
+
+/* ---- THE PACK'S CONTRACT WITH THE RUNTIME --------------------------------------------------
+ *
+ * Two of the ladder's rungs have a RUNTIME HALF, and getting either wrong does not fail -- it
+ * returns fluent nonsense:
+ *
+ *   rotation     the weight is R*B; the activation must be rotated by the same R. Orthogonality
+ *                means (R*A)(R*B) == A*B, so a mismatch is silent. Measured PPL 7,059,519.
+ *   SmoothQuant  the weight column was multiplied by c_j; the activation channel must be divided
+ *                by the same c_j. A pack that carries the vector and a run that ignores it is a
+ *                silently rescaled model.
+ *
+ * Both are now RECORDED in the pack (ORK_PROV_ROTATED / ORK_PROV_SMOOTH, censused from the entries
+ * at write). This function is the one place that compares what the file says it needs against what
+ * this run is actually going to do, and ABORTS on a disagreement. It is deliberately an error and
+ * not a repair: the two halves are decided in different places for different reasons, and quietly
+ * flipping one to match the other would hide whichever of them is the real bug.
+ *
+ * A pack without ORK_PROV_BUILDREC says nothing -- it predates the record. "Unknown" is not
+ * "unrotated", so those are passed through untouched, exactly as before this existed. That is the
+ * honest answer and it is why BUILDREC is a separate bit from the value it qualifies. */
+static void ork_pack_contract_check(ggml_backend_ork_context * ctx) {
+    if (ctx->persist_mode != 1) return;                      /* writing, or no pack: nothing to honour */
+    const uint32_t fl = ctx->pack_prov_flags;
+    if (!(fl & ORK_PROV_BUILDREC)) {
+        if (getenv("ORK_VERBOSE"))
+            fprintf(stderr, "[ORK PACK] this pack predates the build record — rotation/SmoothQuant state is "
+                            "UNKNOWN, not absent; nothing is checked\n");
+        return;
+    }
+    const bool want_rot = (fl & ORK_PROV_ROTATED) != 0;
+    const bool have_rot = ctx->hadamard != 0;
+    bool bad = false;
+    if (want_rot != have_rot) {
+        fprintf(stderr,
+            "[ORK PACK] FATAL: the pack records its weights as %s, but this run will run them %s.\n"
+            "           Rotation is orthogonal — (R*A)(R*B) == A*B — so a mismatch does not fail, it\n"
+            "           returns a plausible wrong answer (measured PPL 7,059,519). Refusing to run.\n",
+            want_rot ? "Hadamard-ROTATED" : "UNROTATED", have_rot ? "rotated" : "unrotated");
+        bad = true;
+    }
+    /* SmoothQuant: the vector is per entry, so the check is that the runtime half is reachable at all.
+     * ork_persist_load_i4native applies e.smooth when smooth_n == K unless ORK_I4_SMOOTH_IGNORE is set —
+     * which is a deliberate experiment knob, and on a pack that was smoothed it is a wrong answer. */
+    if ((fl & ORK_PROV_SMOOTH) && getenv("ORK_I4_SMOOTH_IGNORE")) {
+        fprintf(stderr,
+            "[ORK PACK] FATAL: the pack records SmoothQuant folded into its weights, and\n"
+            "           ORK_I4_SMOOTH_IGNORE is set. The activation half is what divides it back out;\n"
+            "           dropping it rescales every input channel. Refusing to run.\n");
+        bad = true;
+    }
+    if (bad) {
+        fprintf(stderr, "[ORK PACK] (delete the pack to rebuild it for this configuration)\n");
+        abort();
+    }
 }
 
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
@@ -2618,6 +2979,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv,
                             g_soc_id ? g_soc_id : "?");
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
+                    ctx->pack_prov_flags = f.prov_flags;   /* the build record travels with the pack */
                     ork_tier_decide_load(ctx, ORK_TIER_RAM_PCT_DEFAULT);   /* resident WIDTH for the rotated-int4 entries (see ork_tier_rule) */
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
@@ -2785,7 +3147,11 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     if (stale && prov_have) {
         uint32_t now_flags = 0; uint64_t now_imhash = 0;
         ork_pack_provenance(&now_flags, &now_imhash);
-        if (prov_flags != now_flags || prov_imhash != now_imhash) {
+        /* Compare the INPUT bits only. prov_flags also carries the build-record census
+         * (ORK_PROV_BUILDREC and friends), which describes what came OUT and is not a question
+         * about reproducibility -- including it would make every new pack mismatch a fresh run. */
+        const uint32_t IN = ORK_PROV_GPTQ | ORK_PROV_IMATRIX;
+        if ((prov_flags & IN) != (now_flags & IN) || prov_imhash != now_imhash) {
             fprintf(stderr,
                 "[ORK PERSIST] FATAL: %s is STALE but was built with inputs this run does not reproduce —\n"
                 "              refusing to regenerate it as something weaker.\n"
@@ -3950,7 +4316,10 @@ static void ork_stub_verify(ggml_backend_ork_context * ctx, const char * name, c
  * thought to flag yet, which is the category that stranded those packs. */
 extern char ** environ;   /* glibc declares it only under some feature-test macros; be explicit */
 
-static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * bytes_written) {
+static uint32_t ork_build_record(const ggml_backend_ork_context * ctx, double * bpw, uint32_t * n_promoted);
+static float ork_target_bpw(void);
+static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * bytes_written,
+                                  const ggml_backend_ork_context * ctx) {
     char host[256] = "unknown", when[64] = "unknown";
     if (gethostname(host, sizeof host - 1) != 0) snprintf(host, sizeof host, "unknown");
     host[sizeof host - 1] = 0;
@@ -3992,6 +4361,38 @@ static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * 
                             : "DT_I4 / NF4 i4a8",
              g_tier.build_infl / (1024.0*1024*1024), ork_phys_ram_bytes() / (1024.0*1024*1024),
              g_tier.pct); t += ln;
+
+    /* ---- THE LADDER, as key: value lines a reader can parse ----
+     *
+     * These are the NON-load-bearing half of the build record: the load-bearing booleans live in the
+     * footer's prov_flags, where the load path already reads them without parsing anything. What is
+     * here is provenance -- the parameters that decide whether a REBUILD would reproduce this file,
+     * and the requested-vs-achieved bit rate, which is the one number that says whether the thing
+     * that was asked for is the thing on disk. */
+    {   double bpw = 0; uint32_t npromo = 0;
+        const uint32_t br = ctx ? ork_build_record(ctx, &bpw, &npromo) : 0u;
+        const float want = ork_target_bpw();
+        snprintf(ln, sizeof ln, "ladder_rotation: %s\n",
+                 ctx ? ((br & ORK_PROV_ROTATED) ? "1" : "0") : "unknown");                t += ln;
+        snprintf(ln, sizeof ln, "ladder_smooth: %s\n",
+                 ctx ? ((br & ORK_PROV_SMOOTH) ? "1" : "0") : "unknown");                 t += ln;
+        snprintf(ln, sizeof ln, "ladder_smooth_alpha: %.4f\n", (double) ork_smooth_alpha()); t += ln;
+        snprintf(ln, sizeof ln, "ladder_gptq: %d\n", ork_gptq_on() ? 1 : 0);              t += ln;
+        snprintf(ln, sizeof ln, "ladder_gptq_damp: %.4g\n", (double) ork_gptq_damp());    t += ln;
+        /* RHT and GPTQ measured SUBSTITUTES, not complements -- worth /1.32 without GPTQ and nothing
+         * with it. Recorded because a pack built with both is a configuration mistake a later reader
+         * needs to be able to see, and because RHT is not otherwise in any field of the file. */
+        snprintf(ln, sizeof ln, "ladder_rht: %d\n", ork_i4_rht_on() ? 1 : 0);             t += ln;
+        if (want > 0) snprintf(ln, sizeof ln, "bpw_target: %.4f\n", (double) want);
+        else          snprintf(ln, sizeof ln, "bpw_target: unset\n");                     t += ln;
+        snprintf(ln, sizeof ln, "bpw_achieved: %.4f\n", bpw);                             t += ln;
+        snprintf(ln, sizeof ln, "promoted_int8: %u of %zu entries\n", npromo,
+                 ctx ? ctx->persist_built.size() : (size_t) 0);                            t += ln;
+        snprintf(ln, sizeof ln, "promote_order: %s\n",
+                 want > 0 ? "Q4_K_M structural prior (attn_v, ffn_down)"
+                          : (g_pack_cfg.promote_list ? "explicit list"
+                             : (g_pack_cfg.qerr_source_pack ? "qerr-ranked" : "none")));   t += ln;
+    }
 
     /* Every ORK_* variable set for this run, so a method nobody thought to flag is still recorded. */
     t += "env:";
@@ -4109,9 +4510,15 @@ extern "C" bool ggml_backend_ork_extract_gguf(const char * pack_path, const char
     return true;
 }
 
+static void ork_gptq_rescue_unfinalized(ggml_backend_ork_context * ctx);   /* fwd: see its comment */
+
 // Write the index + footer and atomically rename the .tmp into place (skip if nothing was packed).
 static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     if (!ork_persist_writes(ctx) || !ctx->persist_out) return;
+    /* LAST CHANCE: GPTQ phase 1 registers a weight and deliberately does NOT persist it, because
+     * phase 2 is supposed to overwrite it. If phase 2 never came, those weights are simply missing
+     * from the pack. Write them at round-to-nearest rather than ship a pack with a hole in it. */
+    ork_gptq_rescue_unfinalized(ctx);
     if (ctx->persist_built.empty()) {
         fclose(ctx->persist_out); ctx->persist_out = nullptr; unlink(ctx->persist_tmp.c_str()); return;
     }
@@ -4135,13 +4542,31 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
     {
         const uint64_t at = ctx->persist_off;
         uint64_t w = 0;
-        if (ork_write_prov_record(ctx->persist_out, msrc.c_str(), &w)) {
+        if (ork_write_prov_record(ctx->persist_out, msrc.c_str(), &w, ctx)) {
             if (!meta_size) { meta_off = at; meta_size = w; }   /* provenance-only section */
             else            { meta_size += w; }                 /* appended after the kept tensors */
             ctx->persist_off += w;
         }
     }
     ork_persist_emit(ctx, meta_off, meta_size, /*partial=*/false);
+    {   /* SAY WHAT CAME OUT, against what was asked for. The requested rate and the achieved rate are
+         * different numbers and the gap is the thing a caller needs; reporting only the request is how
+         * a control that steers nothing still looks like it is working. */
+        double bpw = 0; uint32_t npromo = 0;
+        const uint32_t br = ork_build_record(ctx, &bpw, &npromo);
+        const float want = ork_target_bpw();
+        char req[48] = "";
+        if (want > 0) snprintf(req, sizeof req, " (requested %.2f)", (double) want);
+        fprintf(stderr, "[ORK PACK] built %zu weights at %.3f bpw%s | rotation=%s smooth=%s gptq=%s "
+                        "promoted=%u\n",
+                ctx->persist_built.size(), bpw, req,
+                (br & ORK_PROV_ROTATED) ? "yes" : "no", (br & ORK_PROV_SMOOTH) ? "yes" : "no",
+                ork_gptq_on() ? "yes" : "no", npromo);
+        if (want > 0 && fabs(bpw - (double) want) > 0.1)
+            fprintf(stderr, "[ORK PACK] NOTE: achieved %.3f bpw against a requested %.2f. Promotion is "
+                            "granular (whole weights) and the eligible set is only the NPU-packed "
+                            "tensors, so some targets are not reachable exactly.\n", bpw, (double) want);
+    }
     fflush(ctx->persist_out); fclose(ctx->persist_out); ctx->persist_out = nullptr;
     if (!ctx->persist_inplace) rename(ctx->persist_tmp.c_str(), ctx->persist_final.c_str());
     ork_persist_after_write(ctx);
@@ -4156,6 +4581,35 @@ static void ork_persist_finalize(ggml_backend_ork_context * ctx) {
  *
  * ftruncate matters: a later index may be SHORTER than the one it replaces, and stale bytes after
  * the footer would break "magic is the final 8 bytes of the file", which every reader relies on. */
+/* THE BUILD RECORD, taken from the entries this build actually wrote.
+ *
+ * Census, not declaration (see ORK_PROV_BUILDREC). `bpw` is blob bits over packed parameters, which
+ * is the SAME definition oRKLLM's measureFromPack uses on the finished file -- so the number the
+ * builder reports and the number a reader measures cannot drift apart. The Bf sidecar and the scale
+ * trailers are excluded from both: they are not weight bits. */
+static uint32_t ork_build_record(const ggml_backend_ork_context * ctx, double * bpw, uint32_t * n_promoted) {
+    uint32_t fl = ORK_PROV_BUILDREC, n_rot = 0, n_sm = 0, n_i8 = 0, n_i4 = 0;
+    double params = 0, bits = 0;
+    for (const auto & kv : ctx->persist_built) {
+        const orkpack_entry & e = kv.second;
+        const bool rot = ork_dt_is_rotated_i4(e.dtype) || e.dtype == ORKPACK_DT_I8_ROT;
+        const bool i8  = (e.dtype == ORKPACK_DT_I8 || e.dtype == ORKPACK_DT_I8_ROT);
+        if (rot) n_rot++;
+        if (i8) n_i8++; else n_i4++;
+        if (e.smooth_n) n_sm++;
+        params += (double) e.K * (double) e.N;
+        bits   += (double) e.blob_size * 8.0;
+    }
+    if (n_rot) fl |= ORK_PROV_ROTATED;
+    if (n_sm)  fl |= ORK_PROV_SMOOTH;
+    /* PROMOTED means a MIXED pack: both tiers present. A pack that is all-int8 is not "promoted",
+     * it is an int8 pack, and saying otherwise would make the bit mean nothing. */
+    if (n_i8 && n_i4) fl |= ORK_PROV_PROMOTED;
+    if (bpw)        *bpw = params > 0 ? bits / params : 0.0;
+    if (n_promoted) *n_promoted = n_i4 ? n_i8 : 0;
+    return fl;
+}
+
 static void ork_persist_emit(ggml_backend_ork_context * ctx, uint64_t meta_off, uint64_t meta_size, bool partial) {
     uint64_t index_off = ctx->persist_off;
     fwrite(&meta_off, 8, 1, ctx->persist_out);
@@ -4172,7 +4626,8 @@ static void ork_persist_emit(ggml_backend_ork_context * ctx, uint64_t meta_off, 
     f.index_off = index_off; f.n_entries = (uint32_t) ctx->persist_built.size(); f.version = ORKPACK_VERSION;
     f.ork_fmt = ork_pack_format_version();   // stamp the ork-driver pack-compat token (its MAJOR ver)
     f.quant_sig = ork_build_sig();           // stamp the build-config precision signature (authoritative on read)
-    ork_pack_provenance(&f.prov_flags, &f.prov_imhash);   // what INPUTS built it (ORK_GPTQ / ORK_IMATRIX content)
+    ork_pack_provenance(&f.prov_flags, &f.prov_imhash);   // what INPUTS built it (GPTQ / ORK_IMATRIX content)
+    f.prov_flags |= ork_build_record(ctx, nullptr, nullptr);   // what the LADDER produced, censused from the entries
     if (partial) f.prov_flags |= ORK_PROV_PARTIAL;
     memcpy(f.magic, ORKPACK_MAGIC, 8);
     fwrite(&f, sizeof f, 1, ctx->persist_out);
@@ -5180,11 +5635,8 @@ static bool ork_i4_norot(void) { static const int e = env_enabled("ORK_I4_NOROT"
  *
  * NORMALISED to geometric mean 1 so the weights' overall dynamic range is unchanged — otherwise a
  * uniformly large c would just rescale every weight and waste quantizer range. */
-static inline bool ork_smooth_on(void) { static const int e = getenv("ORK_I4_SMOOTH") != nullptr; return e; }
-static inline float ork_smooth_alpha(void) {
-    static const float a = getenv("ORK_I4_SMOOTH_ALPHA") ? (float) atof(getenv("ORK_I4_SMOOTH_ALPHA")) : 0.5f;
-    return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
-}
+/* ork_smooth_on / ork_smooth_alpha are defined with the rest of the ladder next to g_pack_cfg: they
+ * are configuration, resolved once, and ORK_I4_SMOOTH* is a dev override rather than the gate. */
 /* act_rms[K] (may be null -> no smoothing), wmax[K] = max_n |W[n][j]|. Fills c[K]. */
 static void ork_smooth_build(int K, const float * act_rms, const float * wmax, std::vector<float> & c, int qmax) {
     c.assign((size_t) K, 1.0f);
@@ -5271,7 +5723,7 @@ static void ork_smooth_build(int K, const float * act_rms, const float * wmax, s
                 nclamp, K, qmax, 2.0 * qm);
 }
 
-static inline bool ork_i4_rht_on(void) { static const int e = getenv("ORK_I4_RHT") != nullptr; return e; }
+static bool ork_i4_rht_on(void) { static const int e = getenv("ORK_I4_RHT") != nullptr; return e; }
 static inline void ork_rht_signs(float * v, int n) {
     for (int i = 0; i < n; i++) {                       /* fixed hash, not rand(): must be reproducible */
         uint32_t h = (uint32_t) i * 2654435761u + 0x9E3779B9u;
@@ -5666,7 +6118,50 @@ struct ork_gptq_cal {
     const void * src_data = nullptr;
 };
 static std::unordered_map<const void *, ork_gptq_cal> g_gptq_cal;
-static bool ork_gptq_on(void)  { static const int e = getenv("ORK_GPTQ") != nullptr; return e; }
+
+/* How many weights are registered for GPTQ and have not been finalized yet. A builder asks this to
+ * know whether it still owes a calibration pass; 0 means either GPTQ is off or phase 2 is done. */
+extern "C" int ggml_backend_ork_gptq_pending(void) {
+    if (!ork_gptq_on()) return 0;
+    ggml_backend_ork_context * ctx = g_ork_ctx;
+    int n = 0;
+    for (const auto & kv : g_gptq_cal)
+        if (kv.second.src && (!ctx || ctx->persist_dumped.find(kv.second.src->name) == ctx->persist_dumped.end()))
+            n++;
+    return n;
+}
+
+/* THE FAILURE THIS CLOSES. GPTQ is two-phase, and phase 1 is a deliberate non-persist: the RTN codes
+ * it packs exist only so the calibration forwards have something to compute with, and
+ * ggml_backend_ork_gptq_finalize() is what writes the real weight. A builder that arms GPTQ and never
+ * finalizes therefore produces a pack MISSING most of its weights -- which still has a valid index, a
+ * valid footer, and loads. The model then serves those weights from the embedded source copies at
+ * source precision and reports a believable number. That is the confident-wrong-answer class this
+ * whole change exists to remove, so it cannot be the cost of a caller forgetting a call.
+ *
+ * The rescue is cheap and exact: phase 1 left the RTN-packed weight in the wcache, pinned, so it is
+ * still in hand and is persisted as-is. The pack then carries rung one of the ladder instead of rung
+ * two, and says so on stderr -- a known downgrade rather than a hole. */
+static void ork_gptq_rescue_unfinalized(ggml_backend_ork_context * ctx) {
+    if (!ork_gptq_on() || g_gptq_cal.empty()) return;
+    size_t n = 0;
+    for (auto & kv : g_gptq_cal) {
+        const ork_gptq_cal & c = kv.second;
+        if (!c.src) continue;
+        if (ctx->persist_dumped.find(c.src->name) != ctx->persist_dumped.end()) continue;   /* finalized */
+        auto it = ctx->wcache.find(kv.first);
+        if (it == ctx->wcache.end()) continue;                                              /* nothing to write */
+        ork_persist_write_i4native(ctx, c.src->name, c.K, c.N, it->second);
+        n++;
+    }
+    if (n)
+        fprintf(stderr,
+            "[ORK GPTQ] WARNING: %zu weights were registered for GPTQ and never finalized — the builder\n"
+            "           did not run a calibration pass (ggml_backend_ork_gptq_finalize). They have been\n"
+            "           written at ROUND-TO-NEAREST so the pack is complete, but this pack is rung one of\n"
+            "           the ladder, not rung two. Rebuild with a calibration corpus to get GPTQ.\n", n);
+}
+/* ork_gptq_on is defined with the rest of the ladder next to g_pack_cfg (resolved once; see there). */
 
 /* ---- WINDOWED GPTQ CALIBRATION -------------------------------------------------------------------
  * The Hessian is K*K doubles and it is NOT disk-backed: unlike a weight, an evicted H cannot be paged
@@ -6367,7 +6862,7 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
         for (const auto & kv : g_gptq_cal) c->wcache_pin.erase(kv.first); } }
         _gptq_pins{ ctx, gptq_seq };
 
-    const float damp = getenv("ORK_GPTQ_DAMP") ? (float) atof(getenv("ORK_GPTQ_DAMP")) : 0.01f;
+    const float damp = ork_gptq_damp();   /* default 0.3 (config), not AutoGPTQ's 0.01 — measured better here */
     std::vector<const void *> keys;
     keys.reserve(g_gptq_cal.size());
     for (auto & kv : g_gptq_cal) if (!kv.second.H.empty()) keys.push_back(kv.first);   /* this window's claims only */
@@ -11960,6 +12455,8 @@ ggml_backend_t ggml_backend_ork_init(void) {
         ctx->hadamard = (ctx->qbits == 4 && !ork_moe_auto() && g_tier.rotated);
         g_tier.rotated = ctx->hadamard;
     }
+    ork_ladder_resolve(ctx);          /* latch gptq/smooth once the tier is known */
+    ork_pack_contract_check(ctx);     /* the pack says what it needs; refuse to run it any other way */
     ctx->phase_evict = env_enabled("ORK_MOE_PHASE_EVICT");   // #1 phase-aware backbone eviction (default OFF)
     // SHIP HARDENING (2026-07-11): the FFN chain ships with a COMPACT resident footprint — default ORK_NO_BF
     // when ORK_FFN_CHAIN is on. The full-K Bf decode-copies ~double the footprint (~1.9->3.6 GiB on 1.7B),

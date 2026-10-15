@@ -574,6 +574,14 @@ struct common_params {
     float       ork_pack_qerr_min   = -1.0f;  // never promote below this measured error; <0 = default
     std::string ork_pack_qerr_src   = "";     // a prior .orkpack to rank qerr from
     std::string ork_pack_promote    = "";     // explicit "name,name,..." promotion list
+    float       ork_pack_bpw        = -1.0f;  // TARGET bits per weight; <0 = backend default (unset)
+    int32_t     ork_pack_4bit       = 0;      // 0 auto (RAM rule), 1 rotated W4A4, 2 NF4 i4a8
+    int32_t     ork_pack_gptq       = -1;     // -1 auto (on for the 4-bit tier), 0 off, 1 on
+    int32_t     ork_pack_smooth     = -1;     // -1 auto (on for the 4-bit tier), 0 off, 1 on
+    // Calibration corpus for the GPTQ pass. Empty = the built-in one (common/ork-calib-text.h), which
+    // is what makes "the ladder is on by default" true for a pack built lazily on first load, with no
+    // user present to supply anything.
+    std::string ork_pack_calib      = "";
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V

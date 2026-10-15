@@ -53,6 +53,23 @@ GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflas
 // (qerr_source_pack) and let the policy rank by the stored qerr and promote worst-first until
 // promote_budget_mb is spent. With neither, the first build is uniform and records the qerr that makes the
 // second build informed.
+//
+// THE PPL LADDER IS THE DEFAULT, not an opt-in. A 4-bit pack built without it is rung one of a measured
+// ladder (Qwen3-1.7B: rotation alone 57.49 -> SmoothQuant+GPTQ 50.42 -> + int8 promotion 47.82), and
+// every rung costs only build time. The three techniques are NOT alike and are configured separately:
+//
+//   GPTQ         changes the weight VALUES. No runtime counterpart at all — the effect is in the bytes.
+//                Needs calibration activations, so the BUILDER must drive calibration forwards and then
+//                call ggml_backend_ork_gptq_finalize(). Armed-but-never-finalized is caught and reported
+//                rather than silently producing a pack with no 4-bit weights in it.
+//   SmoothQuant  folds c_j = act_j^a / wmax_j^(1-a) into the weight column. LOAD-BEARING: the activation
+//                must be divided by the same vector. The vector is stored per entry, so the loader
+//                applies it from the FILE, never from a flag.
+//   rotation     Hadamard. LOAD-BEARING and unconditional for the 4-bit MAC; recorded in the pack.
+//   promotion    per-weight dtype, already expressed by the entry itself.
+//
+// Randomized Hadamard (ORK_I4_RHT) is deliberately NOT in this list: measured a SUBSTITUTE for GPTQ, not
+// a complement, so enabling it alongside GPTQ buys nothing and is not recorded in the pack.
 struct ggml_backend_ork_pack_config {
     int          weight_bits;        // base tier for the bulk of the model: 4 or 8; 0 = UNSET (the
                                      // default), leaving ORK_QUANT / the source-type policy to decide
@@ -61,6 +78,26 @@ struct ggml_backend_ork_pack_config {
     const char * qerr_source_pack;   // a previously built pack to read qerr from; NULL = no ranking available
     float        promote_budget_mb;  // how much EXTRA file size promotion may spend (default 8 MiB)
     float        promote_qerr_min;   // never promote a weight whose measured error is below this (default 0.05)
+    // ---- the ladder ----
+    // TARGET BITS PER WEIGHT. The unit the quality ladder is indexed by, and the one a caller can reason
+    // about without knowing the model. >4 promotes weights to int8 until the achieved rate reaches it;
+    // 0 = unset, leaving promote_budget_mb/qerr as the stopping rule. Promotion ORDER is the Q4_K_M
+    // structural prior (attn_v, then ffn_down), which measured 3.8% better than qerr ranking at a
+    // matched bit budget — qerr is a poor ordering, not merely a flat one. Requested AND achieved are
+    // both recorded in the pack.
+    float        target_bpw;         // default 0 (unset)
+    // WHICH 4-BIT FORM TO WRITE. The two are not interchangeable bytes and the choice is therefore a
+    // build-time one (see ork_tier_rule): NF4 i4a8 is the most accurate 4-bit tier from a
+    // full-precision source but only exists at int8 residency, while rotated W4A4 is compact and is
+    // the tier the quality ladder (rotation + SmoothQuant + GPTQ) applies to at all. Auto picks by the
+    // build host's RAM, which is right for production and useless for an A/B, so it can be stated.
+    //   0 = auto (RAM rule, the default), 1 = rotated W4A4, 2 = NF4 i4a8
+    int          four_bit_tier;      // default 0
+    // Tri-state: -1 = auto (on for the 4-bit tier, off otherwise), 0 = off, 1 = on.
+    int          gptq;               // default -1
+    float        gptq_damp;          // default 0.3 — measured better here than AutoGPTQ's 0.01 (worth 0.9%)
+    int          smooth;             // default -1
+    float        smooth_alpha;       // default 0.5 — swept, optimal
 };
 
 // Fill with the defaults described above. Always call this first, so adding a field cannot silently
@@ -96,6 +133,14 @@ GGML_BACKEND_API double              ggml_backend_ork_gptq_hessian_bytes(int K);
  * costs no Hessian memory, and used to size the window against a RAM budget. min_rows() by contrast
  * reports the largest K the CURRENT window claimed, which is what sets its calibration row count. */
 GGML_BACKEND_API int                 ggml_backend_ork_gptq_max_k(void);
+/* Is this run supposed to run GPTQ at all? Answered as soon as the backend has resolved the ladder
+ * (i.e. after model load), BEFORE any weight registers, so a frontend can skip the whole calibration
+ * apparatus on an int8 build or a read-mode run without paying for it. */
+GGML_BACKEND_API int                 ggml_backend_ork_gptq_wanted(void);
+/* Weights registered for GPTQ that have not been finalized yet. A driver loops until this is 0. Zero
+ * also when GPTQ is off. A build that leaves it non-zero does not produce a pack with holes: finalize
+ * writes those weights at round-to-nearest and says so loudly. */
+GGML_BACKEND_API int                 ggml_backend_ork_gptq_pending(void);
 
 // ---- Async cross-stream submit path ----
 // Run this backend's NPU graph on a worker thread: the launch returns immediately so the caller can do CPU

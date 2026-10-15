@@ -2104,6 +2104,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ork_pack_promote = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    // ---- the quality ladder ----
+    // On by default for the 4-bit tier; these exist to turn a rung OFF, to tune it, or to point the
+    // GPTQ pass at a corpus representative of what will actually be served. They are ARGUMENTS, not
+    // environment variables, because how a pack is built is a decision the artifact should record and
+    // a caller should control -- the ORK_* spellings remain as dev overrides and are never required.
+    add_opt(common_arg(
+        {"--pack-bpw"}, "F",
+        "TARGET bits per weight for the pack. >4 promotes weights to int8 until the rate is reached,\n"
+        "ordered by the Q4_K_M structural prior (attn_v, then ffn_down) which measured 3.8% better than\n"
+        "qerr ranking at a matched budget. Requested and achieved are both recorded in the pack",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_bpw = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-gptq"},
+        {"--no-pack-gptq"},
+        "GPTQ error-feedback quantisation at pack time (default: on for the 4-bit tier). It is O(K^3)\n"
+        "per weight and dominates the build; --no-pack-gptq builds the same pack without it, faster and\n"
+        "measurably worse",
+        [](common_params & params, bool value) {
+            params.ork_pack_gptq = value ? 1 : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-smooth"},
+        {"--no-pack-smooth"},
+        "SmoothQuant at pack time (default: on for the 4-bit tier). Stacks with GPTQ rather than\n"
+        "substituting for it; the per-channel vector is stored in the pack and divided back out of the\n"
+        "activations at run time",
+        [](common_params & params, bool value) {
+            params.ork_pack_smooth = value ? 1 : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-4bit"}, "TIER",
+        "which 4-bit form to WRITE: auto (default, by the build host's RAM) | w4a4 (rotated, compact,\n"
+        "the tier the rotation/SmoothQuant/GPTQ ladder applies to) | nf4 (unrotated i4a8, most accurate\n"
+        "from a full-precision source but int8-sized in memory). The two are different bytes, so this\n"
+        "cannot be deferred to load time",
+        [](common_params & params, const std::string & value) {
+            if      (value == "auto") params.ork_pack_4bit = 0;
+            else if (value == "w4a4") params.ork_pack_4bit = 1;
+            else if (value == "nf4")  params.ork_pack_4bit = 2;
+            else throw std::invalid_argument("--pack-4bit must be auto, w4a4 or nf4");
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--pack-calib"}, "FNAME",
+        "calibration text for the GPTQ pass. Default is a small built-in corpus, which is what makes the\n"
+        "ladder work on a pack built lazily with nobody present; supply a longer one representative of\n"
+        "your workload when you have it (rank(H) <= rows, and a weight of width K wants K rows)",
+        [](common_params & params, const std::string & value) {
+            params.ork_pack_calib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--no-host"},
