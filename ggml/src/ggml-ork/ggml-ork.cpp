@@ -302,7 +302,16 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 7u   // v7 = the optional M-threshold calibration block (see orkpack_calib) + build provenance
+#define ORKPACK_VERSION 8u   /* v8 = the DECLINED set is stored QUANTISED (token_embd -> Q4_K, lm_head ->
+                              * Q6_K) instead of copied verbatim from the source, and the tier is chosen by
+                              * the measured RAM rule rather than an env flag. The FOOTER LAYOUT IS
+                              * UNCHANGED from v7 -- this bump is semantic, and it exists to force a
+                              * rebuild. ork_pack_version_ok() is EXACT equality, so every v7 pack now
+                              * reports "predates the pack-compat token" and regenerates on next load.
+                              * That is the point: the fix is in the BUILDER, so an existing pack cannot
+                              * inherit it and would otherwise keep its old footprint forever. The cost is
+                              * real and deliberate -- a rebuild is GGUF-load-bound, hours for a 27B -- and
+                              * it is paid per model on next load, not eagerly for all of them at once. */
 /* NOT bumped for the provenance fields, deliberately. No orkpack version was ever published, so there
  * is no reader to stay compatible with — and the number could not do the job here anyway: the footer is
  * read at `sz - sizeof f`, so GROWING the struct shifts that window 16 bytes earlier and an older file's
@@ -719,9 +728,12 @@ static int ork_sig_qbits(uint32_t sig) {
  * no longer a build target for the NPU tier at all: it is strictly dominated by the rotated bytes,
  * which cost the same and can be loaded either way. It stays READABLE so existing packs still work.
  *
- * ORK_TIER_RAM_PCT overrides the 50% for A/B measurement. It is a LOAD-time knob by nature -- there is
- * nothing in the artifact for it to contradict -- and it is reported on the line below, so a run that
- * used it says so.
+ * The 50% is a PARAMETER of the two decide functions, not an environment variable. An env knob that
+ * SELECTS behaviour is invisible state that no artifact records and no caller controls -- the same
+ * property that let ORK_MIXED_W4A4's silent absence build a 27B at the inflating tier, because an
+ * unset variable is indistinguishable from a deliberate default. A caller that needs a different
+ * fraction passes one; today every caller wants the default, so the default is all that is supplied.
+ * The fraction in force is reported on the line below either way.
  *
  * ---- AND A SECOND, UNAVOIDABLY BUILD-TIME CHOICE: which BYTES to write -----------------------
  *
@@ -747,6 +759,11 @@ static int ork_sig_qbits(uint32_t sig) {
  * absent (oRKLLM's conversion scheduler spawns the build on the serving board). A pack COPIED to a
  * smaller machine has a stale premise, which is why the choice and its inputs go into the provenance
  * record and the load path says what it found. */
+/* The RAM fraction the tier rule compares against, as a percent. A parameter with one default, not an
+ * env knob: ork_tier_decide_build/load take it, every caller today passes this, and a caller that ever
+ * wants a different fraction passes a different one. */
+#define ORK_TIER_RAM_PCT_DEFAULT 50
+
 struct ork_tier_rule {
     int      native;      /* 1 = keep nibbles (NATIVE/W4A4), 0 = inflate to int8 containers (ROT_A8) */
     int      resolved;    /* 0 = nothing has decided yet */
@@ -758,7 +775,7 @@ struct ork_tier_rule {
     int      build_done;  /* the BUILD-side tier choice has been made */
     uint64_t build_infl;  /* what the i4a8/NF4 tier would have cost on the build host */
 };
-static ork_tier_rule g_tier = { 0, 0, 50, 0, 0, 0, 0, 0, 0 };
+static ork_tier_rule g_tier = { 0, 0, ORK_TIER_RAM_PCT_DEFAULT, 0, 0, 0, 0, 0, 0 };
 
 static uint64_t ork_phys_ram_bytes(void) {
     long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGE_SIZE);
@@ -2141,11 +2158,11 @@ static bool ork_persist_resumable(const char * path, uint64_t * footer_at, uint3
  * page padding and whether a full-K Bf companion gets built, and re-deriving it is how the load-time
  * domain planner drifted twice at once. Experts (ne[2] > 1) count once per expert. Returns 1 for
  * "rotated" (ctx->hadamard). */
-static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * src_path) {
+static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * src_path, int ram_pct) {
     if (g_tier.build_done) return g_tier.rotated;
     g_tier.build_done = 1;
     const uint64_t ram = ork_phys_ram_bytes();
-    if (const char * pc = getenv("ORK_TIER_RAM_PCT")) { int v = atoi(pc); if (v > 0 && v <= 100) g_tier.pct = v; }
+    if (ram_pct > 0 && ram_pct <= 100) g_tier.pct = ram_pct;
     uint64_t sum = 0; int n_elig = 0;
     if (src_path && *src_path) {
         struct ggml_context * mc = nullptr;
@@ -2174,7 +2191,7 @@ static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * sr
         g_tier.rotated ? "ROTATED int4 (W4A4-capable, compact)"
                        : "DT_I4 / NF4 i4a8 (best 4-bit quality, int8 residency)",
         sum/(1024.0*1024*1024), n_elig, ram/(1024.0*1024*1024), g_tier.pct,
-        limit/(1024.0*1024*1024), getenv("ORK_TIER_RAM_PCT") ? " [ORK_TIER_RAM_PCT override]" : "");
+        limit/(1024.0*1024*1024), "");
     return g_tier.rotated;
 }
 
@@ -2184,10 +2201,10 @@ static int ork_tier_decide_build(ggml_backend_ork_context * ctx, const char * sr
  * Both totals come from ork_w_resident_bytes -- the driver's authority for tile geometry, page padding
  * and whether a full-K Bf companion gets built. Re-deriving that here is exactly how the load-time
  * domain planner drifted twice at once, so it is asked, not modelled. */
-static void ork_tier_decide_load(ggml_backend_ork_context * ctx) {
+static void ork_tier_decide_load(ggml_backend_ork_context * ctx, int ram_pct) {
     g_tier.resolved = 1;
     g_tier.ram = ork_phys_ram_bytes();
-    if (const char * pc = getenv("ORK_TIER_RAM_PCT")) { int v = atoi(pc); if (v > 0 && v <= 100) g_tier.pct = v; }
+    if (ram_pct > 0 && ram_pct <= 100) g_tier.pct = ram_pct;
     uint32_t n_rot = 0, n_i4a8 = 0, n_i8 = 0;
     uint64_t infl = 0, comp = 0;
     for (const auto & kv : ctx->persist_idx) {
@@ -2215,7 +2232,7 @@ static void ork_tier_decide_load(ggml_backend_ork_context * ctx) {
             "%.2f GiB RAM, threshold %d%% (%.2f GiB)%s -> loading 4-bit weights %s.\n",
             n_rot, n_i4a8, n_i8, infl/(1024.0*1024*1024), comp/(1024.0*1024*1024),
             g_tier.ram/(1024.0*1024*1024), g_tier.pct, limit/(1024.0*1024*1024),
-            getenv("ORK_TIER_RAM_PCT") ? " [ORK_TIER_RAM_PCT override]" : "",
+            "",
             g_tier.native ? "as NATIVE int4 nibbles (W4A4, compact)"
                           : "INFLATED to int8 containers (ROT_A8: faster, best measured error)");
 }
@@ -2371,7 +2388,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
                             g_model_fp.n_layer, g_model_fp.n_embd, g_model_fp.n_ff, g_model_fp.attn_kv,
                             g_soc_id ? g_soc_id : "?");
                     ctx->persist_qbits = ork_sig_qbits(f.quant_sig);
-                    ork_tier_decide_load(ctx);   /* resident WIDTH for the rotated-int4 entries (see ork_tier_rule) */
+                    ork_tier_decide_load(ctx, ORK_TIER_RAM_PCT_DEFAULT);   /* resident WIDTH for the rotated-int4 entries (see ork_tier_rule) */
                     ctx->persist_map = m; ctx->persist_map_sz = sz; ctx->persist_mode = 1; close(fd);
                     if (getenv("ORK_VERBOSE")) fprintf(stderr, "[ORK PERSIST] read %s (%zu weights) — loading from disk, no re-conversion\n", p, ctx->persist_idx.size());
                     /* ORK_MAKE_STUB=1: emit the companion stub for a pack that already exists. The stub needs
@@ -2646,7 +2663,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
         /* BEFORE the first weight: which 4-bit BYTES this model gets on this machine (ork_tier_rule). */
-        ork_tier_decide_build(ctx, ork_find_model_path().c_str());
+        ork_tier_decide_build(ctx, ork_find_model_path().c_str(), ORK_TIER_RAM_PCT_DEFAULT);
         /* Reserve the recovery header; blobs start after it. Every offset in the format is absolute,
          * so this is invisible to readers. */
         ctx->persist_off = ORKPACK_HDR_BYTES;
