@@ -300,7 +300,11 @@ static bool env_enabled(const char * name) {
 // The struct layout is unchanged from v1, so v1 (all-int8) files load unmodified; VERSION bumps to 2 to
 // mark files that may contain int4 entries (both versions are accepted on read).
 #define ORKPACK_MAGIC   "ORKPK01"
-#define ORKPACK_VERSION 7u   // v7 = the optional M-threshold calibration block (see orkpack_calib) + build provenance
+#define ORKPACK_VERSION_NUM 7    /* the bare integer; ORKPACK_VERSION is the typed form used by the code.
+                                  * Split out ONLY so it can be stringified — see ggml_ork_orkpack_version_tag
+                                  * below. Bump THIS and everything else follows. */
+#define ORKPACK_VERSION ((uint32_t) ORKPACK_VERSION_NUM)
+                             // v7 = the optional M-threshold calibration block (see orkpack_calib) + build provenance
 /* NOT bumped for the provenance fields, deliberately. No orkpack version was ever published, so there
  * is no reader to stay compatible with — and the number could not do the job here anyway: the footer is
  * read at `sz - sizeof f`, so GROWING the struct shifts that window 16 bytes earlier and an older file's
@@ -316,6 +320,31 @@ static bool env_enabled(const char * name) {
                              // v7 adds DT_I8_ROT; v6 adds per-entry qerr (measured quantisation error, for re-tiering); v5 adds
                              // quant_sig (build-config precision signature) to the footer; v4 adds bf_size
                              // to each entry (full-K Bf blob after the Bb blob, so orkd maps Bf directly); v3 adds ork_fmt.
+
+/* The pack format version, stamped into the built shared library as a plain ASCII string.
+ *
+ * WHO READS IT: the release workflow (.github/workflows/build-rockchip.yml, "Package Binaries")
+ * recovers it with `strings` from the libraries it is about to tar up, and writes it into the bundle's
+ * manifest.json as `orkpackVersion`. oRKLLM then reads that number instead of carrying its own copy.
+ *
+ * WHY IT HAS TO COME FROM HERE: the runtime bundle and the oRKLLM service are separately deployed —
+ * apt package vs adopted tarball — so a board routinely runs a current service against a months-old
+ * runtime. Both sides compare pack versions for EXACT equality (ork_pack_version_ok below), so a reader
+ * that assumes a version its builder does not produce condemns every pack on disk as stale, rebuilds
+ * them with that same old builder, and gets the same "stale" answer: a rebuild loop that cannot
+ * terminate, each turn GGUF-load-bound (hours for a 27B). A hardcoded number on the reader's side is
+ * therefore not a tidiness issue, it is the bug. Deriving it from the binary that will actually build
+ * the packs makes the mismatch impossible rather than a rule someone has to remember.
+ *
+ * WHY A STRING AND NOT A FUNCTION CALL: the release build CROSS-compiles aarch64 on an x86_64 runner,
+ * so CI cannot execute the artifact to ask it. A string in .rodata survives `strip` and is readable
+ * with `strings` on any host. `used` keeps it from being elided — nothing in this translation unit
+ * references it, by design. */
+#define ORK_STRINGIFY_(x) #x
+#define ORK_STRINGIFY(x)  ORK_STRINGIFY_(x)
+extern "C" __attribute__((used)) const char ggml_ork_orkpack_version_tag[] =
+    "ORKPACK_FORMAT_VERSION=" ORK_STRINGIFY(ORKPACK_VERSION_NUM);
+
 #define ORKPACK_DT_I8         1u
 #define ORKPACK_DT_I4         4u
 #define ORKPACK_DT_I4_NATIVE  5u
@@ -11564,8 +11593,12 @@ ggml_backend_t ggml_backend_ork_init(void) {
     // One-line version banner to stderr — visible even under llama-bench (which suppresses
     // GGML_LOG_INFO). Cheap, once per backend init. ork_npu_version() = semver (+git hash if built
     // with one). Makes "which build is this?" answerable from any benchmark/run log.
-    fprintf(stderr, "[ork] ork-driver %s (W%dA%d%s)\n", ork_npu_version(),
-            ctx->qbits, ctx->qbits, ctx->hadamard ? "+Had" : "");
+    // The pack format version goes on the same line: it is the number oRKLLM's reader has to agree with
+    // (manifest.json `orkpackVersion`, stamped from ggml_ork_orkpack_version_tag at release time), and a
+    // disagreement is a silent rebuild loop. Printing it makes "which pack version does this runtime
+    // build?" answerable from any run log without unpacking the bundle.
+    fprintf(stderr, "[ork] ork-driver %s (W%dA%d%s), orkpack format v%u\n", ork_npu_version(),
+            ctx->qbits, ctx->qbits, ctx->hadamard ? "+Had" : "", ORKPACK_VERSION);
     GGML_LOG_INFO("%s: ork backend ready (ork-driver %s, orkd %sW%dA%d%s)\n", __func__, ork_npu_version(),
                   ctx->hybrid ? "Hybrid " : "",
                   ctx->qbits, ctx->qbits,

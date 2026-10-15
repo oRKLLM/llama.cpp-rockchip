@@ -163,8 +163,36 @@ jobs:
           cp build/bin/llama-completion release-bin/   # non-interactive completion CLI: oRKLLM's .orkpack conversion scheduler spawns it (clean exit finalizes the .orkpack)
           cp -P build/bin/lib*.so* release-bin/
 
-          printf '{"tag":"%s","llamaCommit":"%s","orkDriverCommit":"%s"}\n' \
-            "$OUR_TAG" "$LLAMA_SHA" "$ORK_SHA" > release-bin/manifest.json
+          # The .orkpack format version the libraries we just built will WRITE, recovered FROM THE
+          # ARTIFACT rather than retyped here. ggml-ork stamps it into .rodata as
+          # "ORKPACK_FORMAT_VERSION=<n>" (ggml_ork_orkpack_version_tag); this job cross-compiles
+          # aarch64 on an x86_64 runner so we cannot execute the binary to ask it, but `strings -a`
+          # reads it on any host and it survives `strip`.
+          #
+          # Why the manifest has to carry it: oRKLLM reads pack footers itself, in its own process,
+          # and compares the version for EXACT equality (ork_pack_version_ok). The service (apt) and
+          # this bundle (tarball, adopted separately) move independently, so a board routinely runs a
+          # current service against a months-old runtime. A reader that assumes a version its builder
+          # does not produce condemns every pack on disk as stale, triggers a rebuild, gets a pack
+          # from that same old builder, and calls it stale again — a rebuild loop that cannot
+          # terminate, each turn GGUF-load-bound (hours for a 27B). Publishing the number here is what
+          # makes the mismatch impossible by construction instead of a merge-ordering rule.
+          ORKPACK_VER=$(strings -a release-bin/lib*.so* \
+                        | sed -n 's/^ORKPACK_FORMAT_VERSION=\([0-9][0-9]*\)$/\1/p' | sort -u)
+          # Empty, non-numeric, or two libraries disagreeing (sort -u left a newline, which is not a
+          # digit) all land here. Fail the BUILD: shipping a bundle whose manifest omits or misstates
+          # the version is the failure this whole mechanism exists to prevent.
+          case "$ORKPACK_VER" in
+            '' | *[!0-9]*)
+              echo "::error::could not recover exactly one ORKPACK_FORMAT_VERSION from the built libraries (got: '${ORKPACK_VER}')."
+              echo "::error::ggml_ork_orkpack_version_tag in ggml/src/ggml-ork/ggml-ork.cpp is what emits it."
+              echo "::error::If it was renamed, removed or optimised away, fix THAT - do not hardcode a number in this workflow."
+              exit 1 ;;
+          esac
+          echo "orkpack format version (from the built libraries): v${ORKPACK_VER}"
+
+          printf '{"tag":"%s","llamaCommit":"%s","orkDriverCommit":"%s","orkpackVersion":%s}\n' \
+            "$OUR_TAG" "$LLAMA_SHA" "$ORK_SHA" "$ORKPACK_VER" > release-bin/manifest.json
 
           tar -czvf "llama-cpp-rockchip-npu-${OUR_TAG}.tar.gz" -C release-bin .
 
