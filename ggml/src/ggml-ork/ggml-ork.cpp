@@ -7088,7 +7088,21 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
         return g_gptq_cal[a].K > g_gptq_cal[b].K; });          // biggest H freed first
 
     fprintf(stderr, "[ORK GPTQ] finalize: %zu weights, damp=%.3g\n", keys.size(), damp);
-    double all0 = ork_now_us(); size_t done = 0, failed = 0;
+    double all0 = ork_now_us(); size_t done = 0, failed = 0, n_orphan = 0;
+    {   /* State of the thing finalize used to depend on, printed once. A weight that is pinned and
+         * gone says the evictor ignores pins; unpinned and gone says it was never claimed through the
+         * path that pins. Either way the work below now survives it. */
+        size_t have = 0, pinned = 0;
+        for (const void * k : keys) {
+            if (ctx->wcache.count(k))     have++;
+            if (ctx->wcache_pin.count(k)) pinned++;
+        }
+        if (have != keys.size())
+            fprintf(stderr, "[ORK GPTQ] %zu of %zu weights are no longer in the weight cache (%zu of them "
+                            "still pinned) — they are re-packed from the calibration record instead, which "
+                            "costs sequential GPTQ for later windows and nothing else\n",
+                    keys.size() - have, keys.size(), pinned);
+    }
 
     /* CHUNKED, parallel over WEIGHTS. ork_i4_gptq is internally OpenMP but its inner loops are short at
      * small K, so the cores idle; weights are completely independent, so the outer loop is where the
@@ -7221,9 +7235,33 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
                                 "RTN in the null space\n", src->name, c.samples, K);
             if (rcs[u]) { fprintf(stderr, "[ORK GPTQ] %s: ork_i4_gptq rc=%d — leaving RTN codes\n", src->name, rcs[u]);
                           failed++; continue; }
+            /* THE CACHE ENTRY IS NOT AN INPUT. It used to be: a missing one meant "wcache entry
+             * vanished", failed++, and ~20 minutes of finished K^3 work thrown away per chunk of
+             * eight K=6144 weights. MEASURED on qwen3-1.7b-f16: every ffn_down lost that way, twice,
+             * including after the pin-guard fix -- so something still drops these entries and the
+             * honest response is to stop depending on them rather than to keep hunting the evictor
+             * while discarding real results.
+             *
+             * Nothing in what follows actually needs the cached weight. The codes and scales come
+             * from ork_i4_gptq, the smoothing vector is carried on the calibration record (c.smooth),
+             * the group size is a function of the name, and ork_persist_write_i4native wants a freshly
+             * packed ork_w either way. So when the entry is gone, build one here, persist from it, and
+             * free its NPU buffer afterwards -- it is not in the cache and nobody will.
+             *
+             * What IS lost in that case is sequential GPTQ: the quantised weight is not put back where
+             * a later window would read it. That was already lost when the entry disappeared. It is
+             * reported below so the degradation is visible rather than inferred. */
             auto it = ctx->wcache.find(keys[base + u]);
-            if (it == ctx->wcache.end()) { fprintf(stderr, "[ORK GPTQ] %s: wcache entry vanished\n", src->name); failed++; continue; }
-            ork_weight & ow = it->second;
+            const bool orphan = (it == ctx->wcache.end());
+            ork_weight tmp;
+            if (orphan) {
+                tmp.smooth = c.smooth;
+                tmp.gsize  = ork_i4_group_for(src->name);
+                tmp.wbits  = 4;                      /* wbits==8 was persisted in phase 1 and is not in keys */
+                tmp.abits  = 4;
+                n_orphan++;
+            }
+            ork_weight & ow = orphan ? tmp : it->second;
             /* The weight is smoothed with c.smooth but PERSISTED with ow.smooth. If those ever differ,
              * inference divides activations by a different vector than the weights were multiplied by. */
             if (c.smooth.size() != ow.smooth.size()) {
@@ -7257,6 +7295,8 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
                           : ork_i4_mm_pack(ctx->npu, K, N, bi.data());
             if (!ow.w) { fprintf(stderr, "[ORK GPTQ] %s: repack FAILED\n", src->name); failed++; continue; }
             ork_persist_write_i4native(ctx, src->name, K, N, ow);
+            /* Not in the cache, so nothing else will ever free it. */
+            if (orphan) { ork_slice_ws_drop(ctx, ow.w); ork_mm_free(ctx->npu, ow.w); ow.w = nullptr; }
             done++;
             fprintf(stderr, "[ORK GPTQ] %s K=%d N=%d rows=%ld -> GPTQ (%.1f s)  [%zu/%zu, %.1f min]\n",
                     src->name, K, N, c.samples, secs[u], done, keys.size(), (ork_now_us()-all0)/6e7);
@@ -7299,6 +7339,9 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
 
     g_gptq_applied  += (long) done;
     g_gptq_fellback += (long) failed;
+    if (n_orphan)
+        fprintf(stderr, "[ORK GPTQ] %zu weights were re-packed outside the cache (see above). They ARE "
+                        "GPTQ-quantised and persisted; only the sequential-GPTQ feedback was lost.\n", n_orphan);
     fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min%s\n",
             done, failed, (ork_now_us()-all0)/6e7, gptq_seq ? " (sequential)" : " (NON-sequential)");
     if (failed)
