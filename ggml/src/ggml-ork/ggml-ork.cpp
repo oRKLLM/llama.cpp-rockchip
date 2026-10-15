@@ -2552,9 +2552,49 @@ static std::string ork_default_orkpack_path(long budget_mb, int want_qbits, std:
     if (ork_is_pack_dir(base)) {
         const std::string v = ork_pick_variant(base, budget_mb, want_qbits, why);
         if (!v.empty()) return v;
+        /* NO ADOPTABLE VARIANT -- but "not adoptable" and "not there" are different, and only one of
+         * them is a reason to start from nothing.
+         *
+         * ork_pick_variant requires ork_pack_version_ok, so a variant left STALE by a format bump is
+         * rejected along with everything else and the resolver used to answer with a fresh
+         * `.building-` name. The stale pack then sat in the directory forever: never adopted, never
+         * replaced, and -- now that an absent pack is not built automatically -- never rebuilt either,
+         * because at the `.building-` path there is nothing to be stale. Worse, a rebuild has to READ
+         * the old pack to recover the settings it was built with, and a path that points at a file
+         * that does not exist cannot.
+         *
+         * So name the stale variant instead: the rebuild replaces it in place, reads its recipe first,
+         * and the directory does not accumulate orphans. Newest by mtime when there are several, since
+         * that is the one the user last chose. */
+        std::string stale_best; time_t stale_mt = 0;
+        if (DIR * d = opendir(base.c_str())) {
+            for (struct dirent * e = readdir(d); e; e = readdir(d)) {
+                const std::string n = e->d_name;
+                if (n.size() < 9 || n.compare(n.size() - 8, 8, ".orkpack") != 0) continue;
+                if (n[0] == '.') continue;               /* a build in flight is not a stale pack */
+                const std::string full = base + "/" + n;
+                int fd = open(full.c_str(), O_RDONLY);
+                if (fd < 0) continue;
+                orkpack_footer f;
+                const off_t sz = lseek(fd, 0, SEEK_END);
+                bool is_pack = sz > (off_t) sizeof f &&
+                               pread(fd, &f, sizeof f, sz - (off_t) sizeof f) == (ssize_t) sizeof f &&
+                               memcmp(f.magic, ORKPACK_MAGIC, 8) == 0;
+                close(fd);
+                if (!is_pack) continue;
+                struct stat st;
+                const time_t mt = stat(full.c_str(), &st) == 0 ? st.st_mtime : 0;
+                if (stale_best.empty() || mt > stale_mt) { stale_best = full; stale_mt = mt; }
+            }
+            closedir(d);
+        }
+        if (!stale_best.empty()) {
+            why += " — the directory holds a STALE pack, which is rebuilt in place to its own recorded settings";
+            return stale_best;
+        }
         char tmp[64];
         snprintf(tmp, sizeof tmp, "/.building-%d-%lld.orkpack", (int) getpid(), (long long) time(nullptr));
-        why += " — building a new one in the pack directory";
+        why += " — a new one would be built here";
         return base + tmp;
     }
     why = "legacy layout (no pack directory for this model)";
