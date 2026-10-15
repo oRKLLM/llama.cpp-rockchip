@@ -2830,14 +2830,20 @@ static void ork_pack_contract_check(ggml_backend_ork_context * ctx) {
         return;
     }
     const bool want_rot = (fl & ORK_PROV_ROTATED) != 0;
-    const bool have_rot = ctx->hadamard != 0;
+    /* ctx->hadamard says the run is on the rotated DATAPATH; ORK_I4_NOROT additionally makes
+     * ork_w4a4_rot_k a no-op, so the activations are not rotated even though the path is. Both have
+     * to agree with the pack, and the second one is the hole the old "build/run-must-match by
+     * convention" note left open -- the convention had no enforcement anywhere, and breaking it
+     * measured PPL 7,059,519. */
+    const bool have_rot = ctx->hadamard != 0 && !ork_i4_norot();
     bool bad = false;
     if (want_rot != have_rot) {
         fprintf(stderr,
-            "[ORK PACK] FATAL: the pack records its weights as %s, but this run will run them %s.\n"
+            "[ORK PACK] FATAL: the pack records its weights as %s, but this run will run them %s%s.\n"
             "           Rotation is orthogonal — (R*A)(R*B) == A*B — so a mismatch does not fail, it\n"
             "           returns a plausible wrong answer (measured PPL 7,059,519). Refusing to run.\n",
-            want_rot ? "Hadamard-ROTATED" : "UNROTATED", have_rot ? "rotated" : "unrotated");
+            want_rot ? "Hadamard-ROTATED" : "UNROTATED", have_rot ? "rotated" : "unrotated",
+            ork_i4_norot() ? " (ORK_I4_NOROT is set)" : "");
         bad = true;
     }
     /* SmoothQuant: the vector is per entry, so the check is that the runtime half is reachable at all.
