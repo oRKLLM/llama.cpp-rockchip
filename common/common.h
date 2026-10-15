@@ -575,6 +575,10 @@ struct common_params {
     std::string ork_pack_qerr_src   = "";     // a prior .orkpack to rank qerr from
     std::string ork_pack_promote    = "";     // explicit "name,name,..." promotion list
     float       ork_pack_bpw        = -1.0f;  // TARGET bits per weight; <0 = backend default (unset)
+    bool        ork_pack_build      = false;  // --pack-build: THIS run is the quantisation step, so an
+                                              // absent pack may be built. Default off: a model that has
+                                              // not been quantised runs un-packed rather than being
+                                              // quantised behind someone's first prompt.
     int32_t     ork_pack_4bit       = 0;      // 0 auto (RAM rule), 1 rotated W4A4, 2 NF4 i4a8
     int32_t     ork_pack_gptq       = -1;     // -1 auto (on for the 4-bit tier), 0 off, 1 on
     int32_t     ork_pack_smooth     = -1;     // -1 auto (on for the 4-bit tier), 0 off, 1 on

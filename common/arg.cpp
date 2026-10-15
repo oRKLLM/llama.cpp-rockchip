@@ -2139,6 +2139,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--pack-build"},
+        "THIS run is the quantisation step: build the .orkpack if it does not exist. Without it an\n"
+        "absent pack is left absent and the model runs un-packed — the first quantisation is a choice\n"
+        "(tier, bits per weight, quality ladder) and it belongs to the user, not to whichever process\n"
+        "happened to open the model first. A STALE pack is rebuilt either way, to its own recipe",
+        [](common_params & params) {
+            params.ork_pack_build = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--pack-4bit"}, "TIER",
         "which 4-bit form to WRITE: auto (default, by the build host's RAM) | w4a4 (rotated, compact,\n"
         "the tier the rotation/SmoothQuant/GPTQ ladder applies to) | nf4 (unrotated i4a8, most accurate\n"

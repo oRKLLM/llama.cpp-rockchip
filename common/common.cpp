@@ -1335,7 +1335,7 @@ static void common_apply_ork_pack_config(const common_params & params) {
                        params.ork_pack_budget_mb >= 0.0f || params.ork_pack_qerr_min >= 0.0f ||
                        !params.ork_pack_qerr_src.empty() || !params.ork_pack_promote.empty() ||
                        params.ork_pack_bpw >= 0.0f || params.ork_pack_gptq >= 0 ||
-                       params.ork_pack_smooth >= 0 || params.ork_pack_4bit != 0;
+                       params.ork_pack_smooth >= 0 || params.ork_pack_4bit != 0 || params.ork_pack_build;
     if (!asked) return;
 
     using defaults_fn = void (*)(struct ggml_backend_ork_pack_config *);
@@ -1357,6 +1357,7 @@ static void common_apply_ork_pack_config(const common_params & params) {
     if (params.ork_pack_qerr_min  >= 0.0f)  cfg.promote_qerr_min  = params.ork_pack_qerr_min;
     if (!params.ork_pack_qerr_src.empty())  cfg.qerr_source_pack  = params.ork_pack_qerr_src.c_str();
     if (!params.ork_pack_promote.empty())   cfg.promote_list      = params.ork_pack_promote.c_str();
+    if (params.ork_pack_build)              cfg.build_absent      = 1;
     if (params.ork_pack_bpw >= 0.0f)        cfg.target_bpw        = params.ork_pack_bpw;
     if (params.ork_pack_4bit != 0)          cfg.four_bit_tier     = params.ork_pack_4bit;
     if (params.ork_pack_gptq >= 0)          cfg.gptq              = params.ork_pack_gptq;

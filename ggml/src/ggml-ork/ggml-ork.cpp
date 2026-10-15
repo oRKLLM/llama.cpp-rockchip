@@ -890,7 +890,7 @@ static int ork_i4_group(void) { static const int g = getenv("ORK_I4_GROUP") ? at
  * implementation cannot drift from it: mixed on, a modest promotion budget, and a floor below which
  * promoting a weight is not worth its bytes. */
 static ggml_backend_ork_pack_config g_pack_cfg =
-    { 0, true, nullptr, nullptr, 8.0f, 0.05f, /*target_bpw*/ 0.0f,
+    { /*build_absent*/ 0, 0, true, nullptr, nullptr, 8.0f, 0.05f, /*target_bpw*/ 0.0f,
       /*four_bit_tier*/ 0,
       /*gptq*/ -1, /*gptq_damp*/ 0.3f, /*smooth*/ -1, /*smooth_alpha*/ 0.5f };
 static bool g_pack_cfg_set = false;
@@ -1169,6 +1169,7 @@ extern "C" bool ggml_backend_ork_write_calib(const char * pack_path, int min_m) 
 
 extern "C" void ggml_backend_ork_pack_config_defaults(struct ggml_backend_ork_pack_config * cfg) {
     if (!cfg) return;
+    cfg->build_absent = 0;   /* the first quantisation is the user's; see the header */
     cfg->weight_bits = 0; cfg->mixed = true; cfg->promote_list = nullptr;   /* 0 = unset: ORK_QUANT / source policy decides */
     cfg->qerr_source_pack = nullptr; cfg->promote_budget_mb = 8.0f; cfg->promote_qerr_min = 0.05f;
     /* THE LADDER IS THE DEFAULT. -1 = auto, which means ON for the 4-bit tier and off otherwise --
@@ -2815,6 +2816,111 @@ static void ork_pack_contract_check(ggml_backend_ork_context * ctx) {
     }
 }
 
+/* ---- A STALE PACK IS REBUILT TO ITS OWN RECIPE, NOT TO OUR DEFAULTS ---------------------------
+ *
+ * An automatic rebuild happens because the FORMAT moved, not because the user changed their mind. So
+ * it has to reproduce the choices that produced the pack being replaced -- base tier, 4-bit form,
+ * ladder settings, bit-rate target. The only place those choices can come from is the pack itself,
+ * which is the third reason the recorded fields are load-bearing (the first two are rotation and
+ * SmoothQuant having runtime halves).
+ *
+ * Silently reverting a user's settings to defaults on a rebuild is the same failure as an orphaned
+ * settings row: the model keeps working, nobody is told, and it is quietly not the model they asked
+ * for. A pack built at 4.5 bpw with GPTQ must not come back as uniform RTN int4.
+ *
+ * WHAT IS RECOVERABLE, and what is approximated. Tier, rotation, SmoothQuant (+alpha), GPTQ (+damp)
+ * and the requested bit rate are stored verbatim. The promotion SET is not stored as a list and does
+ * not need to be: it is a deterministic function of (target bpw, model, structural prior), so
+ * replaying the target reproduces it. For a pack whose promotion came from somewhere else -- an
+ * explicit list, or the older qerr ranking -- there is no target to replay, so the ACHIEVED rate is
+ * used as the target instead. That reproduces the rate but may pick different weights, and it says
+ * so rather than pretending otherwise.
+ *
+ * A CALLER STILL WINS. Fields the caller set explicitly are left alone; only fields still at their
+ * default are filled from the pack. A user re-quantising at new settings is not overruled by the old
+ * ones, and an automatic rebuild, which passes nothing, gets the whole recipe. */
+static bool ork_read_prov_record(const char * pack_path, std::string & out);
+static void ork_pack_recipe_adopt(const char * path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    const off_t sz = lseek(fd, 0, SEEK_END);
+    orkpack_footer f;
+    if (sz <= (off_t) sizeof f || pread(fd, &f, sizeof f, sz - (off_t) sizeof f) != (ssize_t) sizeof f ||
+        memcmp(f.magic, ORKPACK_MAGIC, 8) != 0) { close(fd); return; }
+    close(fd);
+
+    ggml_backend_ork_pack_config def;
+    ggml_backend_ork_pack_config_defaults(&def);
+    std::string said;
+    auto note = [&](const char * k, const std::string & v) { said += " "; said += k; said += "="; said += v; };
+
+    /* Base tier: from the signature, which has always recorded it faithfully. */
+    if (g_pack_cfg.weight_bits == def.weight_bits) {
+        g_pack_cfg.weight_bits = ork_sig_qbits(f.quant_sig);
+        note("bits", std::to_string(g_pack_cfg.weight_bits));
+    }
+    /* Everything below is only meaningful if the pack RECORDED it. A pre-record pack hands us
+     * nothing, and guessing from the derived HD bit is exactly the bug this work removed. */
+    if (!(f.prov_flags & ORK_PROV_BUILDREC)) {
+        fprintf(stderr, "[ORK PACK-RECIPE] %s predates the build record — rebuilding at this build's "
+                        "defaults, because the pack cannot say what it was built with.%s\n",
+                path, said.empty() ? "" : (" Recovered:" + said).c_str());
+        return;
+    }
+    if (g_pack_cfg.four_bit_tier == def.four_bit_tier && ork_sig_qbits(f.quant_sig) == 4) {
+        g_pack_cfg.four_bit_tier = (f.prov_flags & ORK_PROV_ROTATED) ? 1 : 2;
+        note("4bit", g_pack_cfg.four_bit_tier == 1 ? "w4a4" : "nf4");
+    }
+    if (g_pack_cfg.gptq == def.gptq) {
+        g_pack_cfg.gptq = (f.prov_flags & ORK_PROV_GPTQ) ? 1 : 0;
+        note("gptq", g_pack_cfg.gptq ? "on" : "off");
+    }
+    if (g_pack_cfg.smooth == def.smooth) {
+        g_pack_cfg.smooth = (f.prov_flags & ORK_PROV_SMOOTH) ? 1 : 0;
+        note("smooth", g_pack_cfg.smooth ? "on" : "off");
+    }
+    if (g_pack_cfg.mixed == def.mixed && !(f.prov_flags & ORK_PROV_PROMOTED)) {
+        /* Recorded as single-tier: keep it single-tier rather than promoting on a rebuild. */
+        g_pack_cfg.mixed = false;
+        note("mixed", "no");
+    }
+    /* The parameters and the bit rate live in the provenance record. */
+    std::string prov;
+    if (ork_read_prov_record(path, prov)) {
+        auto num = [&](const char * key, float * out) {
+            const std::string k = std::string(key) + ":";
+            size_t i = prov.find(k);
+            if (i == std::string::npos) return false;
+            if (i && prov[i-1] != '\n') return false;
+            const char * q = prov.c_str() + i + k.size();
+            char * e = nullptr;
+            const float v = strtof(q, &e);
+            if (e == q) return false;
+            *out = v; return true;
+        };
+        float v = 0;
+        if (g_pack_cfg.smooth_alpha == def.smooth_alpha && num("ladder_smooth_alpha", &v)) {
+            g_pack_cfg.smooth_alpha = v; note("alpha", std::to_string(v).substr(0, 4));
+        }
+        if (g_pack_cfg.gptq_damp == def.gptq_damp && num("ladder_gptq_damp", &v)) {
+            g_pack_cfg.gptq_damp = v; note("damp", std::to_string(v).substr(0, 5));
+        }
+        if (g_pack_cfg.target_bpw == def.target_bpw) {
+            if (num("bpw_target", &v) && v > 4.0f) {               /* the rate the user asked for */
+                g_pack_cfg.target_bpw = v; note("bpw(requested)", std::to_string(v).substr(0, 4));
+            } else if ((f.prov_flags & ORK_PROV_PROMOTED) && num("bpw_achieved", &v) && v > 4.05f) {
+                /* Promotion came from a list or the qerr ranking: no target to replay, so match the
+                 * RATE. Same bits, possibly a different set -- said out loud, not papered over. */
+                g_pack_cfg.target_bpw = v;
+                note("bpw(from achieved; the original promotion set was not a bpw target)",
+                     std::to_string(v).substr(0, 4));
+            }
+        }
+    }
+    fprintf(stderr, "[ORK PACK-RECIPE] rebuilding %s to the settings IT records, not this build's "
+                    "defaults:%s\n", path, said.empty() ? " (nothing to recover)" : said.c_str());
+}
+
 static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // orkd: the .orkpack is a FIRST-CLASS citizen — it always loads (no gate). READ imports the pre-tiled
     // bytes into the CLIENT's own dma-buf and hands the fd to the daemon (ORKD_IMPORT / ork_i8_mm_import),
@@ -2858,7 +2964,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
      * wiki. Printing the rule and its inputs makes any divergence from what the server would have
      * selected visible in the log, instead of something a reader has to reason out. */
     fprintf(stderr, "[ORK PACK] %s — %s%s\n", p, why.c_str(),
-            access(p, R_OK) == 0 ? "" : " (absent -> building this run)");
+            access(p, R_OK) == 0 ? "" : " (absent — not built automatically; see below)");
     /* ORK_SHOW_PROV=1: print what built this pack. Placed HERE, immediately after the path resolves and
      * before any read, validation or adoption, because this must answer for EVERY pack -- the one that
      * loads cleanly, the one this build refuses, and the one it cannot even parse. An earlier revision
@@ -3256,6 +3362,44 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         fprintf(stderr, "[ORK PERSIST] %s could not be parsed as a resumable build — rebuilding clean\n",
                 rp.c_str());
     }
+    /* ---- ABSENT IS NOT A REASON TO BUILD -------------------------------------------------
+     *
+     * The first quantisation of a model belongs to the user, who picks the settings. An absent pack
+     * means "not quantised yet", and the correct response is to run the model the ordinary way --
+     * ork packs weights inline per matmul, which is what every un-packed model has always done --
+     * not to start a multi-hour GPTQ build behind someone's first prompt. cfg.build_absent (the
+     * --pack-build flag) is how a caller says it IS the quantisation step.
+     *
+     * A STALE pack is not covered by this: it was already quantised, deliberately, and only the
+     * format moved. It is rebuilt to its own recorded recipe (ork_pack_recipe_adopt above).
+     *
+     * THE STUB EXCEPTION, which must be loud. A pack's companion stub gguf reproduces the model with
+     * the packed tensors left as FILE HOLES -- they read as zeros and ork is supposed to serve them
+     * from the pack. Running a stub with no pack is not "a model without a pack", it is a model whose
+     * weights are zeros, and it would generate confident garbage instead of failing. */
+    if (!pack_well_formed && !stale) {
+        const bool may_build = g_pack_cfg.build_absent != 0;
+        if (!may_build) {
+            if (ctx->source_is_stub) {
+                fprintf(stderr,
+                    "[ORK PERSIST] FATAL: %s does not exist, and this model is a STUB of a pack — its\n"
+                    "              packed tensors are file holes that read as ZEROS. Without the pack\n"
+                    "              there are no weights to serve, only silence that would look like\n"
+                    "              output. Restore the pack, or load the original GGUF instead.\n", p);
+                abort();
+            }
+            fprintf(stderr,
+                "[ORK PERSIST] %s does not exist — this model has not been quantised yet, so it runs on\n"
+                "              the ordinary un-packed path (weights are packed inline per matmul).\n"
+                "              A pack is not built automatically: the first quantisation is a choice\n"
+                "              (tier, bits per weight, quality ladder) and it is the user's to make.\n"
+                "              Quantise it from oRKLLM's Quantization tab, or pass --pack-build.\n", p);
+            return;
+        }
+    }
+    /* A stale pack is replaced by one built the way IT was built, not the way this binary defaults. */
+    if (stale && pack_well_formed) ork_pack_recipe_adopt(p);
+
     ctx->persist_out = fopen(ctx->persist_tmp.c_str(), "wb");
     if (ctx->persist_out) { ctx->persist_mode = 2;
         /* BEFORE the first weight: which 4-bit BYTES this model gets on this machine (ork_tier_rule). */
@@ -3271,7 +3415,7 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
         // speed is unrepresentative. Applies to every frontend that hits a missing/stale pack (llama-cli/server/
         // oRKLLM build it at load-time warmup; ork_bench builds it in a dedicated untimed pass). Warn + advise rerun.
         fprintf(stderr,
-            "[ORK PERSIST] orkpack absent/stale -> BUILDING %s this run (one-time).\n"
+            "[ORK PERSIST] BUILDING %s this run (one-time).\n"
             "              WARNING: weights are packed inline, so this run's performance/benchmark timing is SKEWED\n"
             "              and not representative. Re-run once the pack is built for true steady-state numbers.\n",
             ctx->persist_final.c_str()); }

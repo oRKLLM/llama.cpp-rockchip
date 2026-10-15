@@ -71,6 +71,13 @@ GGML_BACKEND_API void                ggml_backend_ork_set_load_config(bool dflas
 // Randomized Hadamard (ORK_I4_RHT) is deliberately NOT in this list: measured a SUBSTITUTE for GPTQ, not
 // a complement, so enabling it alongside GPTQ buys nothing and is not recorded in the pack.
 struct ggml_backend_ork_pack_config {
+    // MAY THIS RUN BUILD A PACK THAT DOES NOT EXIST? Default NO, and that is a product decision, not a
+    // safety margin: the first quantisation of a model is the USER's, with settings they choose. An
+    // absent pack therefore means "this model has not been quantised yet" and the model runs on the
+    // ordinary no-pack path, not "quantise it now, at my defaults, while someone waits".
+    // A STALE pack is different and is rebuilt regardless of this flag: it was already quantised, the
+    // settings were already chosen, and they are recorded in the pack for the rebuild to reproduce.
+    int          build_absent;       // default 0
     int          weight_bits;        // base tier for the bulk of the model: 4 or 8; 0 = UNSET (the
                                      // default), leaving ORK_QUANT / the source-type policy to decide
     bool         mixed;              // default true — promote the worst weights to int8
