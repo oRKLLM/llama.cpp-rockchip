@@ -23,9 +23,13 @@
 //   Attention precision trades prefill for decode: f16 38.4/5.26, q8_0 36.9/6.59, Q4_K 26.8/7.42 — and
 //   BELOW 5 bits the NPU declines the source entirely (sbits<5.0 gate), losing the prefill path. q8_0 is
 //   the balanced optimum. Expert precision in the GGUF is irrelevant (NF4 comes from the .orkpack).
-// The .orkpack path is DERIVED from the loaded model (<model-dir>/<model-basename>.orkpack) — no env var
-// needed; an absent pack is built once, and a MoE model always gets the SAME scheme (NF4 experts) whatever
-// the GGUF's own precision, so one model = one pack. ORK_ORKPACK_PATH is a DEVELOPMENT override only.
+// WHERE the .orkpack lives: two layouts, both supported. LEGACY is <model-dir>/<base>.orkpack, one pack
+// per source. DIRECTORY is <model-dir>/<base>/<label>.orkpack — several packs from one source, each named
+// for its measured bpw, under a .orkpack-dir marker. bpw changes on every re-quantize, so it is an
+// attribute of the variant and never part of the identity: the DIRECTORY carries the source's name and
+// does not move. ORK_ORKPACK_PATH names a pack explicitly and wins over both; it is a SUPPORTED input,
+// not a development override, because an embedder has no command line to derive from and a caller
+// managing several variants must be able to say which it means. See ork_default_orkpack_path().
 // ORK_PERSIST is REMOVED and now aborts with guidance.
 // Research escape hatches: ORK_MOE_AUTO=0 disables the profile; ORK_MOE_NPU forces experts to the NPU.
 //
@@ -179,6 +183,7 @@ extern "C" {
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>   // .orkpack directory layout: enumerating a source's pack variants
 #include <strings.h>   // strcasecmp (env_enabled)
 #ifdef _OPENMP
 #include <omp.h>
@@ -2084,15 +2089,227 @@ static std::string ork_find_model_path() {
     for (const auto & a : av) if (is_gguf(a)) return a;            // positional (ork_bench)
     return std::string();
 }
-// DEFAULT orkpack path: <model-dir>/<model-basename>.orkpack, derived from the loaded GGUF. No env needed.
-// ORK_ORKPACK_PATH overrides it (e.g. to share ONE pack built from the f16 source across several GGUFs —
-// sharing one pack across GGUFs during development). DEVELOPMENT OVERRIDE ONLY — the derived path is the
-// supported path; a MoE model's pack scheme is fixed by the model type (NF4 experts + int8 attn/dense).
-static std::string ork_default_orkpack_path() {
+/* ---- resolving WHERE the .orkpack is ------------------------------------------------------------
+ *
+ * Two layouts, both supported:
+ *
+ *   LEGACY     <model-dir>/<base>.orkpack                 one pack per source
+ *   DIRECTORY  <model-dir>/<base>/<label>.orkpack         several, each named for its measured bpw
+ *              <model-dir>/<base>/.orkpack-dir            the marker that makes it a pack directory
+ *
+ * The directory exists because one source GGUF can reasonably carry several packs (4bpw native W4A4,
+ * 4.9bpw promoted mixed, 8bpw int8), and bpw is a MEASURED property that changes on every re-quantize
+ * — so it has to be an attribute and never part of the identity. The directory is named for the
+ * SOURCE, which does not move; only the variant's name does.
+ *
+ * ORK_ORKPACK_PATH is a SUPPORTED input, not a development override. An embedder (oRKLLM's N-API
+ * worker) has no command line to derive from, and a caller managing several variants has to be able
+ * to say which one it means. It still wins over everything below.
+ *
+ * Deriving still matters for the CLI frontends (llama-cli / llama-bench / ork_bench), and it has to
+ * know about the directory: a bare `-m X.gguf` sitting next to a populated X/ would otherwise find no
+ * pack, silently rebuild a multi-GB one at the legacy path, and leave two copies on disk.
+ */
+static bool ork_is_pack_dir(const std::string & dir) {
+    struct stat st;
+    return stat((dir + "/.orkpack-dir").c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* bpw parsed out of a variant's FILENAME ("4.9bpw.orkpack" -> 4.9), or -1.
+ *
+ * Parsing a filename is acceptable HERE and nowhere else in this file, because it only ever breaks a
+ * TIE between candidates that have already passed the footer gates below; adoption stays the footer's
+ * decision. oRKLLM names each variant from the measurement it reads off that pack's own index, so a
+ * hand-renamed file can mis-order a tie and cannot cause a wrong pack to be adopted. */
+static double ork_variant_bpw(const std::string & fname) {
+    const char * p = fname.c_str();
+    char * end = nullptr;
+    const double v = strtod(p, &end);
+    if (end == p || v <= 0) return -1;
+    return strncmp(end, "bpw", 3) == 0 ? v : -1;
+}
+
+/* Total RAM in MiB from /proc/meminfo, or 0 when it cannot be read.
+ *
+ * This exists so the CLI frontends apply the SAME variant-selection rule the server does. oRKLLM
+ * resolves with its configured weight-residency budget (resolveWcacheBudgetMB), which falls back to
+ * MemTotal - 1 GiB floored at 1 GiB when nothing is configured; this is that same fallback. Without
+ * it, llama-bench / ork_bench / ork_ppl would take the largest variant while the server took the one
+ * that fits, and every number measured by those tools would be about a different artifact than the
+ * one in production, with nothing in the output saying so. */
+static long ork_mem_total_mb() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256]; long kb = 0;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemTotal: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb > 0 ? kb / 1024 : 0;
+}
+
+/* The DEFAULT budget a variant's footprint is measured against, in MiB, or 0 = "unknown, do not
+ * apply". MemTotal - 1 GiB floored at 1 GiB, mirroring oRKLLM's defaultPackBudgetMB() exactly.
+ *
+ * This is a default, not a policy: ork_pick_variant takes the budget as an ARGUMENT, so a caller
+ * that knows better passes its own. There is deliberately no environment variable to override it —
+ * an env knob that SELECTS behaviour is a side channel, and the selection line below reports the
+ * number and where it came from, which is what actually makes the choice auditable.
+ *
+ * Consequence, accepted rather than engineered around: a bare llama-bench on a box whose server has
+ * a CONFIGURED budget (the global memory limit minus the hot-cache reservation) cannot see that
+ * number and will use this rule instead, so it may select a different variant than the server. The
+ * printed line states the budget and its source, so the difference is visible in the record. */
+static long ork_pack_budget_mb() {
+    const long tot = ork_mem_total_mb();
+    if (tot <= 0) return 0;
+    return tot - 1024 < 1024 ? 1024 : tot - 1024;
+}
+
+struct ork_variant { std::string name; double bpw; off_t size; bool tier_ok; };
+
+/* Human size for the selection line. GiB for anything pack-sized, MiB below that — a real pack is
+ * 1-25 GiB, but a fixture or a tiny model printing "0.00 GiB" reads like a bug. */
+static std::string ork_hsize(off_t b) {
+    char t[32];
+    if (b >= 1073741824) snprintf(t, sizeof t, "%.2f GiB", b / 1073741824.0);
+    else                 snprintf(t, sizeof t, "%.0f MiB", b / 1048576.0);
+    return t;
+}
+
+/* Pick a variant out of a pack directory, or "" when it holds none this build would adopt.
+ *
+ * Footer FIRST — schema version, ork_fmt and the build signature, exactly the gates ork_persist_init
+ * applies below — so a directory of packs in an older format resolves to nothing and the caller builds
+ * a fresh one rather than adopting something that would be refused two screens later.
+ *
+ * Then the SAME rule oRKLLM's resolveOrkpack applies, so the artifact a benchmark measures is the
+ * artifact the server serves:
+ *   1. prefer the tier an explicit ORK_QUANT asks for (dropped when it matches nothing);
+ *   2. the highest bpw whose pack FILE fits the budget; if none fits, the LOWEST bpw — never a
+ *      refusal, because a model that will not load is a worse failure than a defensible default;
+ *   3. exact ties break on strcmp, so the answer is a pure function of the directory's contents and
+ *      never of readdir order.
+ * With no budget (no /proc/meminfo) step 2 degrades to plain highest-bpw, and `why` says so.
+ *
+ * The only remaining difference from the server is the explicit per-model `pack_variant` override,
+ * which only the server can know. That asymmetry is defensible because it is an override rather than
+ * a default — the AUTOMATIC answer is the same on both sides.
+ *
+ * The footprint is the pack FILE's size, an upper bound on its resident weight bytes (the file also
+ * carries the model's non-packed tensors), so the rule errs toward the smaller variant — the safe
+ * direction. It is NOT a residency measurement, and the printed line says so. */
+static std::string ork_pick_variant(const std::string & dir, long budget_mb, int want, std::string & why) {
+    DIR * d = opendir(dir.c_str());
+    if (!d) { why = "pack directory unreadable"; return std::string(); }
+
+    std::vector<ork_variant> cand;
+    for (struct dirent * e = readdir(d); e; e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 9 || n.compare(n.size() - 8, 8, ".orkpack") != 0) continue;
+        if (n[0] == '.') continue;                 /* .building-… — a build in flight, never a variant */
+        int fd = open((dir + "/" + n).c_str(), O_RDONLY);
+        if (fd < 0) continue;
+        orkpack_footer f; bool ok = false;
+        const off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > (off_t) sizeof f && lseek(fd, sz - (off_t) sizeof f, SEEK_SET) >= 0 &&
+            read(fd, &f, sizeof f) == (ssize_t) sizeof f) {
+            ok = memcmp(f.magic, ORKPACK_MAGIC, 8) == 0 && ork_pack_version_ok(f.version) &&
+                 f.ork_fmt == ork_pack_format_version() && ork_sig_compatible(f.quant_sig) &&
+                 f.index_off < (uint64_t) sz;
+        }
+        const bool tier_ok = ok && (!want || ork_sig_qbits(f.quant_sig) == want);
+        close(fd);
+        if (ok) cand.push_back({ n, ork_variant_bpw(n), sz, tier_ok });
+    }
+    closedir(d);
+    if (cand.empty()) { why = "no adoptable variant in the pack directory"; return std::string(); }
+
+    const size_t total = cand.size();
+    int tier_state = 0;                       /* 0 = no tier asked, 1 = applied, 2 = asked but unmet */
+    if (want) {
+        std::vector<ork_variant> m;
+        for (const auto & c : cand) if (c.tier_ok) m.push_back(c);
+        if (m.empty()) tier_state = 2;        /* say so: selecting across all tiers is a real fallback */
+        else { cand.swap(m); tier_state = 1; }
+    }
+
+    const off_t budget = (off_t) budget_mb * 1048576;
+    const ork_variant * best = nullptr;
+    bool fits = false;
+    if (budget > 0) {                                        /* highest bpw that FITS */
+        for (const auto & c : cand) {
+            if (c.size > budget) continue;
+            if (!best || c.bpw > best->bpw || (c.bpw == best->bpw && c.name < best->name)) best = &c;
+        }
+        fits = best != nullptr;
+    }
+    if (!best) {         /* none fit -> LOWEST bpw; or, with no budget at all, plain highest bpw */
+        for (const auto & c : cand) {
+            if (!best) { best = &c; continue; }
+            const bool better = (budget > 0) ? (c.bpw < best->bpw) : (c.bpw > best->bpw);
+            if (better || (c.bpw == best->bpw && c.name < best->name)) best = &c;
+        }
+    }
+
+    char buf[768];
+    const char * rule = budget <= 0 ? "highest-bpw (no budget: /proc/meminfo unreadable — the budget "
+                                      "rule could NOT be applied, so this MAY DIFFER from what the "
+                                      "server would select)"
+                      : fits        ? "highest-bpw-that-fits"
+                                    : "lowest-bpw (none fit the budget)";
+    /* Worded to match oRKLLM's [orkpack] line, so the two can be compared at a glance when someone is
+     * asking whether a benchmark measured the artifact the server serves. */
+    char tier_note[80] = "";
+    if (tier_state == 1) snprintf(tier_note, sizeof tier_note, " after the int%d tier filter", want);
+    if (tier_state == 2) snprintf(tier_note, sizeof tier_note,
+                                  " (no int%d variant; selected across all tiers)", want);
+    snprintf(buf, sizeof buf, "chose '%.*s' of %zu variant(s)%s via %s; pack FILE %s "
+                              "(an upper bound on resident weight bytes, not a residency measurement)",
+             (int) (best->name.size() - 8), best->name.c_str(), total, tier_note, rule,
+             ork_hsize(best->size).c_str());
+    std::string w = buf;
+    if (budget > 0) {
+        const long dflt = ork_pack_budget_mb();
+        if (budget_mb == dflt) snprintf(buf, sizeof buf, "; budget %s (MemTotal %ld MiB - 1 GiB)",
+                                        ork_hsize(budget).c_str(), ork_mem_total_mb());
+        else                   snprintf(buf, sizeof buf, "; budget %s (caller-supplied)",
+                                        ork_hsize(budget).c_str());
+        w += buf;
+    }
+
+    if (best->bpw > 0) { snprintf(buf, sizeof buf, "; bpw %.4g from the filename", best->bpw); w += buf; }
+    else               { w += "; no bpw in the filename"; }
+    why = w;
+    return dir + "/" + best->name;
+}
+
+/* The pack path for the GGUF on this command line, plus a one-line account of HOW it was chosen for
+ * the caller to print. `why` is never left empty.
+ *
+ * `budget_mb` (0 = unknown) and `want_qbits` (0 = no forced tier) are ARGUMENTS, not environment
+ * reads: the selection is then a pure function of the directory's contents and these two inputs,
+ * which is the same property the server-side resolver has. The one caller reads ORK_QUANT — a
+ * long-standing knob this file consults in a dozen places — and the default budget, once.
+ *
+ * A variant from the pack DIRECTORY when one is adoptable, else the legacy sibling file. When neither
+ * exists this is the path to BUILD at — inside the directory when the directory exists (so a CLI build
+ * joins the variants instead of orphaning itself beside them, under a `.building-` name the server
+ * renames to its measured bpw), and at the legacy path otherwise, which leaves a greenfield CLI user's
+ * behaviour exactly as it was. */
+static std::string ork_default_orkpack_path(long budget_mb, int want_qbits, std::string & why) {
     std::string m = ork_find_model_path();
-    if (m.empty()) return std::string();
+    if (m.empty()) { why = "no .gguf on the command line"; return std::string(); }
     const size_t dot = m.rfind(".gguf");
-    return m.substr(0, dot) + ".orkpack";
+    const std::string base = m.substr(0, dot);
+    if (ork_is_pack_dir(base)) {
+        const std::string v = ork_pick_variant(base, budget_mb, want_qbits, why);
+        if (!v.empty()) return v;
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "/.building-%d-%lld.orkpack", (int) getpid(), (long long) time(nullptr));
+        why += " — building a new one in the pack directory";
+        return base + tmp;
+    }
+    why = "legacy layout (no pack directory for this model)";
+    return base + ".orkpack";
 }
 static bool ork_write_stub_gguf(const char * src_path, const char * stub_path,
                                 const std::vector<std::pair<std::string, orkpack_entry>> & packed);
@@ -2248,26 +2465,39 @@ static void ork_persist_init(ggml_backend_ork_context * ctx) {
     // from the loaded model. Fail loudly so stale scripts get fixed rather than silently losing the pack.
     if (getenv("ORK_PERSIST")) {
         GGML_ABORT("ork: ORK_PERSIST is no longer supported. The .orkpack path is DERIVED from the loaded "
-                   "model (<model-dir>/<model-basename>.orkpack) and needs no configuration — just run with "
-                   "-m <model.gguf>. ORK_ORKPACK_PATH=<file.orkpack> exists ONLY as a development override "
-                   "(e.g. to point several GGUFs at one pack built from an f16 source). Unset ORK_PERSIST.\n");
+                   "model and needs no configuration — just run with -m <model.gguf>; both the legacy "
+                   "<model-dir>/<base>.orkpack and the <model-dir>/<base>/ pack directory are found. To name "
+                   "a pack explicitly, set ORK_ORKPACK_PATH=<file.orkpack>, which is a supported input "
+                   "(an embedder has no command line to derive from). Unset ORK_PERSIST.\n");
     }
-    // Path resolution (no env required): ORK_ORKPACK_PATH (development override only) >
-    // <model>.orkpack derived from the loaded GGUF. An absent derived pack is BUILT this run (one-time).
+    // Path resolution (no env required): ORK_ORKPACK_PATH — a SUPPORTED input, and the only way an
+    // embedder or a multi-variant caller can name a pack — then the derivation, which tries the pack
+    // DIRECTORY before the legacy sibling file (ork_default_orkpack_path). An absent pack is BUILT this
+    // run (one-time), inside the directory when there is one.
     const char * env_p = getenv("ORK_ORKPACK_PATH");
-    std::string derived;
-    if (!env_p || !*env_p) {
-        derived = ork_default_orkpack_path();
+    std::string derived, why;
+    if (env_p && *env_p) {
+        why = "ORK_ORKPACK_PATH (explicit — the caller named this pack)";
+    } else {
+        /* The resolver takes its inputs as arguments; the environment is read HERE, once, and only
+         * for ORK_QUANT, which this file already consults everywhere else. */
+        const char * q = getenv("ORK_QUANT");
+        const int want_qbits = (q && (*q == '4' || *q == '8')) ? (*q - '0') : 0;
+        derived = ork_default_orkpack_path(ork_pack_budget_mb(), want_qbits, why);
         if (derived.empty()) {
-            fprintf(stderr, "[ork] no .gguf found on the command line — cannot derive the orkpack path; "
-                            "set ORK_ORKPACK_PATH=<file.orkpack> to enable the packed-weight path.\n");
+            fprintf(stderr, "[ORK PACK] no pack: %s — set ORK_ORKPACK_PATH=<file.orkpack> to enable "
+                            "the packed-weight path.\n", why.c_str());
             return;
         }
-        fprintf(stderr, "[ork] orkpack (derived from model): %s%s\n", derived.c_str(),
-                access(derived.c_str(), R_OK) == 0 ? "" : " (absent -> building this run)");
     }
     const char * p = (env_p && *env_p) ? env_p : derived.c_str();
     if (!p || !*p) return;
+    /* ALWAYS, on every path. A run that does not record WHICH artifact it used is not a usable
+     * record — and these are the tools (llama-bench, ork_bench, ork_ppl) whose numbers end up on the
+     * wiki. Printing the rule and its inputs makes any divergence from what the server would have
+     * selected visible in the log, instead of something a reader has to reason out. */
+    fprintf(stderr, "[ORK PACK] %s — %s%s\n", p, why.c_str(),
+            access(p, R_OK) == 0 ? "" : " (absent -> building this run)");
     /* ORK_SHOW_PROV=1: print what built this pack. Placed HERE, immediately after the path resolves and
      * before any read, validation or adoption, because this must answer for EVERY pack -- the one that
      * loads cleanly, the one this build refuses, and the one it cannot even parse. An earlier revision
@@ -6751,8 +6981,15 @@ static void ggml_backend_ork_free(ggml_backend_t backend) {
     // (b) persist the gmax profile to the <orkpack>.gmax sidecar (name<TAB>gmax/line) so a later run
     // loads it. Written whenever we captured a profile and have a persist path — independent of ORK_VERBOSE.
     if (!ctx->gmax_profile.empty()) {
-        const char * pp = getenv("ORK_ORKPACK_PATH");   // development override; else derive from the model
-        std::string pp_d; if ((!pp || !*pp)) { pp_d = ork_default_orkpack_path(); if (!pp_d.empty()) pp = pp_d.c_str(); }
+        // The RESOLVED pack path this run actually used, which is what the LOAD side reads back
+        // (see the <orkpack>.gmax loader). It used to RE-DERIVE here, which under the directory
+        // layout can land on a different variant than the one that was served — or, if the
+        // directory emptied meanwhile, on a `.building-` name — so the profile would be attached to
+        // a pack it does not describe. ork_persist_init sets persist_final on both the read and the
+        // write path, so it is always the right answer; the env read stays only as a fallback for a
+        // context that never ran persist_init.
+        std::string pp_d = ctx->persist_final;
+        const char * pp = pp_d.empty() ? getenv("ORK_ORKPACK_PATH") : pp_d.c_str();
         if (pp && pp[0]) {
             std::string sp = std::string(pp) + ".gmax";
             FILE * gf = fopen(sp.c_str(), "w");
