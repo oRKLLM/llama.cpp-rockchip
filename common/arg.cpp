@@ -2046,15 +2046,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_REPACK"));
     // ---- .orkpack build configuration (ggml-ork) ----
     // The pack is the artifact these produce, so how it is built is a real user decision: the base tier,
-    // and which weights are worth spending extra bytes on. Promotion is ranked by qerr — the measured
-    // per-weight quantisation error the pack records — so a MIXED build wants --pack-qerr-source pointing
-    // at an earlier pack of the same model.
+    // how many bits per weight, and which rungs of the quality ladder to run.
     //
-    // qerr is NOT recorded by every build. It is written only by the GPTQ finalize pass (ORK_GPTQ, which
-    // ork_bench drives), because that is the only path holding the calibration Hessian the metric is
-    // weighted by. A plain uniform build records nothing, so pointing --pack-qerr-source at one yields an
-    // empty ranking and no promotion — the backend says so rather than failing silently. Producing qerr
-    // from an imatrix on ordinary int4 builds is oRKLLM/ork-driver#2.
+    // THE NORMAL WAY TO ASK FOR MIXED PRECISION IS --pack-bpw. It states a rate, the backend promotes
+    // weights to int8 until it reaches it, and the ordering is the Q4_K_M structural prior (attn_v, then
+    // ffn_down) — measured 3.8% better than qerr ranking at a matched bit budget. One build, no
+    // prerequisites.
+    //
+    // --pack-budget / --pack-qerr-min / --pack-qerr-source are the older route: rank by the measured
+    // per-weight quantisation error a previous pack recorded, and promote worst-first until a MiB budget
+    // is spent. They still work, and they still need a source pack that CARRIES qerr. Prefer --pack-bpw.
     add_opt(common_arg(
         {"--pack-bits"}, "N",
         "orkpack base tier: 4 or 8 (default: backend's own, currently 4).\n"
