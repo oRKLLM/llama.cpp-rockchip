@@ -701,6 +701,7 @@ static uint64_t ork_file_hash(const char * p) {
 }
 
 static bool ork_gptq_on(void);   /* fwd: the ladder's resolved answer, not a raw getenv */
+extern long g_gptq_applied, g_gptq_fellback;   /* fwd: the OUTCOME, see their definition */
 static void ork_pack_provenance(uint32_t * flags, uint64_t * imhash) {
     static int done = 0; static uint32_t fl = 0; static uint64_t ih = 0;
     if (!done) {   // the imatrix hash reads the whole file; do it once per process
@@ -710,7 +711,8 @@ static void ork_pack_provenance(uint32_t * flags, uint64_t * imhash) {
     }
     /* GPTQ is NOT cached with the imatrix hash: it is now a resolved configuration rather than an
      * env var, and the resolution happens after the first possible call to this function. */
-    *flags = fl | (ork_gptq_on() ? ORK_PROV_GPTQ : 0u); *imhash = ih;
+    const bool gptq_real = ork_gptq_on() && g_gptq_applied > 0 && g_gptq_fellback == 0;
+    *flags = fl | (gptq_real ? ORK_PROV_GPTQ : 0u); *imhash = ih;
 }
 
 // The weight tier a pack was BUILT at, decoded from its stored signature. This is what makes an .orkpack
@@ -908,6 +910,20 @@ static bool g_pack_cfg_set = false;
  * Auto never fires early, so nothing can observe a different answer than the latch will take. */
 struct ork_ladder_state { int resolved; int gptq; int smooth; float damp; float alpha; };
 static ork_ladder_state g_ladder = { 0, 0, 0, 0.3f, 0.5f };
+
+/* DID GPTQ ACTUALLY HAPPEN, as opposed to having been asked for.
+ *
+ * Every other rung of the ladder can be censused from the bytes -- a rotated weight is a different
+ * weight, a smoothed entry carries its vector. GPTQ cannot: its output is an ordinary int4 weight
+ * that merely has better numbers in it. So the one field that has to be recorded from INTENT is also
+ * the one where intent and outcome can diverge, and they do: a weight whose wcache entry is gone at
+ * finalize keeps its round-to-nearest codes, and the run still asked for GPTQ.
+ *
+ * Counting is therefore the census. The provenance bit is set only when finalize quantised at least
+ * one weight and NOTHING fell back, so "the pack says GPTQ" cannot mean "something tried". A partial
+ * result is reported as partial rather than rounded up to yes. */
+long g_gptq_applied = 0;   /* weights finalize actually re-quantised */
+long g_gptq_fellback = 0;  /* weights that wanted GPTQ and kept their RTN codes */
 
 /* The one env-or-config read for each knob. The env spellings stay as DEV OVERRIDES -- they must
  * never be required for correctness, and the default path sets none of them. */
@@ -4574,7 +4590,11 @@ static bool ork_write_prov_record(FILE * out, const char * src_path, uint64_t * 
         snprintf(ln, sizeof ln, "ladder_smooth: %s\n",
                  ctx ? ((br & ORK_PROV_SMOOTH) ? "1" : "0") : "unknown");                 t += ln;
         snprintf(ln, sizeof ln, "ladder_smooth_alpha: %.4f\n", (double) ork_smooth_alpha()); t += ln;
-        snprintf(ln, sizeof ln, "ladder_gptq: %d\n", ork_gptq_on() ? 1 : 0);              t += ln;
+        if (!ork_gptq_on())           snprintf(ln, sizeof ln, "ladder_gptq: 0\n");
+        else if (!g_gptq_fellback)    snprintf(ln, sizeof ln, "ladder_gptq: 1 (%ld weights)\n", g_gptq_applied);
+        else                          snprintf(ln, sizeof ln, "ladder_gptq: partial (%ld quantised, %ld fell "
+                                                              "back to round-to-nearest)\n",
+                                               g_gptq_applied, g_gptq_fellback);                  t += ln;
         snprintf(ln, sizeof ln, "ladder_gptq_damp: %.4g\n", (double) ork_gptq_damp());    t += ln;
         /* RHT and GPTQ measured SUBSTITUTES, not complements -- worth /1.32 without GPTQ and nothing
          * with it. Recorded because a pack built with both is a configuration mistake a later reader
@@ -6351,6 +6371,7 @@ static void ork_gptq_rescue_unfinalized(ggml_backend_ork_context * ctx) {
         ork_persist_write_i4native(ctx, c.src->name, c.K, c.N, it->second);
         n++;
     }
+    g_gptq_fellback += (long) n;
     if (n)
         fprintf(stderr,
             "[ORK GPTQ] WARNING: %zu weights were registered for GPTQ and never finalized — the builder\n"
@@ -7276,8 +7297,13 @@ extern "C" void ggml_backend_ork_gptq_finalize(void) {
                         "next window calibrates against UNQUANTISED upstream layers\n", evicted);
     }
 
+    g_gptq_applied  += (long) done;
+    g_gptq_fellback += (long) failed;
     fprintf(stderr, "[ORK GPTQ] finalize done: %zu quantized, %zu failed, %.1f min%s\n",
             done, failed, (ork_now_us()-all0)/6e7, gptq_seq ? " (sequential)" : " (NON-sequential)");
+    if (failed)
+        fprintf(stderr, "[ORK GPTQ] %zu weights kept their round-to-nearest codes. The pack will NOT be "
+                        "recorded as GPTQ -- a partial result is not the thing that was asked for.\n", failed);
 }
 
 // Fused int8 matmul for a group of independent MUL_MATs that share the SAME src1 input (Q/K/V
@@ -10311,14 +10337,28 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     // `down` (and `gate` in the GU_CHAIN path) can trigger ork_wcache_evict, which under a tight budget would
     // otherwise free the just-resolved `up` — dangling the held owu/bsu references (ASAN use-after-free at the
     // phase-1 up matmul, 4421). The guard unpins on EVERY return path.
-    struct WCachePinGuard { std::unordered_set<const void *> & s; ~WCachePinGuard() { s.clear(); } } _wc_pin{ ctx->wcache_pin };
+    /* UNPIN ONLY WHAT THIS SCOPE PINNED. The first version cleared the whole set, which is fine while
+     * this function is the only thing that ever pins -- and silently destructive the moment something
+     * else holds a long-lived pin. GPTQ does: it pins every registered weight for the whole
+     * calibration, so one call through here dropped those pins, the next convert-mode
+     * ork_wcache_evict (budget ZERO) freed the entries, and finalize threw away the finished codes
+     * with "wcache entry vanished". MEASURED on qwen3-1.7b-f16: all 28 ffn_down weights lost, ~20
+     * minutes of K^3 work per chunk discarded, those weights left at round-to-nearest.
+     * insert().second is what makes this correct: a key someone else already pinned is not ours to
+     * release. */
+    struct WCachePinGuard {
+        std::unordered_set<const void *> & s;
+        std::vector<const void *> mine;
+        void pin(const void * k) { if (s.insert(k).second) mine.push_back(k); }
+        ~WCachePinGuard() { for (const void * k : mine) s.erase(k); }
+    } _wc_pin{ ctx->wcache_pin, {} };
     auto itu = ork_resolve_weight_i8(ctx, Wu, K, Nff, Wu->nb[1], Wu->type, ggml_get_type_traits(Wu->type)->to_float, true);
     if (itu == ctx->wcache.end()) return false;
-    ctx->wcache_pin.insert(itu->first);                  // pin `up` BEFORE resolving `down` (which may evict)
+    _wc_pin.pin(itu->first);                  // pin `up` BEFORE resolving `down` (which may evict)
     const ork_weight & owu = itu->second; const float * bsu = owu.bscale.data();
     auto itd = ork_resolve_weight_i8(ctx, Wd, Nff, Kd, Wd->nb[1], Wd->type, ggml_get_type_traits(Wd->type)->to_float, true);
     if (itd == ctx->wcache.end()) return false;
-    ctx->wcache_pin.insert(itd->first);
+    _wc_pin.pin(itd->first);
     const ork_weight & owd = itd->second; const float * bsd = owd.bscale.data();
     // NOTE: gate/up/down do NOT need co-residence. Each is a SEPARATE ork_mm_run_* call that goes through
     // run()->dom_activate(w->domain)->a SINGLE-domain submit, so they may live in different domains (the
@@ -10347,7 +10387,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         if (sp) {
             auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
             if (itg == ctx->wcache.end()) return false;
-            ctx->wcache_pin.insert(itg->first);
+            _wc_pin.pin(itg->first);
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // Default nt=1 (TS=M): full-M matmuls (no per-tile weight-DMA re-stream tax) with silu∥up overlap
             // in the one tile — apipe's shape. Smaller TS pipelines more tiles but re-streams weights (net loss
@@ -10394,7 +10434,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
     if (getenv("ORK_GU_CHAIN") && fc.silu_cpu && ablate < 0) {
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg != ctx->wcache.end()) {
-            ctx->wcache_pin.insert(itg->first);          // pin `gate` — GU_CHAIN uses up+gate co-resident in one submit
+            _wc_pin.pin(itg->first);          // pin `gate` — GU_CHAIN uses up+gate co-resident in one submit
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             // Stage the shared int8 input + gate/up int32 outputs in cached NPU-coherent DMA scratch so
             // run_chain_i8's dma_find HITS -> no per-task bcreate/memcpy/bsync/bdestroy, and the shared
@@ -10453,7 +10493,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN SCHED] gate resolve miss %s\n", Wg->name); ok = false; }
         else {
-            ctx->wcache_pin.insert(itg->first);
+            _wc_pin.pin(itg->first);
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             OrkFfnPool * pool = ork_ffn_pool();
             const int TS = 64; const int nt = (M + TS - 1) / TS;                  // doorbell tile cap (mc M<=64)
@@ -10508,7 +10548,7 @@ static bool ggml_backend_ork_ffn_swiglu_chain(ggml_backend_ork_context * ctx,
         auto itg = ork_resolve_weight_i8(ctx, Wg, K, Nff, Wg->nb[1], Wg->type, ggml_get_type_traits(Wg->type)->to_float, true);
         if (itg == ctx->wcache.end()) { if (getenv("ORK_VERBOSE")) fprintf(stderr, "[FFN PIPE] gate resolve miss %s\n", Wg->name); ok = false; }
         else {
-            ctx->wcache_pin.insert(itg->first);
+            _wc_pin.pin(itg->first);
             const ork_weight & owg = itg->second; const float * bsg = owg.bscale.data();
             const int TS = 64; const int nt = (M + TS - 1) / TS;
             std::vector<int32_t> gC0((size_t) TS*Nff), gC1((size_t) TS*Nff);      // ping-pong gate int32 (CPU reads t-1 while NPU writes t)
